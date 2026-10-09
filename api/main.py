@@ -23,6 +23,9 @@ from fastapi.responses import JSONResponse
 from agent.llm.orchestrator import LLMOrchestrationStageError
 from api.dependencies import create_runtime
 
+import os
+from fastapi.middleware.cors import CORSMiddleware
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +48,23 @@ def create_app(
             "Cognitive requests do not execute Agent actions."
         ),
         lifespan=lifespan,
+    )
+
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS",
+            "http://127.0.0.1:5173,http://localhost:5173",
+        ).split(",")
+        if origin.strip()
+    ]
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     from api.routes.cognitive import router as cognitive_router
