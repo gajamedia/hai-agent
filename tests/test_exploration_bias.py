@@ -1,0 +1,405 @@
+import pytest
+
+from agent.learning.exploration_bias import (
+    ExplorationBiasAdapter,
+)
+from agent.learning.meta_learning import (
+    MetaLearningProfile,
+)
+
+
+def test_no_evidence_produces_neutral_bias():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    result = adapter.evaluate(
+        attempts=0,
+        successes=0,
+        failures=0,
+    )
+
+    assert result.bias == 0.0
+    assert result.applied is False
+    assert result.is_neutral
+
+
+def test_successful_exploration_creates_positive_bias():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=9,
+        failures=1,
+    )
+
+    assert result.bias > 0.0
+    assert result.is_positive
+    assert result.applied is True
+
+
+def test_failed_exploration_creates_negative_bias():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=1,
+        failures=9,
+    )
+
+    assert result.bias < 0.0
+    assert result.is_negative
+    assert result.applied is True
+
+
+def test_neutral_success_rate_produces_zero_bias():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=5,
+        failures=5,
+    )
+
+    assert result.bias == 0.0
+
+
+def test_bias_is_bounded():
+    adapter = (
+        ExplorationBiasAdapter(
+            maximum_bias=0.20,
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=1000,
+        successes=1000,
+        failures=0,
+    )
+
+    assert (
+        -0.20
+        <= result.bias
+        <= 0.20
+    )
+
+
+def test_negative_bias_is_bounded():
+    adapter = (
+        ExplorationBiasAdapter(
+            maximum_bias=0.20,
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=1000,
+        successes=0,
+        failures=1000,
+    )
+
+    assert (
+        -0.20
+        <= result.bias
+        <= 0.20
+    )
+
+
+def test_more_evidence_increases_evidence_strength():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    low = adapter.evaluate(
+        attempts=1,
+        successes=1,
+        failures=0,
+    )
+
+    high = adapter.evaluate(
+        attempts=100,
+        successes=100,
+        failures=0,
+    )
+
+    assert (
+        high.evidence_strength
+        > low.evidence_strength
+    )
+
+
+def test_weak_evidence_does_not_apply_bias():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.20,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=1,
+        successes=1,
+        failures=0,
+    )
+
+    assert result.applied is False
+    assert result.bias == 0.0
+
+
+def test_profile_is_supported():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    profile = (
+        MetaLearningProfile()
+    )
+
+    for index in range(8):
+        profile.record_exploration(
+            success=True,
+            event_id=f"event-{index}",
+        )
+
+    result = (
+        adapter.evaluate_profile(
+            profile
+        )
+    )
+
+    assert result.success_rate == 1.0
+    assert result.bias > 0.0
+
+
+def test_profile_failure_history_creates_negative_bias():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    profile = (
+        MetaLearningProfile()
+    )
+
+    for index in range(8):
+        profile.record_exploration(
+            success=False,
+            event_id=f"event-{index}",
+        )
+
+    result = (
+        adapter.evaluate_profile(
+            profile
+        )
+    )
+
+    assert result.success_rate == 0.0
+    assert result.bias < 0.0
+
+
+def test_apply_positive_bias_to_score():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=9,
+        failures=1,
+    )
+
+    final_score = (
+        adapter.apply_to_score(
+            exploration_score=0.50,
+            bias=result,
+        )
+    )
+
+    assert final_score > 0.50
+
+
+def test_apply_negative_bias_to_score():
+    adapter = (
+        ExplorationBiasAdapter(
+            minimum_pressure=0.01,
+        )
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=1,
+        failures=9,
+    )
+
+    final_score = (
+        adapter.apply_to_score(
+            exploration_score=0.50,
+            bias=result,
+        )
+    )
+
+    assert final_score < 0.50
+
+
+def test_neutral_bias_does_not_change_score():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    result = adapter.evaluate(
+        attempts=10,
+        successes=5,
+        failures=5,
+    )
+
+    final_score = (
+        adapter.apply_to_score(
+            exploration_score=0.50,
+            bias=result,
+        )
+    )
+
+    assert final_score == 0.50
+
+
+def test_none_profile_is_rejected():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="profile cannot be None",
+    ):
+        adapter.evaluate_profile(
+            None
+        )
+
+
+def test_none_bias_is_rejected():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="bias cannot be None",
+    ):
+        adapter.apply_to_score(
+            exploration_score=0.5,
+            bias=None,
+        )
+
+
+def test_invalid_counts_are_rejected():
+    adapter = (
+        ExplorationBiasAdapter()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="attempts cannot be negative",
+    ):
+        adapter.evaluate(
+            attempts=-1,
+            successes=0,
+            failures=0,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="successes cannot be negative",
+    ):
+        adapter.evaluate(
+            attempts=1,
+            successes=-1,
+            failures=0,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="failures cannot be negative",
+    ):
+        adapter.evaluate(
+            attempts=1,
+            successes=0,
+            failures=-1,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="cannot exceed attempts",
+    ):
+        adapter.evaluate(
+            attempts=2,
+            successes=2,
+            failures=1,
+        )
+
+
+def test_invalid_configuration_is_rejected():
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            neutral_success_rate=-0.1,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            neutral_success_rate=1.1,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            minimum_evidence=0,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            maximum_bias=-0.1,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            maximum_bias=1.1,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            minimum_pressure=-0.1,
+        )
+
+    with pytest.raises(
+        ValueError,
+    ):
+        ExplorationBiasAdapter(
+            minimum_pressure=1.1,
+        )
