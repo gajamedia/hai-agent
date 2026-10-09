@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 data/*.db
 opencode-debug.log
+# Local environment configuration
+.env
+.env.*
+!.env.example

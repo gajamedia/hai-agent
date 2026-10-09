@@ -2,7 +2,20 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Callable
+
+# from dotenv import load_dotenv
+
+# # Resolve the project root independently of the current working directory.
+# PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# # Load environment variables before importing runtime dependencies.
+# # Existing OS environment variables take precedence over .env values.
+# load_dotenv(
+#     dotenv_path=PROJECT_ROOT / ".env",
+#     override=False,
+# )
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
