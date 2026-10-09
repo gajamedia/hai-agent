@@ -188,19 +188,105 @@ class AgentCognitiveRuntime:
         state = getattr(self.agent, "state", None)
         return getattr(state, "world_model", None)
 
+    # def _resolve_relevant_memory(self, explicit: Any) -> Any:
+    #     if explicit is not None:
+    #         return explicit
+
+    #     working_memory = getattr(self.agent, "working_memory", None)
+    #     if working_memory is None:
+    #         return None
+
+    #     snapshot = getattr(working_memory, "snapshot", None)
+    #     if callable(snapshot):
+    #         return snapshot()
+
+    #     return working_memory
+    # def _resolve_relevant_memory(self, explicit: Any) -> Any:
+    #     if explicit is not None:
+    #         return explicit
+
+    #     working_memory = getattr(self.agent, "working_memory", None)
+    #     if working_memory is None:
+    #         return []
+
+    #     # Some memory implementations expose snapshot(); others expose
+    #     # their current state through attributes. Normalize both forms.
+    #     snapshot = getattr(working_memory, "snapshot", None)
+    #     if callable(snapshot):
+    #         value = snapshot()
+    #         if value is None:
+    #             return []
+    #         if isinstance(value, Mapping):
+    #             return [dict(value)]
+    #         if isinstance(value, (str, bytes, bytearray)):
+    #             return [value]
+    #         try:
+    #             return list(value)
+    #         except TypeError:
+    #             return [value]
+
+    #     fields = (
+    #         "goal",
+    #         "context",
+    #         "current_action",
+    #         "plan",
+    #         "reasoning",
+    #         "recent_observation",
+    #     )
+
+    #     memory_state = {}
+    #     for field in fields:
+    #         value = getattr(working_memory, field, None)
+    #         if value is not None:
+    #             memory_state[field] = value
+
+    #     return [memory_state] if memory_state else []
     def _resolve_relevant_memory(self, explicit: Any) -> Any:
+        """
+        Resolve relevant memory while preserving the existing data contract.
+
+        - Explicit memory takes precedence.
+        - Snapshot results are returned without changing their structure.
+        - Mapping-based working memory remains a mapping.
+        - WorkingMemory objects without snapshot() are converted to a mapping.
+        """
         if explicit is not None:
             return explicit
 
         working_memory = getattr(self.agent, "working_memory", None)
-        if working_memory is None:
-            return None
 
+        if working_memory is None:
+            return []
+
+        # Preserve existing behavior: don't wrap snapshot results in a list.
         snapshot = getattr(working_memory, "snapshot", None)
         if callable(snapshot):
-            return snapshot()
+            value = snapshot()
+            return [] if value is None else value
 
-        return working_memory
+        # Preserve dictionaries and other mapping-based memory.
+        if isinstance(working_memory, Mapping):
+            return working_memory
+
+        # WorkingMemory objects may not implement snapshot() or slicing.
+        fields = (
+            "goal",
+            "context",
+            "current_action",
+            "plan",
+            "reasoning",
+            "recent_observation",
+        )
+
+        memory_state = {}
+        for field in fields:
+            value = getattr(working_memory, field, None)
+            if value is not None:
+                memory_state[field] = value
+
+        # return memory_state if memory_state else []
+        return [memory_state] if memory_state else []
+
 
     def _resolve_strategy(self, explicit: Any) -> Any:
         if explicit is not None:

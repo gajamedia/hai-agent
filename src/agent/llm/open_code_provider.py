@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import json
 import os
 import subprocess
@@ -442,10 +443,38 @@ class OpenCodeProvider:
 
         return command
 
+    # def _run_command(
+    #     self,
+    #     command: Sequence[str],
+    # ) -> subprocess.CompletedProcess[str]:
+    #     if self._runner is not None:
+    #         return self._runner(
+    #             command,
+    #             self.cwd,
+    #             self.timeout,
+    #             self.environment,
+    #         )
+
+    #     environment = None
+
+    #     if self.environment is not None:
+    #         environment = dict(os.environ)
+    #         environment.update(self.environment)
+
+    #     return subprocess.run(
+    #         list(command),
+    #         cwd=self.cwd,
+    #         env=environment,
+    #         capture_output=True,
+    #         text=True,
+    #         timeout=self.timeout,
+    #         check=False,
+    #     )
     def _run_command(
         self,
         command: Sequence[str],
     ) -> subprocess.CompletedProcess[str]:
+        # Keep the injected runner unchanged for unit tests.
         if self._runner is not None:
             return self._runner(
                 command,
@@ -455,13 +484,65 @@ class OpenCodeProvider:
             )
 
         environment = None
-
         if self.environment is not None:
             environment = dict(os.environ)
             environment.update(self.environment)
 
+        command_to_run = list(command)
+
+        # Windows PowerShell shims (.ps1) cannot be launched as ordinary
+        # executables through subprocess.run([...]).
+        if os.name == "nt":
+            executable = command_to_run[0]
+            executable_path = Path(executable)
+
+            if executable_path.suffix.lower() == ".ps1":
+                powershell = shutil.which("powershell.exe") or shutil.which(
+                    "powershell"
+                )
+                if powershell is None:
+                    raise FileNotFoundError(
+                        "powershell.exe was not found on PATH."
+                    )
+
+                command_to_run = [
+                    powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(executable_path),
+                    *command_to_run[1:],
+                ]
+            elif executable_path.name.lower() == "opencode":
+                # Prefer the installed PowerShell shim when the provider
+                # still uses the default executable name.
+                powershell_shim = shutil.which("opencode.ps1")
+                if powershell_shim:
+                    powershell = shutil.which("powershell.exe") or shutil.which(
+                        "powershell"
+                    )
+                    if powershell is None:
+                        raise FileNotFoundError(
+                            "powershell.exe was not found on PATH."
+                        )
+
+                    command_to_run = [
+                        powershell,
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        powershell_shim,
+                        *command_to_run[1:],
+                    ]
+
         return subprocess.run(
-            list(command),
+            command_to_run,
             cwd=self.cwd,
             env=environment,
             capture_output=True,
@@ -469,6 +550,7 @@ class OpenCodeProvider:
             timeout=self.timeout,
             check=False,
         )
+
 
     @staticmethod
     def _render_messages(
