@@ -5,7 +5,7 @@ from agent.cognition.goal_decomposer import GoalDecomposer
 from agent.cognition.hierarchical_planner import (
     HierarchicalPlanner,
 )
-
+from unittest.mock import patch
 
 def create_actions():
     return [
@@ -250,62 +250,68 @@ def test_learning_does_not_create_procedure_from_failed_experience():
 
 
 def test_failed_procedure_is_not_reused():
-
     agent = create_agent()
 
     # Learn a valid procedure first.
-    record_successful_door_experience(
-        agent
-    )
+    record_successful_door_experience(agent)
 
-    memory = (
-        agent.procedural_memory.latest()
-    )
+    memory = agent.procedural_memory.latest()
 
     assert memory is not None
+    assert memory.success_count == 1
 
-    # Introduce two failures so failure count
-    # becomes greater than success count.
-    memory.record_failure(
-        ["failed-1"]
-    )
+    # Make failures exceed successes.
+    memory.record_failure(["failed-1"])
+    memory.record_failure(["failed-2"])
 
-    memory.record_failure(
-        ["failed-2"]
-    )
+    assert memory.failure_count > memory.success_count
 
     planner = HierarchicalPlanner(
         planner=agent.planner,
         decomposer=GoalDecomposer(),
-        procedural_store=(
-            agent.procedural_memory
-        ),
-        causal_store=(
-            agent.causal_memory
-        ),
+        procedural_store=agent.procedural_memory,
+        causal_store=agent.causal_memory,
     )
 
     goal = Goal(
         description="open the door",
-        target_state={
-            "door": "unlocked",
-        },
+        target_state={"door": "unlocked"},
     )
 
-    plan = planner.plan(
-        goal=goal,
-        world_state={
-            "door": "locked",
-            "box": "open",
-            "key": "inside_box",
-        },
-    )
+    world_state = {
+        "door": "locked",
+        "box": "open",
+        "key": "inside_box",
+    }
 
-    # Classical planner should still be able to
-    # produce the correct plan.
+    # Verify that the learned procedure is rejected
+    # before its action steps are resolved.
+    with (
+        patch.object(
+            planner,
+            "_resolve_action_steps",
+            wraps=planner._resolve_action_steps,
+        ) as resolve_steps,
+        patch.object(
+            agent.planner,
+            "plan",
+            wraps=agent.planner.plan,
+        ) as symbolic_plan,
+    ):
+        plan = planner.plan(
+            goal=goal,
+            world_state=world_state,
+        )
+
+    # The learned procedure must not be resolved.
+    resolve_steps.assert_not_called()
+
+    # The classical planner must be used as fallback.
+    symbolic_plan.assert_called_once()
+
+    # The fallback must still produce a valid plan.
     assert [
-        action.name
-        for action in plan
+        action.name for action in plan
     ] == [
         "take_key",
         "unlock_door",
