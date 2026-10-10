@@ -2535,61 +2535,78 @@ class Agent:
     def _record_decision_capability_telemetry(
         self,
         decision,
-        success: bool,
+        success: bool | None = None,
+        *,
+        decision_making_success: bool | None = None,
+        execution_success: bool | None = None,
+        goal_achievement_success: bool | None = None,
+        mode_success: bool | None = None,
     ) -> None:
+        """Record capability evidence from one runtime decision.
+
+        ``success`` remains as a backward-compatible argument for existing
+        callers. When no specific outcomes are supplied, its value is used
+        for every capability, preserving the previous method contract.
+
+        Runtime callers should provide separate outcomes because a successful
+        action does not necessarily mean that the goal was achieved. A None
+        outcome records an attempt without asserting success or failure.
         """
-        Record explicit capability evidence produced by a
-        runtime decision.
-
-        The following capabilities are currently supported:
-
-            decision_making
-            execution
-            goal_achievement
-
-        Additionally, one mode-specific capability is recorded:
-
-            exploration
-            exploitation
-
-        Planning and reasoning are intentionally not inferred
-        here because the current runtime does not expose enough
-        direct evidence to make those measurements trustworthy.
-        """
-
         source = "decide_and_act"
+        has_specific_outcomes = any(
+            value is not None
+            for value in (
+                decision_making_success,
+                execution_success,
+                goal_achievement_success,
+                mode_success,
+            )
+        )
+
+        # ``None`` means no explicit outcome was supplied for a category.
+        # Preserve the legacy ``success`` fallback for decision-making and
+        # other unspecified categories, while allowing callers to provide
+        # independently measured outcomes for any category.
+        if decision_making_success is None:
+            decision_making_success = success
+        if not has_specific_outcomes:
+            execution_success = success
+            goal_achievement_success = success
+            mode_success = success
+        else:
+            if execution_success is None:
+                execution_success = success
+            if goal_achievement_success is None:
+                goal_achievement_success = success
+            if mode_success is None:
+                mode_success = success
 
         self.record_capability_telemetry(
             "decision_making",
-            success,
+            decision_making_success,
             source=source,
         )
-
         self.record_capability_telemetry(
             "execution",
-            success,
+            execution_success,
             source=source,
         )
-
         self.record_capability_telemetry(
             "goal_achievement",
-            success,
+            goal_achievement_success,
             source=source,
         )
 
         if decision.mode == DecisionMode.EXPLORE:
-
             self.record_capability_telemetry(
                 "exploration",
-                success,
+                mode_success,
                 source=source,
             )
-
         elif decision.mode == DecisionMode.EXPLOIT:
-
             self.record_capability_telemetry(
                 "exploitation",
-                success,
+                mode_success,
                 source=source,
             )
 
@@ -3461,13 +3478,69 @@ class Agent:
         # Capability telemetry
         # -------------------------------------------------
         #
-        # Record capability evidence only after the final
-        # decision outcome has been resolved.
+        # Keep execution outcome separate from goal completion.
+        # Decision-making quality is not inferred from either one;
+        # the current runtime has no direct independent measure for it.
+        # ``decision_success`` remains the established mode/meta-learning
+        # outcome to preserve existing adaptation behavior.
         # -------------------------------------------------
+
+        execution_success: bool | None = None
+        plan_execution_results = getattr(
+            result,
+            "plan_execution_results",
+            None,
+        )
+        exploration_result = getattr(
+            result,
+            "exploration_result",
+            None,
+        )
+        direct_result = getattr(
+            result,
+            "direct_result",
+            None,
+        )
+
+        if plan_execution_results is not None:
+            execution_success = (
+                len(plan_execution_results) > 0
+                and all(
+                    bool(getattr(step, "success", False))
+                    for step in plan_execution_results
+                )
+            )
+        elif exploration_result is not None:
+            outcome = getattr(
+                exploration_result,
+                "success",
+                None,
+            )
+            if outcome is not None:
+                execution_success = bool(outcome)
+        elif direct_result is not None:
+            if isinstance(direct_result, dict):
+                if "success" in direct_result:
+                    execution_success = bool(direct_result["success"])
+            else:
+                outcome = getattr(direct_result, "success", None)
+                if outcome is not None:
+                    execution_success = bool(outcome)
+
+        # Some lightweight/runtime test paths do not return an explicit
+        # execution result. In that case, retain the historical telemetry
+        # fallback to the evaluated decision outcome. Whenever execution
+        # supplies its own outcome, it remains independent of goal status.
+        if execution_success is None:
+            execution_success = decision_success
 
         self._record_decision_capability_telemetry(
             decision=decision,
             success=decision_success,
+            decision_making_success=decision_success,
+            execution_success=execution_success,
+            goal_achievement_success=goal_satisfied,
+            mode_success=decision_success,
         )
 
         # -------------------------------------------------

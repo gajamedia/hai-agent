@@ -1,0 +1,129 @@
+.telemetry-section {
+  margin-top: 30px;
+}
+.telemetry-refresh {
+  margin-left: auto;
+  align-self: center;
+  white-space: nowrap;
+}
+.telemetry-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0;
+}
+.telemetry-metrics .metric {
+  min-width: 0;
+}
+.telemetry-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 13px 15px;
+  margin: 14px 0;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 12px;
+  color: var(--muted, #94a3b8);
+  background: rgba(148, 163, 184, 0.06);
+}
+.telemetry-note svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+.telemetry-note p {
+  margin: 0;
+  line-height: 1.55;
+  font-size: 0.9rem;
+}
+.telemetry-table-panel {
+  margin-top: 14px;
+}
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+.telemetry-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.9rem;
+}
+.telemetry-table th,
+.telemetry-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+  white-space: nowrap;
+}
+.telemetry-table th {
+  color: var(--muted, #94a3b8);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.telemetry-table td code {
+  font-size: 0.82rem;
+}
+.telemetry-no-data {
+  padding: 4px 0 8px;
+}
+.telemetry-footnote,
+.telemetry-updated {
+  color: var(--muted, #94a3b8);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+.telemetry-footnote {
+  margin: 12px 0 0;
+}
+.telemetry-updated {
+  margin: 12px 2px 0;
+}
+.telemetry-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.telemetry-error p {
+  margin: 5px 0 0;
+}
+.telemetry-outcome {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.telemetry-outcome.success-text {
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+}
+.telemetry-outcome.failure-text {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
+}
+.telemetry-outcome.unknown-text {
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.12);
+}
+@media (max-width: 900px) {
+  .telemetry-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 560px) {
+  .telemetry-metrics {
+    grid-template-columns: 1fr;
+  }
+  .telemetry-section .section-head {
+    flex-wrap: wrap;
+  }
+  .telemetry-refresh {
+    margin-left: 0;
+  }
+  .telemetry-table th,
+  .telemetry-table td {
+    padding: 10px;
+  }
+}

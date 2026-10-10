@@ -256,3 +256,110 @@ def test_adaptive_planner_falls_back_when_strategy_is_not_executable():
         "take_key",
         "unlock_door",
     ]
+
+def test_adaptive_planner_ignores_paused_strategy():
+    actions = create_actions()
+    planner = Planner(actions)
+
+    adaptive_planner = AdaptivePlanner(
+        planner=planner,
+        strategy_selector=StrategySelector(),
+    )
+
+    strategy = Strategy(
+        name="paused_strategy",
+        goal="Open the door",
+        steps=["find_spare_key", "unlock_door"],
+        success_count=10,
+        total_actions=20,
+    )
+    strategy.pause()
+
+    plan = adaptive_planner.plan(
+        world_state={
+            "door": "locked",
+            "box": "closed",
+            "key": "inside_box",
+            "spare_key": "available",
+        },
+        goal_state={"door": "unlocked"},
+        goal="Open the door",
+        strategies=[strategy],
+    )
+
+    assert [action.name for action in plan] == [
+        "open_box",
+        "take_key",
+        "unlock_door",
+    ]
+
+
+def test_adaptive_planner_ignores_retired_strategy():
+    actions = create_actions()
+    planner = Planner(actions)
+
+    adaptive_planner = AdaptivePlanner(
+        planner=planner,
+        strategy_selector=StrategySelector(),
+    )
+
+    strategy = Strategy(
+        name="retired_strategy",
+        goal="Open the door",
+        steps=["find_spare_key", "unlock_door"],
+        success_count=10,
+        total_actions=20,
+    )
+    strategy.retire()
+
+    plan = adaptive_planner.plan(
+        world_state={
+            "door": "locked",
+            "box": "closed",
+            "key": "inside_box",
+            "spare_key": "available",
+        },
+        goal_state={"door": "unlocked"},
+        goal="Open the door",
+        strategies=[strategy],
+    )
+
+    assert [action.name for action in plan] == [
+        "open_box",
+        "take_key",
+        "unlock_door",
+    ]
+
+def test_adaptive_planner_falls_back_when_strategy_does_not_achieve_goal():
+    planner = Planner(create_actions())
+
+    adaptive_planner = AdaptivePlanner(
+        planner=planner,
+        strategy_selector=StrategySelector(),
+    )
+
+    incomplete_strategy = Strategy(
+        name="incomplete_strategy",
+        goal="Open the door",
+        steps=["find_spare_key"],
+        success_count=10,
+        total_actions=10,
+    )
+
+    plan = adaptive_planner.plan(
+        world_state={
+            "door": "locked",
+            "box": "closed",
+            "key": "inside_box",
+            "spare_key": "available",
+        },
+        goal_state={"door": "unlocked"},
+        goal="Open the door",
+        strategies=[incomplete_strategy],
+    )
+
+    assert [action.name for action in plan] == [
+        "open_box",
+        "take_key",
+        "unlock_door",
+    ]

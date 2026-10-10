@@ -12,11 +12,15 @@ from agent.llm.contracts import (
     LLMRequest,
     LLMResponse,
 )
+import logging
+import time
 
 
 DEFAULT_EXECUTABLE = "opencode"
 DEFAULT_PROVIDER_NAME = "opencode"
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 class OpenCodeProviderError(RuntimeError):
     """Base error for the OpenCode LLM provider."""
@@ -318,21 +322,61 @@ class OpenCodeProvider:
 
         command = self.build_command(request)
 
+        # try:
+        #     result = self._run_command(command)
+        # except FileNotFoundError as exc:
+        #     raise OpenCodeConfigurationError(
+        #         f"OpenCode executable was not found: {self.executable!r}. "
+        #         "Make sure `opencode` is installed and available on PATH."
+        #     ) from exc
+        # except subprocess.TimeoutExpired as exc:
+        #     raise OpenCodeTimeoutError(
+        #         f"OpenCode request timed out after {self.timeout} seconds."
+        #     ) from exc
+        # except OSError as exc:
+        #     raise OpenCodeConfigurationError(
+        #         f"Failed to start OpenCode: {exc}"
+        #     ) from exc
+        started_at = time.perf_counter()
         try:
             result = self._run_command(command)
         except FileNotFoundError as exc:
+            elapsed = time.perf_counter() - started_at
+            logger.error(
+                "OpenCode executable not found after %.2fs",
+                elapsed,
+            )
             raise OpenCodeConfigurationError(
                 f"OpenCode executable was not found: {self.executable!r}. "
                 "Make sure `opencode` is installed and available on PATH."
             ) from exc
         except subprocess.TimeoutExpired as exc:
+            elapsed = time.perf_counter() - started_at
+            logger.error(
+                "OpenCode timed out after %.2fs (limit=%s seconds)",
+                elapsed,
+                self.timeout,
+            )
             raise OpenCodeTimeoutError(
                 f"OpenCode request timed out after {self.timeout} seconds."
             ) from exc
         except OSError as exc:
+            elapsed = time.perf_counter() - started_at
+            logger.error(
+                "Failed to start OpenCode after %.2fs: %s",
+                elapsed,
+                exc,
+            )
             raise OpenCodeConfigurationError(
                 f"Failed to start OpenCode: {exc}"
             ) from exc
+
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "OpenCode process finished in %.2fs with exit code %s",
+            elapsed,
+            result.returncode,
+        )
 
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()

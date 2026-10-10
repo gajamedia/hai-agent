@@ -426,3 +426,105 @@ def test_unsupported_decision_mode_is_rejected():
         raise AssertionError(
             "Expected ValueError."
         )
+
+def test_exploit_plan_is_not_execution_success():
+    planner = create_hierarchical_planner()
+    executor = UnifiedDecisionExecutor(
+        hierarchical_planner=planner,
+    )
+
+    decision = AgentDecision(
+        mode=DecisionMode.EXPLOIT,
+        reason="Use existing knowledge.",
+        uncertainty=0.1,
+        expected_information_gain=0.1,
+        risk=0.1,
+    )
+
+    result = executor.execute(
+        decision,
+        goal=Goal(
+            "open the door",
+            target_state={"door": "unlocked"},
+        ),
+        world_state={
+            "door": "locked",
+            "box": "open",
+            "key": "agent",
+        },
+        strategies=[],
+    )
+
+    assert result.plan is not None
+    assert result.success is False
+
+def test_execute_plan_runs_actions_in_one_experience():
+    agent = create_agent()
+    environment = RoomEnvironment()
+    executor = UnifiedDecisionExecutor(
+        explorer=ActiveExplorer(),
+        hierarchical_planner=create_hierarchical_planner(),
+    )
+
+    decision = AgentDecision(
+        mode=DecisionMode.EXPLOIT,
+        reason="Execute the planned actions.",
+        uncertainty=0.1,
+        expected_information_gain=0.1,
+        risk=0.1,
+    )
+
+    goal = Goal(
+        "open the door",
+        target_state={"door": "unlocked"},
+    )
+
+    result = executor.execute_plan(
+        decision=decision,
+        agent=agent,
+        environment=environment,
+        goal=goal,
+        actions=create_actions(),
+        world_state=environment.observe(),
+        experience_id="exploit-plan-test",
+    )
+
+    assert result.success is True
+    assert environment.observe()["door"] == "unlocked"
+    assert agent.current_experience is None
+
+def test_exploration_success_is_separate_from_goal_satisfaction():
+    agent = create_agent()
+    environment = RoomEnvironment()
+
+    executor = UnifiedDecisionExecutor(
+        explorer=ActiveExplorer(),
+    )
+
+    decision = AgentDecision(
+        mode=DecisionMode.EXPLORE,
+        reason="Need more knowledge.",
+        uncertainty=1.0,
+        expected_information_gain=1.0,
+        risk=0.1,
+    )
+
+    result = executor.execute(
+        decision,
+        agent=agent,
+        environment=environment,
+        actions=[create_actions()[0]],
+        information_gain={"open_box": 1.0},
+        action_risk={"open_box": 0.1},
+        exploration_risk=0.1,
+        experience_id="explore-goal-contract",
+        goal=Goal(
+            "unlock the door",
+            target_state={"door": "unlocked"},
+        ),
+    )
+
+    assert result.exploration_result is not None
+    assert result.success is True
+    assert result.exploration_result.success is True
+    assert result.exploration_result.goal_satisfied is False

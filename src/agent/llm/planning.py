@@ -11,6 +11,9 @@ from .contracts import LLMResponse
 from .reasoning import LLMReasoning
 from .service import LLMService
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_SYSTEM_PROMPT = """You are the planning layer of an autonomous agent.
 Create a structured, minimal, goal-directed plan from the supplied goal, agent context, and reasoning.
@@ -410,12 +413,30 @@ class LLMPlanner:
             },
         )
 
-        plan = LLMPlanParser.parse(
-            response.content,
-            provider=response.provider,
-            model=response.model,
-            max_steps=self.max_steps,
-        )
+        # plan = LLMPlanParser.parse(
+        #     response.content,
+        #     provider=response.provider,
+        #     model=response.model,
+        #     max_steps=self.max_steps,
+        # )
+        try:
+            plan = LLMPlanParser.parse(
+                response.content,
+                provider=response.provider,
+                model=response.model,
+                max_steps=self.max_steps,
+            )
+        except LLMPlanningParseError:
+            content = response.content or ""
+            logger.warning(
+                "LLM planning response could not be parsed as JSON "
+                "(provider=%s, model=%s, chars=%d, preview=%r)",
+                response.provider,
+                response.model,
+                len(content),
+                content[:200],
+            )
+            raise
 
         self.last_response = response
         self.last_plan = plan
