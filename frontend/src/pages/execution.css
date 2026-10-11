@@ -1,0 +1,197 @@
+
+.execution-section {
+  margin-top: 32px;
+  scroll-margin-top: 24px;
+}
+
+.execution-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.execution-action-list,
+.execution-order,
+.execution-steps {
+  display: grid;
+  gap: 10px;
+}
+
+.execution-action {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border: 1px solid var(--border, #29333f);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.execution-action input {
+  margin-top: 4px;
+  accent-color: var(--accent, #70e1c1);
+}
+
+.execution-action span,
+.execution-order-item > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.execution-action small,
+.execution-order-item small {
+  color: var(--muted, #8e9baa);
+  font-size: 12px;
+}
+
+.execution-order {
+  margin-top: 20px;
+}
+
+.execution-order-item {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border, #29333f);
+  border-radius: 9px;
+}
+
+.execution-order-item code {
+  overflow-wrap: anywhere;
+}
+
+.execution-order-controls {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.execution-order-controls button {
+  min-width: 30px;
+  padding: 5px;
+}
+
+.execution-field {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.execution-field > span {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.execution-field input {
+  width: 100%;
+  padding: 11px 12px;
+  color: inherit;
+  background: var(--surface, #101820);
+  border: 1px solid var(--border, #29333f);
+  border-radius: 8px;
+  font: inherit;
+}
+
+.execution-target-editor {
+  min-height: 100px;
+}
+
+.execution-form-foot {
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.execution-form-foot code {
+  overflow-wrap: anywhere;
+}
+
+.execution-control-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.execution-result-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.execution-result-metrics > div {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 12px;
+  background: var(--surface, #101820);
+  border-radius: 9px;
+}
+
+.execution-result-metrics small {
+  color: var(--muted, #8e9baa);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.execution-result-metrics b {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.execution-tag-success {
+  color: var(--success, #70e1a1);
+}
+
+.execution-success-icon {
+  flex-shrink: 0;
+  color: var(--success, #70e1a1);
+}
+
+.execution-failure-icon {
+  flex-shrink: 0;
+  color: var(--danger, #ff8585);
+}
+
+.execution-json {
+  max-width: 100%;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface, #101820);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.execution-section .alert pre {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .execution-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 520px) {
+  .execution-result-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .execution-form-foot {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .execution-form-foot button {
+    justify-content: center;
+  }
+}

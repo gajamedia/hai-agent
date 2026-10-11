@@ -47,7 +47,9 @@ class CognitiveRunRequest(BaseModel):
     # Optional inputs for LLM-assisted metacognition.
     include_metacognition: bool = False
     episode: Any = None
-    deterministic_reflection: DeterministicReflectionInput | None = None
+    deterministic_reflection: (
+        DeterministicReflectionInput | None
+    ) = None
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     include_trace: bool = False
@@ -57,3 +59,13 @@ class CognitiveRunResponse(BaseModel):
     cycle: int | None = None
     result: dict[str, Any]
     trace: dict[str, Any] | None = None
+
+
+class ExecutionRunRequest(BaseModel):
+    """Input for explicit execution in the room simulation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[str] = Field(min_length=1, max_length=4)
+    goal_description: str = Field(min_length=1, max_length=500)
+    target_state: dict[str, Any] = Field(min_length=1)
