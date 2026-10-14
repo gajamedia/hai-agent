@@ -1,12 +1,11 @@
-
 export const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
 ).replace(/\/+$/, "");
 
 async function parseResponse(response) {
   const text = await response.text();
-  let body;
 
+  let body;
   try {
     body = text ? JSON.parse(text) : {};
   } catch {
@@ -60,23 +59,14 @@ export async function getCapabilityTelemetry({
   );
 }
 
-/**
- * Read the current simulation state and available actions.
- */
+export async function getStrategies(signal) {
+  return request("/api/v1/strategies", { signal });
+}
+
 export async function getExecutionState(signal) {
   return request("/api/v1/execution/state", { signal });
 }
 
-/**
- * Execute one action or an ordered list of actions.
- *
- * Example:
- * {
- *   actions: ["open_box", "take_key", "unlock_door"],
- *   goal_description: "Unlock the door",
- *   target_state: { door: "unlocked" }
- * }
- */
 export async function runExecution(payload, signal) {
   return request("/api/v1/execution/run", {
     method: "POST",
@@ -86,10 +76,6 @@ export async function runExecution(payload, signal) {
   });
 }
 
-/**
- * Reset the simulation environment.
- * Backend telemetry is expected to be retained.
- */
 export async function resetExecution(signal) {
   return request("/api/v1/execution/reset", {
     method: "POST",

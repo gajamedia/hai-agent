@@ -528,3 +528,86 @@ def test_exploration_success_is_separate_from_goal_satisfaction():
     assert result.success is True
     assert result.exploration_result.success is True
     assert result.exploration_result.goal_satisfied is False
+
+
+def test_execute_plan_records_precondition_failure_as_episode():
+    agent = create_agent()
+    environment = RoomEnvironment()
+
+    executor = UnifiedDecisionExecutor(
+        explorer=ActiveExplorer(),
+        hierarchical_planner=create_hierarchical_planner(),
+    )
+
+    decision = AgentDecision(
+        mode=DecisionMode.EXPLOIT,
+        reason="Test failed precondition recording.",
+        uncertainty=0.1,
+        expected_information_gain=0.0,
+        risk=0.1,
+    )
+
+    goal = Goal(
+        "unlock the door",
+        target_state={"door": "unlocked"},
+    )
+
+    state_before = dict(environment.observe())
+    episodic_count_before = agent.episodic_memory.count()
+
+    # Deliberately attempt unlock_door before obtaining the key.
+    actions = [agent.actions["unlock_door"]]
+
+    result = executor.execute_plan(
+        decision=decision,
+        agent=agent,
+        environment=environment,
+        goal=goal,
+        actions=actions,
+        world_state=state_before,
+        experience_id="precondition-failure-regression",
+    )
+
+    assert result.success is False
+    assert result.goal_satisfied is False
+    assert goal.failed is True
+    assert goal.completed is False
+
+    # The failed action must not change the environment.
+    assert environment.observe() == state_before
+
+    # The failed action must be recorded in episodic memory.
+    assert (
+        agent.episodic_memory.count()
+        == episodic_count_before + 1
+    )
+
+    episode = agent.episodic_memory.all()[-1]
+
+    assert episode.action == "unlock_door"
+    assert episode.result["success"] is False
+    assert episode.result["failure_type"] == "precondition_failed"
+    assert "failure" in episode.tags
+    assert episode.observation_before == state_before
+    assert episode.observation_after == state_before
+
+    # The failed episode must belong to the recorded experience.
+    recorded_experience = (
+        agent.experience_recorder.store.latest()
+    )
+
+    assert recorded_experience is not None
+    assert (
+        recorded_experience.experience_id
+        == "precondition-failure-regression"
+    )
+    assert recorded_experience.failed is True
+    assert recorded_experience.completed is False
+    assert recorded_experience.action_count == 1
+    assert (
+        recorded_experience.episodes[0].action
+        == "unlock_door"
+    )
+
+    # The executor owns this experience and must close it.
+    assert agent.current_experience is None

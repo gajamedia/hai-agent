@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -196,12 +195,12 @@ class UnifiedDecisionExecutor:
         experience_id: Optional[str] = None,
         **_: Any,
     ) -> UnifiedExecutionResult:
-        """
-        Execute exactly the supplied Action.
+        """Execute exactly the supplied action and record its outcome.
 
-        This method does not ask ActiveExplorer to choose another
-        action and does not ask the planner to replace the requested
-        action.
+        The requested action is never replaced by an explorer or planner.
+        If the executor owns the experience, it manages that experience's
+        lifecycle. If the caller already owns an experience, this method
+        records the outcome but does not complete, fail, or close it.
         """
         if decision is None:
             raise ValueError("decision cannot be None.")
@@ -221,72 +220,76 @@ class UnifiedDecisionExecutor:
                 "a direct action."
             )
 
-        action_name = str(
-            getattr(action, "name", "")
-        ).strip()
-
+        action_name = str(getattr(action, "name", "")).strip()
         if not action_name:
-            raise ValueError(
-                "action must expose a non-empty name."
-            )
+            raise ValueError("action must expose a non-empty name.")
 
-        # Always use the current environment state for preconditions.
-        observation_before = environment.observe()
-        can_execute = getattr(action, "can_execute", None)
-
-        if callable(can_execute) and not can_execute(
-            observation_before
-        ):
-            failure = {
-                "success": False,
-                "action": action_name,
-                "message": (
-                    "Preconditions are not satisfied for action "
-                    f"'{action_name}'."
-                ),
-                "failure_type": "precondition_failed",
-                "observation_before": dict(observation_before),
-                "observation_after": dict(observation_before),
-            }
-
-            return UnifiedExecutionResult(
-                decision=decision,
-                direct_action=action,
-                direct_result=failure,
-            )
-
-        # Only a Goal instance is accepted by Agent.set_goal().
+        # Establish the goal context before recording an outcome so that
+        # learning and reflection can associate the episode with the goal.
         if isinstance(goal, Goal):
             agent.set_goal(goal)
 
-        current_experience = getattr(
-            agent,
-            "current_experience",
-            None,
-        )
+        current_experience = getattr(agent, "current_experience", None)
         owns_experience = current_experience is None
 
         if owns_experience:
+            state = getattr(agent, "state", None)
+            cycle = getattr(state, "cycle", 0)
             goal_description = (
                 getattr(goal, "description", None)
                 or str(goal or f"Execute action: {action_name}")
             )
             resolved_experience_id = (
                 experience_id
-                or (
-                    f"{getattr(agent, 'name', 'agent')}"
-                    f"-single-action-{agent.state.cycle + 1}"
-                )
+                or f"{getattr(agent, 'name', 'agent')}"
+                f"-single-action-{cycle + 1}"
             )
-
             agent.start_experience(
                 experience_id=resolved_experience_id,
                 goal=goal_description,
             )
 
         try:
-            # ExplorationExecutor performs agent.act(), environment
-            # execution, observations, and episode recording.
+            # Always check the live environment state immediately before
+            # attempting the action.
+            observation_before = dict(environment.observe())
+            can_execute = getattr(action, "can_execute", None)
+
+            if callable(can_execute) and not can_execute(observation_before):
+                failure = {
+                    "success": False,
+                    "action": action_name,
+                    "message": (
+                        "Preconditions are not satisfied for action "
+                        f"'{action_name}'."
+                    ),
+                    "failure_type": "precondition_failed",
+                    "observation_before": dict(observation_before),
+                    "observation_after": dict(observation_before),
+                }
+
+                # Use the Agent's canonical recording pipeline whenever it
+                # exists. Lightweight test doubles may not implement it.
+                record_experience = getattr(agent, "record_experience", None)
+                if callable(record_experience):
+                    record_experience(
+                        action=action_name,
+                        observation_before=dict(observation_before),
+                        observation_after=dict(observation_before),
+                        result=dict(failure),
+                    )
+
+                if owns_experience:
+                    agent.fail_experience()
+
+                return UnifiedExecutionResult(
+                    decision=decision,
+                    direct_action=action,
+                    direct_result=failure,
+                )
+
+            # ExplorationExecutor handles act(), environment execution,
+            # before/after observations, and normal episode recording.
             execution = self.explorer.executor.execute(
                 agent=agent,
                 environment=environment,

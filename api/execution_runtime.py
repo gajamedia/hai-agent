@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
@@ -12,7 +14,6 @@ from agent.core.action import Action
 from agent.core.agent import Agent
 from agent.core.goal import Goal
 from agent.world.room import RoomEnvironment
-
 
 ALLOWED_ACTIONS = (
     "open_box",
@@ -32,9 +33,20 @@ def _simulation_handler(**kwargs: Any) -> dict[str, Any]:
     return {"success": True}
 
 
-def create_simulation_agent() -> Agent:
-    """Create a dedicated Agent for the room simulation."""
-    agent = Agent("hai-simulation-agent")
+def create_simulation_agent(
+    memory_path: str | Path | None = None,
+) -> Agent:
+    """Create a dedicated, persistent Agent for room simulation."""
+    if memory_path is None:
+        memory_path = os.getenv(
+            "HAI_SIMULATION_MEMORY_PATH",
+            "data/simulation_memory.db",
+        )
+
+    agent = Agent(
+        "hai-simulation-agent",
+        memory_path=memory_path,
+    )
 
     actions = [
         Action(
@@ -85,8 +97,13 @@ class ExecutionRuntime:
     Its lock serializes execution, state reads, and resets.
     """
 
-    def __init__(self) -> None:
-        self.agent = create_simulation_agent()
+    def __init__(
+        self,
+        memory_path: str | Path | None = None,
+    ) -> None:
+        self.agent = create_simulation_agent(
+            memory_path=memory_path,
+        )
         self.environment = RoomEnvironment()
         self.lock = RLock()
 
@@ -266,5 +283,7 @@ class ExecutionRuntime:
             }
 
 
-def create_execution_runtime() -> ExecutionRuntime:
-    return ExecutionRuntime()
+def create_execution_runtime(
+    memory_path: str | Path | None = None,
+) -> ExecutionRuntime:
+    return ExecutionRuntime(memory_path=memory_path)

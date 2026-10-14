@@ -10,6 +10,7 @@ import {
   CircleHelp,
   Code2,
   FileJson,
+  FlaskConical,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -26,12 +27,14 @@ import {
   checkHealth,
   getCapabilityTelemetry,
   getExecutionState,
+  getStrategies,
   resetExecution,
   runCognitive,
   runExecution,
 } from "../api/client.js";
 
 import JsonPanel from "../components/JsonPanel.jsx";
+import StrategyLab from "./StrategyLab.jsx";
 import { exampleRequest } from "../data/exampleRequest.js";
 import "./telemetry.css";
 
@@ -704,6 +707,11 @@ export default function Dashboard() {
   const [telemetryError, setTelemetryError] = useState("");
   const [telemetryUpdatedAt, setTelemetryUpdatedAt] = useState(null);
 
+  const [strategiesData, setStrategiesData] = useState(null);
+  const [strategiesLoading, setStrategiesLoading] = useState(false);
+  const [strategiesError, setStrategiesError] = useState("");
+  const [strategiesUpdatedAt, setStrategiesUpdatedAt] = useState(null);
+
   const [executionState, setExecutionState] = useState(null);
   const [executionLoading, setExecutionLoading] = useState(false);
   const [executionBusy, setExecutionBusy] = useState(false);
@@ -715,6 +723,22 @@ export default function Dashboard() {
   const [targetStateText, setTargetStateText] = useState(
     pretty({ box: "open" }),
   );
+
+  const [activeHash, setActiveHash] = useState(
+    window.location.hash || "#top",
+  );
+
+  useEffect(() => {
+    const updateActiveHash = () => {
+      setActiveHash(window.location.hash || "#top");
+    };
+
+    window.addEventListener("hashchange", updateActiveHash);
+
+    return () => {
+      window.removeEventListener("hashchange", updateActiveHash);
+    };
+  }, []);
 
   const parsed = useMemo(() => {
     try {
@@ -742,6 +766,27 @@ export default function Dashboard() {
       }
     } finally {
       if (!signal?.aborted) setTelemetryLoading(false);
+    }
+  }
+
+  async function refreshStrategies(signal) {
+    setStrategiesLoading(true);
+    setStrategiesError("");
+
+    try {
+      const data = await getStrategies(signal);
+      setStrategiesData(data);
+      setStrategiesUpdatedAt(new Date());
+    } catch (exception) {
+      if (exception.name !== "AbortError") {
+        setStrategiesError(
+          `${exception.message}${
+            exception.body ? `\\n${pretty(exception.body)}` : ""
+          }`,
+        );
+      }
+    } finally {
+      if (!signal?.aborted) setStrategiesLoading(false);
     }
   }
 
@@ -788,6 +833,7 @@ export default function Dashboard() {
 
     refreshTelemetry(controller.signal);
     refreshExecutionState(controller.signal);
+    refreshStrategies(controller.signal);
 
     return () => controller.abort();
   }, []);
@@ -807,7 +853,7 @@ export default function Dashboard() {
     try {
       setResponse(await runCognitive(parsed.value));
       setTab("overview");
-      await refreshTelemetry();
+      await Promise.all([refreshTelemetry(), refreshStrategies()]);
     } catch (exception) {
       setError(
         `${exception.message}${
@@ -836,6 +882,7 @@ export default function Dashboard() {
       await Promise.all([
         refreshExecutionState(),
         refreshTelemetry(),
+        refreshStrategies(),
       ]);
     } catch (exception) {
       setExecutionError(
@@ -847,6 +894,7 @@ export default function Dashboard() {
       await Promise.all([
         refreshExecutionState(),
         refreshTelemetry(),
+        refreshStrategies(),
       ]);
     } finally {
       setExecutionBusy(false);
@@ -867,7 +915,7 @@ export default function Dashboard() {
         state: data.state,
       }));
 
-      await refreshTelemetry();
+      await Promise.all([refreshTelemetry(), refreshStrategies()]);
     } catch (exception) {
       setExecutionError(
         `${exception.message}${
@@ -895,20 +943,41 @@ export default function Dashboard() {
         </div>
 
         <p className="nav-label">WORKSPACE</p>
-        <a className="nav active" href="#top">
+        <a
+          className={`nav ${activeHash === "#top" ? "active" : ""}`}
+          href="#top"
+        >
           <Activity size={16} /> Cognitive dashboard
         </a>
-        <a className="nav" href="#request">
+        <a
+          className={`nav ${activeHash === "#request" ? "active" : ""}`}
+          href="#request"
+        >
           <FileJson size={16} /> API request
         </a>
-        <a className="nav" href="#results">
+        <a
+          className={`nav ${activeHash === "#results" ? "active" : ""}`}
+          href="#results"
+        >
           <Workflow size={16} /> Cognitive output
         </a>
-        <a className="nav" href="#execution">
+        <a
+          className={`nav ${activeHash === "#execution" ? "active" : ""}`}
+          href="#execution"
+        >
           <Zap size={16} /> Execution workspace
         </a>
-        <a className="nav" href="#telemetry">
+        <a
+          className={`nav ${activeHash === "#telemetry" ? "active" : ""}`}
+          href="#telemetry"
+        >
           <BarChart3 size={16} /> Capability telemetry
+        </a>
+        <a
+          className={`nav ${activeHash === "#strategies" ? "active" : ""}`}
+          href="#strategies"
+        >
+          <FlaskConical size={16} /> Strategy Lab
         </a>
 
         <div className="side-bottom">
@@ -1195,6 +1264,14 @@ export default function Dashboard() {
           onRun={executeSelectedActions}
           onReset={resetSimulation}
           onRefresh={() => refreshExecutionState()}
+        />
+
+        <StrategyLab
+          data={strategiesData}
+          loading={strategiesLoading}
+          error={strategiesError}
+          updatedAt={strategiesUpdatedAt}
+          onRefresh={() => refreshStrategies()}
         />
 
         <TelemetrySection

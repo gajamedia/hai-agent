@@ -62,20 +62,13 @@ def create_app(
 
     from api.routes.cognitive import router as cognitive_router
     from api.routes.execution import router as execution_router
+    from api.routes.strategies import router as strategies_router
     from api.routes.telemetry import router as telemetry_router
 
-    application.include_router(
-        cognitive_router,
-        prefix="/api/v1",
-    )
-    application.include_router(
-        execution_router,
-        prefix="/api/v1",
-    )
-    application.include_router(
-        telemetry_router,
-        prefix="/api/v1",
-    )
+    application.include_router(cognitive_router, prefix="/api/v1")
+    application.include_router(execution_router, prefix="/api/v1")
+    application.include_router(telemetry_router, prefix="/api/v1")
+    application.include_router(strategies_router, prefix="/api/v1")
 
     @application.get("/health", tags=["system"])
     def health() -> dict[str, str]:

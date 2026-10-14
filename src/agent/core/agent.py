@@ -192,6 +192,12 @@ from agent.learning.learned_state_restoration import (
     UnifiedLearnedStateRestorationResult,
 )
 
+from agent.memory.strategy_evolution_evidence_repository import (
+    StrategyEvolutionEvidenceRepository,
+)
+
+
+
 class Agent:
 
     def __init__(
@@ -509,9 +515,21 @@ class Agent:
         # Strategy evolution evidence
         # -------------------------------------------------
 
+        if self.memory_path is not None:
+            evidence_repository = (
+                StrategyEvolutionEvidenceRepository(
+                    self.memory_path
+                )
+            )
+        else:
+            evidence_repository = None
+
         self.strategy_evolution_evidence = (
-            StrategyEvolutionEvidenceStore()
+            StrategyEvolutionEvidenceStore(
+                repository=evidence_repository
+            )
         )
+
 
         # =================================================
         # Persistent strategy memory
@@ -1705,76 +1723,89 @@ class Agent:
         experience: Experience,
         success: bool,
     ) -> None:
+        if experience is None:
+            return
 
-        attribution = (
-            self.attribute_strategy(
-                experience=experience
-            )
+        # Preserve existing attribution behavior, including an
+        # explicitly selected active strategy.
+        attribution = self.attribute_strategy(
+            experience=experience,
         )
-
         strategy = attribution.strategy
+
+        if strategy is None:
+            # Bootstrap validation applies only when no strategy
+            # has already been attributed.
+            goal = experience.goal
+
+            if not isinstance(goal, str) or not goal.strip():
+                return
+
+            steps = [
+                episode.action
+                for episode in experience.episodes
+            ]
+
+            if not steps or any(
+                not isinstance(action_name, str)
+                or not action_name.strip()
+                for action_name in steps
+            ):
+                return
+
+            if any(
+                action_name not in self.actions
+                for action_name in steps
+            ):
+                return
+
+            strategy = self.strategy_store.get_or_create(
+                goal=goal,
+                steps=steps,
+            )
+            self._refresh_strategy_registry()
 
         if strategy is None:
             return
 
+        # Prevent duplicate outcome updates for the same experience.
+        if experience.experience_id in strategy.source_experiences:
+            return
+
         progress_delta = 0.0
 
-        if (
-            self.last_progress_learning
-            is not None
-        ):
+        if self.last_progress_learning is not None:
             progress_delta = (
-                self.last_progress_learning
-                .progress_delta
+                self.last_progress_learning.progress_delta
             )
 
-        evidence = (
-            self.strategy_evolution_evidence.get(
-                strategy.name
-            )
+        evidence = self.strategy_evolution_evidence.get(
+            strategy.name
         )
 
         if evidence is not None:
-
             evidence.record_trial(
                 success=success,
                 progress_delta=progress_delta,
-                experience_id=(
-                    experience.experience_id
-                ),
+                experience_id=experience.experience_id,
             )
+            self.strategy_evolution_evidence.save(evidence)
 
         if success:
-
             strategy.record_success(
-                experience_id=(
-                    experience.experience_id
-                ),
-                action_count=(
-                    experience.action_count
-                ),
-                progress_delta=(
-                    progress_delta
-                ),
+                experience_id=experience.experience_id,
+                action_count=experience.action_count,
+                progress_delta=progress_delta,
             )
-
         else:
-
             strategy.record_failure(
-                experience_id=(
-                    experience.experience_id
-                ),
-                action_count=(
-                    experience.action_count
-                ),
-                progress_delta=(
-                    progress_delta
-                ),
+                experience_id=experience.experience_id,
+                action_count=experience.action_count,
+                progress_delta=progress_delta,
             )
 
-        self.strategy_store.save(
-            strategy
-        )
+        self.strategy_store.save(strategy)
+        self._refresh_strategy_registry()
 
     # =====================================================
     # Strategy evolution

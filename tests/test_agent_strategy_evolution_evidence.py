@@ -549,3 +549,167 @@ def test_failed_trial_updates_evolution_evidence():
     assert evidence.success_count == 0
     assert evidence.failure_count == 1
     assert evidence.average_progress == -0.5
+
+def make_bootstrap_experience(
+    experience_id: str,
+    goal: str = "Open door",
+    actions=None,
+):
+    from agent.core.experience import Experience
+
+    if actions is None:
+        actions = [
+            "open_box",
+            "take_key",
+            "unlock_door",
+        ]
+
+    experience = Experience(
+        experience_id=experience_id,
+        goal=goal,
+    )
+
+    for cycle, action_name in enumerate(actions, start=1):
+        experience.add_episode(
+            make_episode(
+                action=action_name,
+                success=True,
+                cycle=cycle,
+                observation_before={"cycle": cycle - 1},
+                observation_after={"cycle": cycle},
+            )
+        )
+
+    return experience
+
+
+def test_bootstrap_creates_strategy_from_successful_experience():
+    agent = Agent(name="bootstrap-test")
+    agent.register_actions(make_actions())
+
+    experience = make_bootstrap_experience("bootstrap-success")
+
+    agent._update_strategy_from_experience(
+        experience=experience,
+        success=True,
+    )
+
+    strategies = agent.get_registered_strategies()
+
+    assert len(strategies) == 1
+
+    strategy = strategies[0]
+    assert strategy.goal == "Open door"
+    assert strategy.steps == [
+        "open_box",
+        "take_key",
+        "unlock_door",
+    ]
+    assert strategy.success_count == 1
+    assert strategy.failure_count == 0
+    assert "bootstrap-success" in strategy.source_experiences
+
+
+def test_bootstrap_records_failed_experience():
+    agent = Agent(name="bootstrap-failure-test")
+    agent.register_actions(make_actions())
+
+    experience = make_bootstrap_experience("bootstrap-failure")
+
+    agent._update_strategy_from_experience(
+        experience=experience,
+        success=False,
+    )
+
+    strategies = agent.get_registered_strategies()
+
+    assert len(strategies) == 1
+    assert strategies[0].success_count == 0
+    assert strategies[0].failure_count == 1
+
+
+def test_bootstrap_reuses_strategy_for_same_goal_and_steps():
+    agent = Agent(name="bootstrap-dedupe-test")
+    agent.register_actions(make_actions())
+
+    first = make_bootstrap_experience("bootstrap-repeat-1")
+    second = make_bootstrap_experience("bootstrap-repeat-2")
+
+    agent._update_strategy_from_experience(first, success=True)
+    agent._update_strategy_from_experience(second, success=False)
+
+    strategies = agent.get_registered_strategies()
+
+    assert len(strategies) == 1
+    assert strategies[0].success_count == 1
+    assert strategies[0].failure_count == 1
+    assert set(strategies[0].source_experiences) == {
+        "bootstrap-repeat-1",
+        "bootstrap-repeat-2",
+    }
+
+
+def test_bootstrap_does_not_count_same_experience_twice():
+    agent = Agent(name="bootstrap-idempotency-test")
+    agent.register_actions(make_actions())
+
+    experience = make_bootstrap_experience("bootstrap-once")
+
+    agent._update_strategy_from_experience(experience, success=True)
+    agent._update_strategy_from_experience(experience, success=True)
+
+    strategies = agent.get_registered_strategies()
+
+    assert len(strategies) == 1
+    assert strategies[0].success_count == 1
+    assert strategies[0].attempts == 1
+
+
+def test_bootstrap_rejects_unregistered_action():
+    agent = Agent(name="bootstrap-invalid-action-test")
+    agent.register_actions(make_actions())
+
+    experience = make_bootstrap_experience(
+        "bootstrap-invalid",
+        actions=["action_that_does_not_exist"],
+    )
+
+    agent._update_strategy_from_experience(
+        experience=experience,
+        success=True,
+    )
+
+    assert agent.get_registered_strategies() == []
+
+
+def test_bootstrap_strategy_persists_after_restart(tmp_path):
+    database_path = tmp_path / "bootstrap-memory.db"
+
+    agent = Agent(
+        name="bootstrap-persistence-test",
+        memory_path=str(database_path),
+    )
+    agent.register_actions(make_actions())
+
+    experience = make_bootstrap_experience("bootstrap-persisted")
+
+    agent._update_strategy_from_experience(
+        experience=experience,
+        success=True,
+    )
+
+    restarted_agent = Agent(
+        name="bootstrap-persistence-test",
+        memory_path=str(database_path),
+    )
+
+    strategies = restarted_agent.get_registered_strategies()
+
+    assert len(strategies) == 1
+    assert strategies[0].steps == [
+        "open_box",
+        "take_key",
+        "unlock_door",
+    ]
+    assert strategies[0].success_count == 1
+    assert "bootstrap-persisted" in strategies[0].source_experiences

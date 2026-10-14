@@ -13,3 +13,12 @@ opencode-debug.log
 !**/.env.example
 node_modules/
 dist/
+
+# Local runtime databases and experiment artifacts
+data/*.sqlite3
+data/*.sqlite
+data/*.db-wal
+data/*.db-shm
+
+# Local source backups
+*backup.py

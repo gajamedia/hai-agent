@@ -40,8 +40,11 @@ def create_runtime() -> AgentCognitiveRuntime:
 
     llm_service = LLMService(provider)
 
+    memory_path = os.getenv("HAI_MEMORY_PATH", "data/memory.db")
+
     agent = Agent(
         os.getenv("HAI_AGENT_NAME", "hAI"),
+        memory_path=memory_path,
         llm_service=llm_service,
     )
 
