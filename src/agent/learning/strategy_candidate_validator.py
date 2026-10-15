@@ -1,3 +1,4 @@
+
 """
 Strategy candidate validation subsystem.
 
@@ -36,7 +37,8 @@ class StrategyValidationResult:
 class StrategyCandidateValidator:
     """
     Validate a strategy candidate against available actions,
-    world state, goal state, and optional registered strategies.
+    world state, goal state, lifecycle status, and optional
+    registered strategies.
     """
 
     def __init__(
@@ -109,9 +111,7 @@ class StrategyCandidateValidator:
         Optional[str],
         str,
     ]:
-        simulated_state = dict(
-            world_state
-        )
+        simulated_state = dict(world_state)
 
         if not candidate.steps:
             return (
@@ -132,9 +132,7 @@ class StrategyCandidateValidator:
                     "action is not registered",
                 )
 
-            if not action.can_execute(
-                simulated_state
-            ):
+            if not action.can_execute(simulated_state):
                 return (
                     False,
                     simulated_state,
@@ -142,9 +140,7 @@ class StrategyCandidateValidator:
                     "action preconditions are not satisfied",
                 )
 
-            for key, value in (
-                action.effects.items()
-            ):
+            for key, value in action.effects.items():
                 simulated_state[key] = value
 
         return (
@@ -166,9 +162,36 @@ class StrategyCandidateValidator:
         goal_state: Dict[str, Any],
     ) -> StrategyValidationResult:
 
+        # -------------------------------------------------
+        # Required argument validation
+        # -------------------------------------------------
+
         if candidate is None:
             raise ValueError(
                 "candidate cannot be None."
+            )
+
+        # -------------------------------------------------
+        # Candidate lifecycle validation
+        # -------------------------------------------------
+
+        # Strategies are expected to be active by default.
+        # The fallback preserves compatibility with strategy
+        # test doubles that do not expose a status attribute.
+        candidate_status = getattr(
+            candidate,
+            "status",
+            "active",
+        )
+
+        if candidate_status != "active":
+            return StrategyValidationResult(
+                strategy=candidate,
+                valid=False,
+                reason=(
+                    "candidate is not active "
+                    f"(status: {candidate_status})"
+                ),
             )
 
         if world_state is None:
@@ -232,9 +255,7 @@ class StrategyCandidateValidator:
         # Duplicate strategy
         # -------------------------------------------------
 
-        if self._is_duplicate(
-            candidate
-        ):
+        if self._is_duplicate(candidate):
             return StrategyValidationResult(
                 strategy=candidate,
                 valid=False,
