@@ -11,6 +11,7 @@ from agent.llm.agent_canonical_single_action_api import (
 )
 from agent.llm.agent_execution_boundary import AgentExecutionRequest
 from agent.llm.canonical_single_action import CanonicalSingleActionRequest
+from agent.llm.execution_security import ExecutionSecurityPolicy
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,9 @@ class FakeUnifiedExecutor:
 class FakeAgent:
     def __init__(self):
         self.actions = {"open_box": object(), "take_key": object()}
+        self.execution_security_policy = ExecutionSecurityPolicy(
+            action_risks={"open_box": 0.1, "take_key": 0.1}
+        )
         self.unified_executor = FakeUnifiedExecutor()
         self.configure_called = 0
 

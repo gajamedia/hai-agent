@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .agent_execution_boundary import AgentExecutionRequest
+from .execution_security import ExecutionSecurityPolicy
 from .canonical_single_action import (
     CanonicalSingleActionExecutor,
     CanonicalSingleActionRequest,
@@ -39,11 +40,16 @@ class AgentCanonicalSingleActionAPI:
     * the Agent's existing action registry is enforced by the binding.
     """
 
+    # The generic LLM adapter can recognize that this boundary enforces the
+    # same policy internally and avoid a duplicate approval check.
+    enforces_execution_security = True
+
     def __init__(
         self,
         agent: Any,
         *,
         decision_factory,
+        security_policy: ExecutionSecurityPolicy | None = None,
     ) -> None:
         if agent is None:
             raise AgentCanonicalSingleActionAPIConfigurationError(
@@ -69,9 +75,19 @@ class AgentCanonicalSingleActionAPI:
 
         self.agent = agent
         self.decision_factory = decision_factory
+        self.security_policy = (
+            security_policy
+            or getattr(agent, "execution_security_policy", None)
+            or ExecutionSecurityPolicy()
+        )
+        if not isinstance(self.security_policy, ExecutionSecurityPolicy):
+            raise AgentCanonicalSingleActionAPIConfigurationError(
+                "security_policy must be an ExecutionSecurityPolicy."
+            )
         self.executor = CanonicalSingleActionExecutor.for_agent(
             agent,
             decision_factory=decision_factory,
+            security_policy=self.security_policy,
         )
 
     @classmethod
@@ -80,11 +96,13 @@ class AgentCanonicalSingleActionAPI:
         agent: Any,
         *,
         decision_factory,
+        security_policy: ExecutionSecurityPolicy | None = None,
     ) -> "AgentCanonicalSingleActionAPI":
         """Build the API façade for an existing Agent instance."""
         return cls(
             agent,
             decision_factory=decision_factory,
+            security_policy=security_policy,
         )
 
     @property

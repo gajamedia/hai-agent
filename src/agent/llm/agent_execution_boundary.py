@@ -7,6 +7,7 @@ from .controlled_execution import (
     ControlledExecutionReport,
     ControlledPlanExecutor,
 )
+from .execution_security import ExecutionSecurityPolicy
 from .plan_validation import (
     LLMPlanValidationResult,
     LLMPlanValidator,
@@ -82,17 +83,19 @@ class LLMPlanAgentExecutionAdapter:
     """
     Bridge a validated LLMPlan to an existing Agent execution boundary.
 
-    This layer deliberately does not import or call Agent.decide_and_act(),
-    UnifiedDecisionExecutor, or any concrete executor implementation. The
-    application supplies the established execution boundary explicitly.
+    A security policy is always applied immediately before the caller-owned
+    boundary. The default policy fails closed for unknown actions and requires
+    trusted approval for actions classified as high risk.
     """
 
     def __init__(
         self,
         *,
         validator: LLMPlanValidator | None = None,
+        security_policy: ExecutionSecurityPolicy | None = None,
     ) -> None:
         self.validator = validator or LLMPlanValidator()
+        self.security_policy = security_policy or ExecutionSecurityPolicy()
         self.last_validation: LLMPlanValidationResult | None = None
         self.last_result: AgentPlanExecutionResult | None = None
 
@@ -152,6 +155,12 @@ class LLMPlanAgentExecutionAdapter:
                 experience_id=experience_id,
                 metadata=request_metadata,
             )
+            # Canonical Agent boundaries enforce the policy in their concrete
+            # binding. Other callback/protocol boundaries are guarded here.
+            # This avoids calling a trusted approval provider twice for the
+            # same canonical action.
+            if getattr(boundary, "enforces_execution_security", False) is not True:
+                self.security_policy.authorize(request)
             return boundary.execute(request)
 
         report = ControlledPlanExecutor(execute_step).execute(

@@ -61,6 +61,8 @@ class LLMPlanRuntimeExecutionReport:
     final_world_state: Any
     next_step_index: int | None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # None means no goal verifier was available; True/False is an observed verdict.
+    goal_satisfied: bool | None = None
 
     @property
     def executed_step_indices(self) -> tuple[int, ...]:
@@ -82,6 +84,7 @@ class LLMPlanRuntimeExecutionReport:
 StopConditionEvaluator = Callable[[str, Mapping[str, Any]], bool]
 StepSuccessEvaluator = Callable[[LLMPlanStep, Any, Mapping[str, Any]], bool]
 WorldStateObserver = Callable[[Any], Any]
+GoalSatisfactionEvaluator = Callable[[Any, Any, Mapping[str, Any]], bool]
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,7 @@ class LLMPlanRuntimeExecutor:
         stop_condition_evaluator: StopConditionEvaluator | None = None,
         step_success_evaluator: StepSuccessEvaluator | None = None,
         world_state_observer: WorldStateObserver | None = None,
+        goal_satisfaction_evaluator: GoalSatisfactionEvaluator | None = None,
         stop_on_step_failure: bool = True,
         raise_on_step_error: bool = False,
         runtime_event_observer: RuntimeEventObserver | None = None,
@@ -224,12 +228,17 @@ class LLMPlanRuntimeExecutor:
             raise LLMPlanRuntimeConfigurationError(
                 "world_state_observer must be callable."
             )
+        if goal_satisfaction_evaluator is not None and not callable(goal_satisfaction_evaluator):
+            raise LLMPlanRuntimeConfigurationError(
+                "goal_satisfaction_evaluator must be callable."
+            )
 
         self.bridge = bridge
         self.validator = validator or LLMPlanValidator()
         self.stop_condition_evaluator = stop_condition_evaluator
         self.step_success_evaluator = step_success_evaluator
         self.world_state_observer = world_state_observer
+        self.goal_satisfaction_evaluator = goal_satisfaction_evaluator
         self.stop_on_step_failure = bool(stop_on_step_failure)
         self.raise_on_step_error = bool(raise_on_step_error)
         if runtime_event_observer is not None and not callable(runtime_event_observer):
@@ -352,6 +361,34 @@ class LLMPlanRuntimeExecutor:
             return bool(self.step_success_evaluator(step, result, context))
         return bool(getattr(result, "success", False))
 
+    def _verify_goal_satisfaction(
+        self,
+        goal: Any,
+        world_state: Any,
+        *,
+        plan: LLMPlan,
+        records: Sequence[LLMPlanStepExecutionRecord],
+        environment: Any,
+    ) -> bool | None:
+        """Verify the requested goal against the final observed state.
+
+        An explicit evaluator takes precedence. Otherwise, Goal-like objects
+        exposing ``is_satisfied(world_state)`` are verified automatically.
+        Text-only goals retain legacy behavior and return ``None``.
+        """
+        context = {
+            "plan": plan,
+            "records": tuple(records),
+            "world_state": world_state,
+            "environment": environment,
+        }
+        if self.goal_satisfaction_evaluator is not None:
+            return bool(self.goal_satisfaction_evaluator(goal, world_state, context))
+        checker = getattr(goal, "is_satisfied", None)
+        if callable(checker):
+            return bool(checker(world_state))
+        return None
+
     def execute(
         self,
         plan: LLMPlan,
@@ -463,6 +500,69 @@ class LLMPlanRuntimeExecutor:
                     experience_id=experience_id,
                     metadata=runtime_metadata,
                 )
+
+                # A feedback-blocked step was never sent to the underlying
+                # action API. Record it as skipped and stop without emitting
+                # "step_recorded", which is reserved for actual attempts.
+                result_payload = getattr(result, "result", None)
+                if (
+                    isinstance(result_payload, Mapping)
+                    and result_payload.get("blocked_by_runtime_feedback") is True
+                ):
+                    blocked_reason = str(
+                        result_payload.get("reason") or "runtime_feedback_stop"
+                    )
+                    record = LLMPlanStepExecutionRecord(
+                        step=step,
+                        request=None,
+                        result=result,
+                        success=False,
+                        observation=current_world_state,
+                        skipped=True,
+                        error=blocked_reason,
+                    )
+                    records.append(record)
+                    last_result = result
+                    stopped = True
+                    stop_reason = "runtime_feedback_stop"
+                    next_step_index = step.index
+
+                    blocked_metadata = dict(runtime_metadata)
+                    blocked_metadata.update(
+                        {
+                            "runtime_feedback_stop": True,
+                            "runtime_feedback_reason": blocked_reason,
+                            "blocked_by_runtime_feedback": True,
+                        }
+                    )
+                    self._emit_event(
+                        LLMPlanRuntimeEvent(
+                            phase="step_blocked",
+                            plan=plan,
+                            step=step,
+                            record=record,
+                            world_state=current_world_state,
+                            result=result,
+                            stop_reason=stop_reason,
+                            next_step_index=next_step_index,
+                            metadata=blocked_metadata,
+                        )
+                    )
+                    self._emit_event(
+                        LLMPlanRuntimeEvent(
+                            phase="stopped",
+                            plan=plan,
+                            step=step,
+                            record=record,
+                            world_state=current_world_state,
+                            result=result,
+                            stop_reason=stop_reason,
+                            next_step_index=next_step_index,
+                            metadata=blocked_metadata,
+                        )
+                    )
+                    break
+
                 request_trace = getattr(self.bridge, "last_execution_request", None)
 
                 context = {
@@ -633,17 +733,32 @@ class LLMPlanRuntimeExecutor:
         completed = len(records) == len(plan.steps) and all(
             record.success and not record.skipped for record in records
         )
-        success = completed and not stopped
+        goal_satisfied = self._verify_goal_satisfaction(
+            resolved_goal,
+            current_world_state,
+            plan=plan,
+            records=records,
+            environment=environment,
+        )
+        # Successful individual actions do not imply that the goal was reached.
+        success = completed and not stopped and goal_satisfied is not False
         if completed:
             next_step_index = None
 
         report_metadata = dict(metadata or {})
         report_metadata.update(
             {
-                "executed_step_count": len(records),
+                "executed_step_count": sum(
+                    1 for record in records if not record.skipped
+                ),
                 "planned_step_count": len(plan.steps),
+                "goal_satisfied": goal_satisfied,
+                "goal_verification_performed": goal_satisfied is not None,
             }
         )
+        if completed and goal_satisfied is False and stop_reason is None:
+            stop_reason = "goal_not_satisfied"
+            report_metadata["goal_verification_failure"] = True
 
         report = LLMPlanRuntimeExecutionReport(
             plan=plan,
@@ -656,6 +771,7 @@ class LLMPlanRuntimeExecutor:
             final_world_state=current_world_state,
             next_step_index=next_step_index,
             metadata=report_metadata,
+            goal_satisfied=goal_satisfied,
         )
         self.last_report = report
         if completed or not stopped:
@@ -683,5 +799,6 @@ __all__ = [
     "LLMPlanRuntimeExecutionReport",
     "LLMPlanRuntimeEvent",
     "RuntimeEventObserver",
+    "GoalSatisfactionEvaluator",
     "LLMPlanRuntimeExecutor",
 ]

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 from .agent_execution_boundary import AgentExecutionRequest
+from .execution_security import ExecutionSecurityPolicy
 from .unified_executor_binding import (
     AgentUnifiedExecutionReport,
     AgentUnifiedExecutorBinding,
@@ -202,10 +203,12 @@ class CanonicalSingleActionExecutor:
         agent: Any,
         *,
         decision_factory,
+        security_policy: ExecutionSecurityPolicy | None = None,
     ) -> "CanonicalSingleActionExecutor":
         binding = AgentUnifiedExecutorBinding(
             agent,
             decision_factory=decision_factory,
+            security_policy=security_policy,
         )
 
         return cls(binding)

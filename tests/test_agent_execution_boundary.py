@@ -7,6 +7,7 @@ from agent.llm.agent_execution_boundary import (
     CallbackAgentExecutionBoundary,
     LLMPlanAgentExecutionAdapter,
 )
+from agent.llm.execution_security import ExecutionSecurityPolicy
 from agent.llm.plan_validation import LLMPlanValidator
 
 
@@ -37,6 +38,29 @@ def make_boundary(calls):
         lambda request: calls.append(request) or {"success": True}
     )
 
+
+
+
+def make_adapter(
+    *,
+    validator=None,
+    action_risks=None,
+    approval_checker=None,
+    approval_required_actions=(),
+):
+    policy = ExecutionSecurityPolicy(
+        action_risks=(
+            {"open": 0.1, "deploy": 0.1}
+            if action_risks is None
+            else action_risks
+        ),
+        approval_checker=approval_checker,
+        approval_required_actions=frozenset(approval_required_actions),
+    )
+    return LLMPlanAgentExecutionAdapter(
+        validator=validator,
+        security_policy=policy,
+    )
 
 def test_request_normalizes_action_and_copies_metadata():
     metadata = {"trace": "abc"}
@@ -76,7 +100,7 @@ def test_callback_boundary_executes_request():
 
 def test_valid_plan_is_validated_and_executed():
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -90,7 +114,7 @@ def test_valid_plan_is_validated_and_executed():
 
 def test_request_contains_context_for_each_step():
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(actions=("open", "deploy")),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -110,7 +134,7 @@ def test_request_contains_context_for_each_step():
 
 def test_invalid_plan_is_not_sent_to_boundary():
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(actions=("missing",)),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -123,7 +147,7 @@ def test_invalid_plan_is_not_sent_to_boundary():
 
 
 def test_missing_boundary_execute_is_rejected():
-    adapter = LLMPlanAgentExecutionAdapter()
+    adapter = make_adapter()
     with pytest.raises(TypeError, match="boundary must provide"):
         adapter.execute(
             make_plan(actions=("open",)),
@@ -140,7 +164,7 @@ def test_step_failure_stops_boundary_execution():
         calls.append(request.action)
         return {"success": request.action == "open"}
 
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(),
         boundary=CallbackAgentExecutionBoundary(run),
         goal="ship change",
@@ -155,7 +179,7 @@ def test_boundary_exception_is_contained_in_report():
     def run(_request):
         raise RuntimeError("boom")
 
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(actions=("open",)),
         boundary=CallbackAgentExecutionBoundary(run),
         goal="ship change",
@@ -168,7 +192,7 @@ def test_boundary_exception_is_contained_in_report():
 
 def test_stop_checker_can_stop_after_a_successful_step():
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -181,7 +205,7 @@ def test_stop_checker_can_stop_after_a_successful_step():
 
 def test_repeated_actions_are_preserved_in_execution_order():
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(actions=("open", "open", "deploy")),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -193,7 +217,7 @@ def test_repeated_actions_are_preserved_in_execution_order():
 
 def test_custom_validator_is_used():
     validator = LLMPlanValidator(min_confidence=0.95)
-    adapter = LLMPlanAgentExecutionAdapter(validator=validator)
+    adapter = make_adapter(validator=validator)
     calls = []
     result = adapter.execute(
         make_plan(),
@@ -207,7 +231,7 @@ def test_custom_validator_is_used():
 
 
 def test_last_validation_is_retained():
-    adapter = LLMPlanAgentExecutionAdapter()
+    adapter = make_adapter()
     result = adapter.validate(
         make_plan(actions=("open",)),
         goal="ship change",
@@ -217,7 +241,7 @@ def test_last_validation_is_retained():
 
 
 def test_last_result_is_retained():
-    adapter = LLMPlanAgentExecutionAdapter()
+    adapter = make_adapter()
     result = adapter.execute(
         make_plan(actions=("open",)),
         boundary=make_boundary([]),
@@ -228,7 +252,7 @@ def test_last_result_is_retained():
 
 
 def test_invalid_plan_result_is_retained():
-    adapter = LLMPlanAgentExecutionAdapter()
+    adapter = make_adapter()
     result = adapter.execute(
         make_plan(actions=("missing",)),
         boundary=make_boundary([]),
@@ -242,7 +266,7 @@ def test_invalid_plan_result_is_retained():
 def test_metadata_is_available_without_mutating_caller_mapping():
     metadata = {"source": "llm"}
     calls = []
-    LLMPlanAgentExecutionAdapter().execute(
+    make_adapter().execute(
         make_plan(actions=("open",)),
         boundary=make_boundary(calls),
         goal="ship change",
@@ -255,18 +279,18 @@ def test_metadata_is_available_without_mutating_caller_mapping():
 
 def test_explicit_validator_reuses_same_instance():
     validator = LLMPlanValidator()
-    adapter = LLMPlanAgentExecutionAdapter(validator=validator)
+    adapter = make_adapter(validator=validator)
     assert adapter.validator is validator
 
 
 def test_execution_result_reports_acceptance_and_execution_separately():
-    invalid = LLMPlanAgentExecutionAdapter().execute(
+    invalid = make_adapter().execute(
         make_plan(actions=("missing",)),
         boundary=make_boundary([]),
         goal="ship change",
         available_actions={"open": object()},
     )
-    valid = LLMPlanAgentExecutionAdapter().execute(
+    valid = make_adapter().execute(
         make_plan(actions=("open",)),
         boundary=make_boundary([]),
         goal="ship change",
@@ -277,7 +301,7 @@ def test_execution_result_reports_acceptance_and_execution_separately():
 
 
 def test_validation_can_be_used_without_execution():
-    adapter = LLMPlanAgentExecutionAdapter()
+    adapter = make_adapter()
     result = adapter.validate(
         make_plan(actions=("open",)),
         goal="ship change",
@@ -292,7 +316,7 @@ def test_goal_object_with_description_is_supported():
         description = "ship change"
 
     calls = []
-    result = LLMPlanAgentExecutionAdapter().execute(
+    result = make_adapter().execute(
         make_plan(actions=("open",)),
         boundary=make_boundary(calls),
         goal=Goal(),
@@ -300,3 +324,123 @@ def test_goal_object_with_description_is_supported():
     )
     assert result.accepted is True
     assert calls[0].goal.description == "ship change"
+
+
+def test_default_policy_fails_closed_for_unknown_action():
+    calls = []
+    result = LLMPlanAgentExecutionAdapter().execute(
+        make_plan(actions=("open",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"open": object()},
+    )
+    assert result.accepted is True
+    assert result.report.stopped is True
+    assert result.report.stop_reason == "executor_error:ExecutionSecurityError"
+    assert calls == []
+
+
+def test_high_risk_action_is_blocked_without_approval():
+    calls = []
+    adapter = make_adapter(action_risks={"deploy": 0.9})
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+    )
+    assert result.report.stopped is True
+    assert result.report.stop_reason == "executor_error:ExecutionSecurityError"
+    assert calls == []
+    event = adapter.security_policy.audit_log[-1]
+    assert event.allowed is False
+    assert event.approval_required is True
+    assert event.reason == "approval_required_but_no_approval_checker"
+
+
+def test_high_risk_action_executes_with_trusted_approval():
+    calls = []
+    approved_requests = []
+    adapter = make_adapter(
+        action_risks={"deploy": 0.9},
+        approval_checker=lambda request: approved_requests.append(request) or True,
+    )
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+    )
+    assert result.report.completed is True
+    assert [request.action for request in calls] == ["deploy"]
+    assert approved_requests == calls
+    assert adapter.security_policy.audit_log[-1].reason == "approved"
+
+
+def test_false_approval_blocks_action():
+    calls = []
+    adapter = make_adapter(
+        action_risks={"deploy": 0.9},
+        approval_checker=lambda _request: False,
+    )
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+    )
+    assert result.report.stopped is True
+    assert calls == []
+    assert adapter.security_policy.audit_log[-1].reason == "approval_missing_or_invalid"
+
+
+def test_metadata_approval_flag_is_not_trusted():
+    calls = []
+    adapter = make_adapter(action_risks={"deploy": 0.9})
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+        metadata={"approved": True},
+    )
+    assert result.report.stopped is True
+    assert calls == []
+
+
+def test_explicit_approval_required_action_blocks_even_when_low_risk():
+    calls = []
+    adapter = make_adapter(
+        action_risks={"deploy": 0.1},
+        approval_required_actions={"deploy"},
+    )
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+    )
+    assert result.report.stopped is True
+    assert calls == []
+    assert adapter.security_policy.audit_log[-1].approval_required is True
+
+
+def test_approval_checker_exception_fails_closed():
+    calls = []
+
+    def fail(_request):
+        raise RuntimeError("approval service unavailable")
+
+    adapter = make_adapter(
+        action_risks={"deploy": 0.9},
+        approval_checker=fail,
+    )
+    result = adapter.execute(
+        make_plan(actions=("deploy",)),
+        boundary=make_boundary(calls),
+        goal="ship change",
+        available_actions={"deploy": object()},
+    )
+    assert result.report.stopped is True
+    assert calls == []
+    assert adapter.security_policy.audit_log[-1].reason == "approval_check_failed"

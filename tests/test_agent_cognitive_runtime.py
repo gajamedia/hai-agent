@@ -93,6 +93,14 @@ class FakeAgent:
         self.working_memory = FakeWorkingMemory()
         self.last_self_awareness_calibration = FakeCalibration()
         self.last_metacognitive_reflection = FakeReflection()
+        self.telemetry_events = []
+
+    def record_capability_telemetry(self, capability, *, success=None, source="runtime"):
+        self.telemetry_events.append({
+            "capability": capability,
+            "success": success,
+            "source": source,
+        })
 
     def get_self_awareness_snapshot(self):
         return FakeSelfAwarenessSnapshot()
@@ -413,3 +421,59 @@ def test_context_returns_agent_context_instance():
     context = runtime.build_context()
 
     assert isinstance(context, AgentContext)
+
+
+
+def test_run_records_cognitive_cycle_success_without_execution_claim():
+    agent, _, runtime = build_runtime()
+
+    runtime.run()
+
+    assert agent.telemetry_events == [{
+        "capability": "cognitive_cycle",
+        "success": True,
+        "source": "agent_cognitive_runtime",
+    }]
+
+
+def test_run_records_cognitive_cycle_failure_and_reraises_original_error():
+    agent, orchestrator, runtime = build_runtime()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("provider failed")
+
+    orchestrator.run = fail
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        runtime.run()
+
+    assert agent.telemetry_events == [{
+        "capability": "cognitive_cycle",
+        "success": False,
+        "source": "agent_cognitive_runtime",
+    }]
+
+
+def test_telemetry_failure_does_not_mask_cognitive_result():
+    agent, _, runtime = build_runtime()
+
+    def fail_telemetry(*args, **kwargs):
+        raise RuntimeError("telemetry unavailable")
+
+    agent.record_capability_telemetry = fail_telemetry
+
+    result = runtime.run()
+
+    assert result.to_dict() == {"ok": True}
+
+
+def test_agent_without_telemetry_api_remains_supported():
+    agent, _, runtime = build_runtime()
+    # The real Agent exposes this method on its class, so deleting the
+    # instance attribute raises AttributeError. Shadow it with a non-callable
+    # value to model an Agent that does not expose a usable telemetry API.
+    agent.record_capability_telemetry = None
+
+    result = runtime.run()
+
+    assert result.to_dict() == {"ok": True}

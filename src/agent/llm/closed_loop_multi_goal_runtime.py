@@ -183,6 +183,7 @@ class ClosedLoopMultiGoalRuntime:
         auto_complete_achieved_goals: bool = True,
         stop_on_unresolved_conflict: bool = True,
         stop_on_execution_failure_without_replan: bool = True,
+        replan_on_execution_failure: bool = True,
     ) -> None:
         if not callable(getattr(runtime_executor, "execute", None)):
             raise ClosedLoopMultiGoalRuntimeConfigurationError(
@@ -217,6 +218,7 @@ class ClosedLoopMultiGoalRuntime:
         self.stop_on_execution_failure_without_replan = bool(
             stop_on_execution_failure_without_replan
         )
+        self.replan_on_execution_failure = bool(replan_on_execution_failure)
 
         self._observers: list[RuntimeObserver] = []
         self.last_result: ClosedLoopMultiGoalRuntimeExecutionReport | None = None
@@ -301,6 +303,65 @@ class ClosedLoopMultiGoalRuntime:
         return bool(getattr(ClosedLoopMultiGoalRuntime._result_report(runtime_result), "completed", False))
 
     @staticmethod
+    def _replacement_plan_safety_issue(
+        replanning: Any,
+        expected_goal: ManagedGoal,
+    ) -> str | None:
+        """Return a stable rejection code when a replacement plan is unsafe to execute.
+
+        This is a final orchestration-level guard. It complements (rather than replaces)
+        the adaptive planner's own validation and never executes or mutates the plan.
+        """
+        replacement = getattr(replanning, "replacement_plan", None)
+        if replacement is None:
+            return "replacement_plan_missing"
+        if not isinstance(replacement, LLMPlan):
+            return "replacement_plan_wrong_type"
+
+        expected = str(expected_goal.description).strip().casefold()
+        actual = str(getattr(replacement, "goal", "") or "").strip().casefold()
+        if not actual:
+            return "replacement_plan_goal_missing"
+        if actual != expected:
+            return "replacement_plan_goal_mismatch"
+
+        steps = getattr(replacement, "steps", None)
+        if not steps:
+            return "replacement_plan_empty"
+        for position, step in enumerate(steps, start=1):
+            action = getattr(step, "action", getattr(step, "action_name", None))
+            if not isinstance(action, str) or not action.strip():
+                return f"replacement_plan_action_missing_step_{position}"
+
+        validation = getattr(replanning, "validation", None)
+        if validation is None:
+            # Some integrations provide only a plan and do not expose validation.
+            # Minimal structural/goal checks above still apply in that case.
+            return None
+        valid = (
+            validation.get("valid")
+            if isinstance(validation, Mapping)
+            else getattr(validation, "valid", None)
+        )
+        if valid is False:
+            return "replacement_plan_validation_failed"
+        return None
+
+    @staticmethod
+    def _record_safety_rejection(
+        rejections: list[Mapping[str, Any]],
+        *,
+        generation: int,
+        goal_id: str,
+        reason: str,
+    ) -> None:
+        rejections.append({
+            "generation": int(generation),
+            "goal_id": str(goal_id),
+            "reason": str(reason),
+        })
+
+    @staticmethod
     def _remaining_plan_indices(plan: LLMPlan, successful_indices: Sequence[int]) -> tuple[int, ...]:
         done = set(int(item) for item in successful_indices)
         return tuple(step.index for step in plan.steps if step.index not in done)
@@ -318,6 +379,71 @@ class ClosedLoopMultiGoalRuntime:
             getattr(feedback, "progress_delta", None),
             getattr(feedback, "risk_level", None),
         )
+
+    @staticmethod
+    def _failure_feedback(
+        runtime_result: Any,
+        plan: LLMPlan,
+        *,
+        generation: int,
+        world_state: Any,
+    ) -> LLMPlanRuntimeLearningFeedback:
+        """Build deterministic recovery feedback from an observed failed run.
+
+        This is only a planning signal. It never retries or executes an action
+        itself; the configured goal-aware replanner must produce a replacement.
+        """
+        failed_index = ClosedLoopMultiGoalRuntime._failed_step_index(runtime_result)
+        if failed_index is None:
+            failed_index = max(0, ClosedLoopMultiGoalRuntime._next_step_index(runtime_result) - 1)
+        failed_step = next(
+            (step for step in plan.steps if step.index == failed_index),
+            None,
+        )
+        action = failed_step.action if failed_step is not None else "unknown_action"
+        return LLMPlanRuntimeLearningFeedback(
+            step_index=max(0, int(failed_index)),
+            action=action,
+            success=False,
+            progress_delta=-0.1,
+            evidence_quality=0.0,
+            confidence=0.9,
+            diagnosis=f"execution_failure_generation_{generation}",
+            lesson=(
+                "The previous execution did not achieve its expected outcome. "
+                "Use the latest observed world state and avoid blindly repeating "
+                "the failed action."
+            ),
+            next_step="Replan the remaining work using the latest world state.",
+            change_required=True,
+            continue_recommended=False,
+            exploration_recommended=False,
+            risk_level="high",
+            risk_score=0.75,
+            information_gain=0.0,
+            metadata={
+                "synthetic": True,
+                "trigger": "execution_failure_recovery",
+                "generation": int(generation),
+                "failed_step_index": int(failed_index),
+                "world_state_available": world_state is not None,
+            },
+        )
+
+    def _feedback_requests_replan(self, feedback: Any) -> bool:
+        if feedback is None or self.goal_replanner is None:
+            return False
+        adaptive = getattr(self.goal_replanner, "adaptive_replanner", None)
+        evaluator = getattr(adaptive, "evaluate_trigger", None)
+        if not callable(evaluator):
+            # The controller's own replan() still validates whether the supplied
+            # feedback can be used; do not assume a missing evaluator is a trigger.
+            return False
+        try:
+            decision = evaluator(feedback)
+        except Exception:
+            return False
+        return bool(getattr(decision, "should_replan", False))
 
     @staticmethod
     def _normalize_evidence(value: Any) -> tuple[Any, ...]:
@@ -506,6 +632,7 @@ class ClosedLoopMultiGoalRuntime:
         failed_ids: list[str] = []
         goal_switch_count = 0
         replan_count = 0
+        safety_rejections: list[Mapping[str, Any]] = []
         stop_reason: str | None = None
         stopped = False
         completed = False
@@ -597,9 +724,17 @@ class ClosedLoopMultiGoalRuntime:
                     # Goal-aware controller normally requires feedback only when a runtime
                     # trigger exists; the controller itself accepts the goal-change path.
                     raise ClosedLoopMultiGoalRuntimeReplanningError(str(exc)) from exc
-                if replanning.replacement_plan is None:
-                    stop_reason = "goal_change_replan_not_produced"
+                safety_issue = self._replacement_plan_safety_issue(replanning, current_goal)
+                if safety_issue is not None:
+                    self._record_safety_rejection(
+                        safety_rejections,
+                        generation=generation,
+                        goal_id=current_goal.goal_id,
+                        reason=safety_issue,
+                    )
+                    stop_reason = f"unsafe_replacement_plan:{safety_issue}"
                     stopped = True
+                    self.last_replanning = replanning
                     break
                 segment_plan = replanning.replacement_plan
                 replan_count += 1
@@ -671,6 +806,20 @@ class ClosedLoopMultiGoalRuntime:
                 raise ClosedLoopMultiGoalRuntimeInputError(
                     "feedback_provider must return LLMPlanRuntimeLearningFeedback or None."
                 )
+            recovery_feedback_used = False
+            if (
+                not segment_success
+                and self.replan_on_execution_failure
+                and self.goal_replanner is not None
+                and not self._feedback_requests_replan(feedback)
+            ):
+                feedback = self._failure_feedback(
+                    runtime_result,
+                    segment_plan,
+                    generation=generation,
+                    world_state=current_world_state,
+                )
+                recovery_feedback_used = True
             feedback_signature = self._feedback_signature(feedback)
             fresh_feedback = feedback is not None and feedback_signature != self._last_feedback_signature
             if fresh_feedback:
@@ -712,6 +861,7 @@ class ClosedLoopMultiGoalRuntime:
                         **base_metadata,
                         "success": segment_success,
                         "feedback_present": feedback is not None,
+                        "recovery_feedback_used": recovery_feedback_used,
                     },
                 )
             )
@@ -729,7 +879,10 @@ class ClosedLoopMultiGoalRuntime:
                 success=segment_success,
                 world_state=current_world_state,
                 next_goal_id=next_goal_id,
-                metadata={"feedback": feedback},
+                metadata={
+                    "feedback": feedback,
+                    "recovery_feedback_used": recovery_feedback_used,
+                },
             )
 
             if stopped and stop_reason == "max_goal_switches_reached":
@@ -761,6 +914,14 @@ class ClosedLoopMultiGoalRuntime:
             if next_goal_id is not None and next_goal_id != current_goal.goal_id and not stopped:
                 should_replan = True
 
+            if should_replan and generation >= self.max_segments:
+                # Do not request a replacement plan when the segment budget is
+                # already exhausted; this avoids wasted planning and side effects.
+                segments.append(segment)
+                stop_reason = "max_segments_reached"
+                stopped = True
+                break
+
             if should_replan:
                 if self.goal_replanner is None:
                     stop_reason = "replan_required_without_replanner"
@@ -790,9 +951,20 @@ class ClosedLoopMultiGoalRuntime:
                     )
                 except Exception as exc:
                     raise ClosedLoopMultiGoalRuntimeReplanningError(str(exc)) from exc
-                if segment_replanning.replacement_plan is None:
-                    stop_reason = "replacement_plan_not_produced"
+                safety_issue = self._replacement_plan_safety_issue(
+                    segment_replanning,
+                    next_goal,
+                )
+                if safety_issue is not None:
+                    self._record_safety_rejection(
+                        safety_rejections,
+                        generation=generation + 1,
+                        goal_id=next_goal.goal_id,
+                        reason=safety_issue,
+                    )
+                    stop_reason = f"unsafe_replacement_plan:{safety_issue}"
                     stopped = True
+                    self.last_replanning = segment_replanning
                     segments.append(
                         ClosedLoopMultiGoalRuntimeSegment(
                             **{**segment.__dict__, "replanning": segment_replanning}
@@ -863,6 +1035,14 @@ class ClosedLoopMultiGoalRuntime:
                 **base_metadata,
                 "goal_count": len(snapshot.goals),
                 "terminal_goal_count": sum(goal.status.terminal for goal in snapshot.goals),
+                "replan_on_execution_failure": self.replan_on_execution_failure,
+                "goal_safety_gate_enabled": True,
+                "replacement_plan_safety_rejections": tuple(dict(item) for item in safety_rejections),
+                "replacement_plan_safety_rejection_count": len(safety_rejections),
+                "recovery_feedback_segment_count": sum(
+                    bool(segment.metadata.get("recovery_feedback_used"))
+                    for segment in segments
+                ),
             },
         )
         self.last_result = report

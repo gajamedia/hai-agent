@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from agent.llm.agent_execution_boundary import AgentExecutionRequest
+from agent.llm.execution_security import ExecutionSecurityPolicy
 from agent.llm.unified_executor_binding import (
     AgentUnifiedExecutionReport,
     AgentUnifiedExecutorBinding,
@@ -33,6 +34,9 @@ class FakeAgent:
             "open_box": FakeAction("open_box"),
             "close_box": FakeAction("close_box"),
         }
+        self.execution_security_policy = ExecutionSecurityPolicy(
+            action_risks={"open_box": 0.1, "close_box": 0.1}
+        )
         self.unified_executor = FakeExecutor()
         self.configure_calls = 0
 

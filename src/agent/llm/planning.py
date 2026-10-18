@@ -419,6 +419,24 @@ class LLMPlanner:
         #     model=response.model,
         #     max_steps=self.max_steps,
         # )
+        # try:
+        #     plan = LLMPlanParser.parse(
+        #         response.content,
+        #         provider=response.provider,
+        #         model=response.model,
+        #         max_steps=self.max_steps,
+        #     )
+        # except LLMPlanningParseError:
+        #     content = response.content or ""
+        #     logger.warning(
+        #         "LLM planning response could not be parsed as JSON "
+        #         "(provider=%s, model=%s, chars=%d, preview=%r)",
+        #         response.provider,
+        #         response.model,
+        #         len(content),
+        #         content[:200],
+        #     )
+        #     raise
         try:
             plan = LLMPlanParser.parse(
                 response.content,
@@ -428,13 +446,16 @@ class LLMPlanner:
             )
         except LLMPlanningParseError:
             content = response.content or ""
-            logger.warning(
-                "LLM planning response could not be parsed as JSON "
-                "(provider=%s, model=%s, chars=%d, preview=%r)",
+
+            logger.exception(
+                "LLM planning JSON parse failed "
+                "(provider=%s, model=%s, chars=%d, "
+                "head=%r, tail=%r)",
                 response.provider,
                 response.model,
                 len(content),
-                content[:200],
+                content[:500],
+                content[-2000:],
             )
             raise
 

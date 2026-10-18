@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import isfinite
 from threading import RLock
 from typing import Any
@@ -347,11 +347,22 @@ class LLMPlanRuntimeLearningFeedbackBridge:
                 }
             )
 
+            # The observer contract supplies step_index and action separately;
+            # the persisted episode object is not guaranteed to expose them.
+            # Build feedback from a minimal normalized record while preserving
+            # the original episode for reflection, evaluation, and consumers.
+            experience_record = {
+                "step_index": int(step_index),
+                "action": str(action),
+                "success": _read_value(episode, "success"),
+            }
+
             feedback = self.feedback_engine.build(
-                episode,
+                experience_record,
                 reflection,
                 metadata=provisional_metadata,
             )
+            feedback = replace(feedback, episode=episode)
 
             if self.runtime_evaluation_provider is not None:
                 runtime_evaluation = self.runtime_evaluation_provider(
@@ -359,11 +370,12 @@ class LLMPlanRuntimeLearningFeedbackBridge:
                     episode,
                 )
                 feedback = self.feedback_engine.build(
-                    episode,
+                    experience_record,
                     reflection,
                     runtime_evaluation=runtime_evaluation,
                     metadata=provisional_metadata,
                 )
+                feedback = replace(feedback, episode=episode)
 
             existing = self._feedback_by_step.get(feedback.step_index)
             if existing is not None:

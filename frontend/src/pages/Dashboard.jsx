@@ -25,7 +25,7 @@ import {
 import {
   API_BASE_URL,
   checkHealth,
-  getCapabilityTelemetry,
+  getCapabilityTelemetrySources,
   getExecutionState,
   getStrategies,
   resetExecution,
@@ -34,6 +34,7 @@ import {
 } from "../api/client.js";
 
 import JsonPanel from "../components/JsonPanel.jsx";
+import AssistantComposer from "../components/AssistantComposer.jsx";
 import StrategyLab from "./StrategyLab.jsx";
 import { exampleRequest } from "../data/exampleRequest.js";
 import "./telemetry.css";
@@ -486,209 +487,103 @@ function ExecutionSection({
   );
 }
 
-function TelemetrySection({
-  telemetry,
-  loading,
-  error,
-  onRefresh,
-  refreshedAt,
-}) {
-  const snapshot = telemetry?.snapshot;
+function TelemetrySourcePanel({ title, description, sourceData }) {
+  const isUnavailable = sourceData?.status === "unavailable";
+  const isError = sourceData?.status === "error";
+  const snapshot = sourceData?.snapshot;
   const capabilities = Object.entries(snapshot?.capabilities || {});
-  const events = telemetry?.events || [];
+  const events = sourceData?.events || [];
 
+  return (
+    <section className="panel telemetry-source-panel">
+      <div className="panel-head telemetry-source-heading">
+        <div>
+          <h3>{title}</h3>
+          <p className="muted telemetry-source-description">{description}</p>
+        </div>
+        <span className={`tag ${sourceData?.status === "ok" ? "telemetry-status-ok" : "telemetry-status-muted"}`}>
+          {sourceData?.status || "unknown"}
+        </span>
+      </div>
+
+      {isUnavailable && (
+        <div className="telemetry-note">
+          <CircleHelp size={17} />
+          <p>Runtime ini tidak tersedia. Kode: <code>{sourceData?.error || "unknown"}</code>.</p>
+        </div>
+      )}
+      {isError && (
+        <div className="alert error telemetry-error">
+          <AlertCircle size={17} />
+          <div><b>Telemetry source error</b><p>{sourceData?.message || sourceData?.error || "Gagal membaca telemetry."}</p></div>
+        </div>
+      )}
+      {!sourceData && (
+        <p className="muted telemetry-no-data">Data sumber belum tersedia.</p>
+      )}
+
+      {sourceData?.status === "ok" && (
+        <>
+          <div className="telemetry-metrics">
+            <article className="metric"><small><Activity size={14} /> EVENTS RECORDED</small><b>{snapshot?.event_count ?? 0}</b><span>Total event pada runtime ini</span></article>
+            <article className="metric"><small><Workflow size={14} /> ATTEMPTS</small><b>{snapshot?.total_attempts ?? 0}</b><span>Semua percobaan tercatat</span></article>
+            <article className="metric"><small><CheckCircle2 size={14} /> SUCCESSES</small><b>{snapshot?.total_successes ?? 0}</b><span>Outcome sukses diketahui</span></article>
+            <article className="metric"><small><AlertCircle size={14} /> FAILURES</small><b>{snapshot?.total_failures ?? 0}</b><span>Outcome gagal diketahui</span></article>
+          </div>
+
+          {!snapshot?.has_evidence && (
+            <div className="telemetry-note"><CircleHelp size={17} /><p>Belum ada bukti kapabilitas yang tercatat pada sumber ini. Data kosong bukan bukti bahwa agent gagal atau telah belajar.</p></div>
+          )}
+
+          <div className="table-scroll">
+            <table className="telemetry-table">
+              <thead><tr><th>Kapabilitas</th><th>Percobaan</th><th>Berhasil</th><th>Gagal</th><th>Rasio sukses*</th></tr></thead>
+              <tbody>
+                {capabilities.map(([name, values]) => (
+                  <tr key={name}><td><code>{name}</code></td><td>{values.attempts ?? 0}</td><td>{values.successes ?? 0}</td><td>{values.failures ?? 0}</td><td>{formatPercent(values.successes ?? 0, values.failures ?? 0)}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {!capabilities.length && <p className="muted telemetry-no-data">Belum ada kapabilitas yang tercatat.</p>}
+          <p className="telemetry-footnote">* Rasio dihitung dari outcome sukses dan gagal yang diketahui.</p>
+
+          <div className="panel-head telemetry-events-heading"><h3>Event terbaru</h3><span className="tag">{sourceData.events_returned ?? events.length} event</span></div>
+          {events.length ? (
+            <div className="table-scroll"><table className="telemetry-table">
+              <thead><tr><th>ID</th><th>Kapabilitas</th><th>Outcome</th><th>Sumber event</th></tr></thead>
+              <tbody>{events.map((event, index) => (
+                <tr key={`${event.event_id ?? "event"}-${index}`}><td>{event.event_id ?? "—"}</td><td><code>{event.capability ?? "—"}</code></td><td>{event.success === true ? <span className="telemetry-outcome success-text">Berhasil</span> : event.success === false ? <span className="telemetry-outcome failure-text">Gagal</span> : <span className="telemetry-outcome unknown-text">Belum diketahui</span>}</td><td>{event.source ?? "—"}</td></tr>
+              ))}</tbody>
+            </table></div>
+          ) : <p className="muted telemetry-no-data">Belum ada event telemetry pada runtime ini.</p>}
+        </>
+      )}
+    </section>
+  );
+}
+
+function TelemetrySection({ telemetrySources, loading, error, onRefresh, refreshedAt }) {
+  const sources = telemetrySources?.sources || {};
   return (
     <section id="telemetry" className="telemetry-section">
       <div className="section-head">
         <BarChart3 size={18} />
-        <div>
-          <small>OBSERVABILITY</small>
-          <h2>Capability telemetry</h2>
-          <p>Statistik yang dibaca dari instance Agent pada backend saat ini.</p>
-        </div>
-        <button
-          type="button"
-          className="ghost telemetry-refresh"
-          onClick={onRefresh}
-          disabled={loading}
-        >
-          {loading ? (
-            <LoaderCircle className="spin" size={14} />
-          ) : (
-            <RefreshCw size={14} />
-          )}
+        <div><small>OBSERVABILITY</small><h2>Runtime telemetry</h2><p>Data kognitif dan eksekusi ditampilkan terpisah dari sumber API masing-masing.</p></div>
+        <button type="button" className="ghost telemetry-refresh" onClick={onRefresh} disabled={loading}>
+          {loading ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
           {loading ? "Memuat..." : "Refresh"}
         </button>
       </div>
-
-      {error && (
-        <div className="alert error telemetry-error">
-          <AlertCircle size={17} />
-          <div>
-            <b>Telemetry tidak dapat dimuat</b>
-            <p>{error}</p>
-          </div>
-        </div>
-      )}
-
-      {loading && !telemetry && (
-        <div className="empty telemetry-empty">
-          <LoaderCircle className="spin" size={24} />
-          <h3>Memuat telemetry</h3>
-          <p>Mengambil snapshot dari API backend.</p>
-        </div>
-      )}
-
-      {!loading && !telemetry && !error && (
-        <div className="empty telemetry-empty">
-          <CircleHelp size={24} />
-          <h3>Telemetry belum tersedia</h3>
-          <p>Belum ada respons telemetry dari backend.</p>
-        </div>
-      )}
-
-      {telemetry && (
-        <>
-          <div className="telemetry-metrics">
-            <article className="metric">
-              <small><Activity size={14} /> EVENTS RECORDED</small>
-              <b>{snapshot?.event_count ?? 0}</b>
-              <span>Total event pada instance saat ini</span>
-            </article>
-            <article className="metric">
-              <small><Workflow size={14} /> ATTEMPTS</small>
-              <b>{snapshot?.total_attempts ?? 0}</b>
-              <span>Semua percobaan tercatat</span>
-            </article>
-            <article className="metric">
-              <small><CheckCircle2 size={14} /> SUCCESSES</small>
-              <b>{snapshot?.total_successes ?? 0}</b>
-              <span>Outcome sukses yang diketahui</span>
-            </article>
-            <article className="metric">
-              <small><AlertCircle size={14} /> FAILURES</small>
-              <b>{snapshot?.total_failures ?? 0}</b>
-              <span>Outcome gagal yang diketahui</span>
-            </article>
-          </div>
-
-          {!snapshot?.has_evidence && (
-            <div className="telemetry-note">
-              <CircleHelp size={17} />
-              <p>
-                Belum ada bukti kapabilitas yang tercatat. Ini bukan error,
-                tetapi belum ada data untuk menyimpulkan performa atau
-                pembelajaran agent.
-              </p>
-            </div>
-          )}
-
-          <div className="panel telemetry-table-panel">
-            <div className="panel-head">
-              <h3>Ringkasan per kapabilitas</h3>
-              <span className="tag">{capabilities.length} kapabilitas</span>
-            </div>
-            {capabilities.length ? (
-              <div className="table-scroll">
-                <table className="telemetry-table">
-                  <thead>
-                    <tr>
-                      <th>Kapabilitas</th>
-                      <th>Percobaan</th>
-                      <th>Berhasil</th>
-                      <th>Gagal</th>
-                      <th>Rasio sukses*</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {capabilities.map(([name, values]) => (
-                      <tr key={name}>
-                        <td><code>{name}</code></td>
-                        <td>{values.attempts ?? 0}</td>
-                        <td>{values.successes ?? 0}</td>
-                        <td>{values.failures ?? 0}</td>
-                        <td>
-                          {formatPercent(
-                            values.successes ?? 0,
-                            values.failures ?? 0,
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="muted telemetry-no-data">
-                Belum ada kapabilitas yang tercatat.
-              </p>
-            )}
-            <p className="telemetry-footnote">
-              * Rasio dihitung dari outcome sukses dan gagal yang diketahui;
-              percobaan tanpa outcome tidak masuk denominator.
-            </p>
-          </div>
-
-          <div className="panel telemetry-table-panel">
-            <div className="panel-head">
-              <h3>Event terbaru</h3>
-              <span className="tag">
-                {telemetry.events_returned ?? events.length} event
-              </span>
-            </div>
-            {events.length ? (
-              <div className="table-scroll">
-                <table className="telemetry-table">
-                  <thead>
-                    <tr>
-                      <th>ID</th>
-                      <th>Kapabilitas</th>
-                      <th>Outcome</th>
-                      <th>Sumber</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {events.map((event, index) => (
-                      <tr key={`${event.event_id ?? "event"}-${index}`}>
-                        <td>{event.event_id ?? "—"}</td>
-                        <td><code>{event.capability ?? "—"}</code></td>
-                        <td>
-                          {event.success === true ? (
-                            <span className="telemetry-outcome success-text">
-                              Berhasil
-                            </span>
-                          ) : event.success === false ? (
-                            <span className="telemetry-outcome failure-text">
-                              Gagal
-                            </span>
-                          ) : (
-                            <span className="telemetry-outcome unknown-text">
-                              Belum diketahui
-                            </span>
-                          )}
-                        </td>
-                        <td>{event.source ?? "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="muted telemetry-no-data">
-                Belum ada event telemetry untuk ditampilkan.
-              </p>
-            )}
-          </div>
-
-          <p className="telemetry-updated">
-            {refreshedAt
-              ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}`
-              : "Waktu pembaruan belum tersedia."}
-            {" · "}Data runtime saat ini; tidak dijamin persisten setelah
-            server restart.
-          </p>
-        </>
-      )}
+      <p className="telemetry-contract-note"><code>GET /api/v1/telemetry/capabilities/sources</code> · Snapshot tidak digabungkan antar-runtime.</p>
+      {error && <div className="alert error telemetry-error"><AlertCircle size={17} /><div><b>Telemetry tidak dapat dimuat</b><p>{error}</p></div></div>}
+      {loading && !telemetrySources && <div className="empty telemetry-empty"><LoaderCircle className="spin" size={24} /><h3>Memuat telemetry</h3><p>Mengambil sumber telemetry dari API backend.</p></div>}
+      {!loading && !telemetrySources && !error && <div className="empty telemetry-empty"><CircleHelp size={24} /><h3>Telemetry belum tersedia</h3><p>Belum ada respons telemetry dari backend.</p></div>}
+      {telemetrySources && <div className="telemetry-sources-grid">
+        <TelemetrySourcePanel title="Cognitive Runtime" description="Penalaran dan kapabilitas runtime kognitif." sourceData={sources.cognitive_runtime} />
+        <TelemetrySourcePanel title="Execution Runtime" description="Aksi simulasi dan outcome runtime eksekusi." sourceData={sources.execution_runtime} />
+      </div>}
+      <p className="telemetry-updated">{refreshedAt ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}` : "Waktu pembaruan belum tersedia."} · Data runtime saat ini; tidak dijamin persisten setelah server restart.</p>
     </section>
   );
 }
@@ -702,7 +597,7 @@ export default function Dashboard() {
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState("overview");
 
-  const [telemetry, setTelemetry] = useState(null);
+  const [telemetrySources, setTelemetrySources] = useState(null);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const [telemetryError, setTelemetryError] = useState("");
   const [telemetryUpdatedAt, setTelemetryUpdatedAt] = useState(null);
@@ -753,8 +648,8 @@ export default function Dashboard() {
     setTelemetryError("");
 
     try {
-      const data = await getCapabilityTelemetry({ limit: 20, signal });
-      setTelemetry(data);
+      const data = await getCapabilityTelemetrySources({ limit: 20, signal });
+      setTelemetrySources(data);
       setTelemetryUpdatedAt(new Date());
     } catch (exception) {
       if (exception.name !== "AbortError") {
@@ -1033,6 +928,8 @@ export default function Dashboard() {
           </div>
         </motion.section>
 
+        <AssistantComposer />
+
         <section className="metrics">
           <div className="metric">
             <small><Server size={14} /> API STATUS</small>
@@ -1275,7 +1172,7 @@ export default function Dashboard() {
         />
 
         <TelemetrySection
-          telemetry={telemetry}
+          telemetrySources={telemetrySources}
           loading={telemetryLoading}
           error={telemetryError}
           onRefresh={() => refreshTelemetry()}

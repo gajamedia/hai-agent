@@ -119,32 +119,36 @@ class AgentCognitiveRuntime:
     ) -> CognitiveCycleResult:
         """Run one cognitive pass using Agent state as the default context."""
 
-        resolved_observation = self._resolve_observation(observation)
-        context = self.build_context(
-            goal=goal,
-            state=state,
-            world_model=world_model,
-            relevant_memory=relevant_memory,
-            strategy=strategy,
-            self_awareness=self_awareness,
-            calibration=calibration,
-            metacognition=metacognition,
-            metadata=metadata,
-        )
+        try:
+            resolved_observation = self._resolve_observation(observation)
+            context = self.build_context(
+                goal=goal,
+                state=state,
+                world_model=world_model,
+                relevant_memory=relevant_memory,
+                strategy=strategy,
+                self_awareness=self_awareness,
+                calibration=calibration,
+                metacognition=metacognition,
+                metadata=metadata,
+            )
 
-        result = self.orchestrator.run(
-            resolved_observation,
-            context,
-            episode=episode,
-            deterministic_reflection=deterministic_reflection,
-            include_metacognition=include_metacognition,
-            metadata={
-                "integration": "agent_cognitive_runtime",
-                "agent_name": getattr(self.agent, "name", None),
-                "cycle": self._resolve_cycle(),
-                **dict(metadata or {}),
-            },
-        )
+            result = self.orchestrator.run(
+                resolved_observation,
+                context,
+                episode=episode,
+                deterministic_reflection=deterministic_reflection,
+                include_metacognition=include_metacognition,
+                metadata={
+                    "integration": "agent_cognitive_runtime",
+                    "agent_name": getattr(self.agent, "name", None),
+                    "cycle": self._resolve_cycle(),
+                    **dict(metadata or {}),
+                },
+            )
+        except Exception:
+            self._record_cognitive_telemetry(success=False)
+            raise
 
         self.last_trace = AgentCognitiveRuntimeTrace(
             cycle=self._resolve_cycle(),
@@ -152,7 +156,27 @@ class AgentCognitiveRuntime:
             context=context,
             result=result,
         )
+        self._record_cognitive_telemetry(success=True)
         return result
+
+    def _record_cognitive_telemetry(self, *, success: bool) -> None:
+        """Record cognitive-cycle outcome without conflating it with execution.
+
+        Telemetry is optional for lightweight/fake Agents. A telemetry failure
+        must not hide the cognitive result or replace the original exception.
+        """
+        recorder = getattr(self.agent, "record_capability_telemetry", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                "cognitive_cycle",
+                success=success,
+                source="agent_cognitive_runtime",
+            )
+        except Exception:
+            # Telemetry is diagnostic; never let it change runtime semantics.
+            return
 
     def get_last_result(self) -> CognitiveCycleResult | None:
         """Return the latest cognitive result without touching the Agent."""

@@ -1578,10 +1578,11 @@ class Agent:
     def attribute_strategy(
         self,
         experience: Experience,
-        strategies: Optional[
-            list[Strategy]
-        ] = None,
+        strategies: Optional[list[Strategy]] = None,
     ) -> StrategyAttributionResult:
+        """Attribute experience only to eligible active strategies."""
+        if experience is None:
+            raise ValueError("experience cannot be None.")
 
         candidates = (
             strategies
@@ -1589,64 +1590,93 @@ class Agent:
             else self.strategy_registry
         )
 
-        result = (
-            self.strategy_attributor.attribute(
-                experience=experience,
-                strategies=candidates,
-            )
+        active_candidates = [
+            strategy
+            for strategy in candidates
+            if strategy is not None and strategy.is_active
+        ]
+
+        # Explicit strategy takes precedence only while active.
+        if self.active_strategy is not None:
+            if self.active_strategy.is_active:
+                return StrategyAttributionResult(
+                    strategy=self.active_strategy,
+                    matched=True,
+                    reason="explicit active strategy",
+                )
+
+            # Do not retain a paused or retired strategy as active.
+            self.active_strategy = None
+
+        result = self.strategy_attributor.attribute(
+            experience=experience,
+            strategies=active_candidates,
         )
 
-        # Explicit strategy always has precedence.
-        if self.active_strategy is not None:
-
-            return StrategyAttributionResult(
-                strategy=self.active_strategy,
-                matched=True,
-                reason=(
-                    "explicit active strategy"
-                ),
-            )
-
-        if (
-            result.matched
-            and result.strategy is not None
-        ):
-            self.active_strategy = (
-                result.strategy
-            )
+        if result.matched and result.strategy is not None:
+            if result.strategy.is_active:
+                self.active_strategy = result.strategy
+            else:
+                # Defensive guard: never activate an ineligible result.
+                return StrategyAttributionResult(
+                    strategy=None,
+                    matched=False,
+                    reason="attributed strategy is not active",
+                )
 
         return result
+
 
     # =====================================================
     # Strategy lifecycle / consolidation
     # =====================================================
 
-    def consolidate_strategies(
-        self,
-    ):
+    def consolidate_strategies(self):
+        """Consolidate equivalent strategies and repair active reference."""
+        previous_active = self.active_strategy
 
-        result = (
-            self.strategy_consolidator.consolidate(
-                self.strategy_registry
-            )
+        result = self.strategy_consolidator.consolidate(
+            self.strategy_registry
         )
 
-        self.strategy_registry = (
-            result.strategies
-        )
+        self.strategy_registry = result.strategies
 
+        # Rebuild canonical storage with consolidated representatives.
         self.strategy_store.clear()
 
-        for strategy in (
-            self.strategy_registry
-        ):
-            self.strategy_store.add(
-                strategy
-            )
+        for strategy in self.strategy_registry:
+            self.strategy_store.add(strategy)
 
         self._refresh_strategy_registry()
 
+        if previous_active is not None:
+            # If the previous active object was merged and retired,
+            # redirect to its surviving equivalent representative.
+            replacement = next(
+                (
+                    strategy
+                    for strategy in self.strategy_registry
+                    if strategy.is_active
+                    and self.strategy_consolidator.equivalent(
+                        previous_active,
+                        strategy,
+                    )
+                ),
+                None,
+            )
+
+            if replacement is not None:
+                self.active_strategy = replacement
+            elif previous_active.is_active and any(
+                strategy is previous_active
+                for strategy in self.strategy_registry
+            ):
+                self.active_strategy = previous_active
+            else:
+                self.active_strategy = None
+
         return result
+
 
     def evaluate_strategy_lifecycle(
         self,

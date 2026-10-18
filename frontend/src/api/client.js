@@ -59,6 +59,14 @@ export async function getCapabilityTelemetry({
   );
 }
 
+export async function getCapabilityTelemetrySources({ limit = 20, signal } = {}) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(
+    `/api/v1/telemetry/capabilities/sources?${query.toString()}`,
+    { signal },
+  );
+}
+
 export async function getStrategies(signal) {
   return request("/api/v1/strategies", { signal });
 }

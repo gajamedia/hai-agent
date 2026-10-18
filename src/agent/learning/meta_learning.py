@@ -56,6 +56,9 @@ class MetaLearningProfile:
         event_id: Optional[str] = None,
     ) -> None:
 
+        if not self._record_event(event_id):
+            return
+
         self.exploration_count += 1
 
         if success:
@@ -63,9 +66,6 @@ class MetaLearningProfile:
         else:
             self.exploration_failure_count += 1
 
-        self._record_event(
-            event_id
-        )
 
     # =====================================================
     # Exploitation
@@ -77,6 +77,9 @@ class MetaLearningProfile:
         event_id: Optional[str] = None,
     ) -> None:
 
+        if not self._record_event(event_id):
+            return
+
         self.exploitation_count += 1
 
         if success:
@@ -84,9 +87,6 @@ class MetaLearningProfile:
         else:
             self.exploitation_failure_count += 1
 
-        self._record_event(
-            event_id
-        )
 
     # =====================================================
     # Evolution
@@ -98,6 +98,9 @@ class MetaLearningProfile:
         event_id: Optional[str] = None,
     ) -> None:
 
+        if not self._record_event(event_id):
+            return
+
         self.evolution_count += 1
 
         if success:
@@ -105,9 +108,6 @@ class MetaLearningProfile:
         else:
             self.evolution_failure_count += 1
 
-        self._record_event(
-            event_id
-        )
 
     # =====================================================
     # Recovery
@@ -119,6 +119,9 @@ class MetaLearningProfile:
         event_id: Optional[str] = None,
     ) -> None:
 
+        if not self._record_event(event_id):
+            return
+
         self.recovery_count += 1
 
         if success:
@@ -126,9 +129,6 @@ class MetaLearningProfile:
         else:
             self.recovery_failure_count += 1
 
-        self._record_event(
-            event_id
-        )
 
     # =====================================================
     # Progress
@@ -140,12 +140,12 @@ class MetaLearningProfile:
         event_id: Optional[str] = None,
     ) -> None:
 
+        if not self._record_event(event_id):
+            return
+
         self.total_progress += progress_delta
         self.progress_observation_count += 1
 
-        self._record_event(
-            event_id
-        )
 
     # =====================================================
     # Internal event tracking
@@ -154,15 +154,24 @@ class MetaLearningProfile:
     def _record_event(
         self,
         event_id: Optional[str],
-    ) -> None:
+    ) -> bool:
+        """
+        Accept a learning event exactly once when it has an ID.
+
+        Returns False for a duplicate ID so counters and progress are
+        not updated twice when runtime callbacks are retried. Calls
+        without an event ID preserve the historical non-deduplicated
+        behavior.
+        """
 
         if event_id is None:
-            return
+            return True
 
-        if event_id not in self.learning_events:
-            self.learning_events.append(
-                event_id
-            )
+        if event_id in self.learning_events:
+            return False
+
+        self.learning_events.append(event_id)
+        return True
 
     # =====================================================
     # Rates

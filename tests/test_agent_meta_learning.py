@@ -146,8 +146,9 @@ def test_agent_progress_event_is_not_duplicated():
 
     profile = agent.get_meta_learning_profile()
 
-    assert profile.progress_observation_count == 2
-    assert profile.total_progress == 1.0
+    # Replayed event IDs must not update the learning profile twice.
+    assert profile.progress_observation_count == 1
+    assert profile.total_progress == 0.5
 
     assert (
         profile.learning_events.count(
