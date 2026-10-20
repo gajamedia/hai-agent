@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -345,6 +345,46 @@ class LLMPlanParser:
         return tuple(result)
 
 
+
+def _validate_action_sequence_against_catalog(
+    plan: "LLMPlan",
+    catalog: Sequence[Any],
+    initial_state: Mapping[str, Any],
+) -> list[str]:
+    """Validate a plan by simulating trusted action preconditions and effects."""
+    specs: dict[str, Mapping[str, Any]] = {}
+    for item in catalog:
+        if isinstance(item, Mapping):
+            action_id = item.get("id", item.get("name"))
+            if isinstance(action_id, str) and action_id.strip():
+                specs[action_id.strip()] = item
+    state = dict(initial_state)
+    issues: list[str] = []
+    for step in plan.steps:
+        spec = specs.get(step.action)
+        if spec is None:
+            issues.append(f"step {step.index}: unknown action {step.action!r}")
+            continue
+        preconditions = spec.get("preconditions", {})
+        effects = spec.get("effects", {})
+        if not isinstance(preconditions, Mapping):
+            preconditions = {}
+        if not isinstance(effects, Mapping):
+            effects = {}
+        failed = {
+            key: {"expected": expected, "actual": state.get(key)}
+            for key, expected in preconditions.items()
+            if state.get(key) != expected
+        }
+        if failed:
+            issues.append(
+                f"step {step.index} {step.action!r} preconditions failed: "
+                + json.dumps(failed, ensure_ascii=False, sort_keys=True)
+            )
+            continue
+        state.update(effects)
+    return issues
+
 class LLMPlanner:
     """Ask an injected LLM service to create a plan from reasoning + context."""
 
@@ -390,53 +430,104 @@ class LLMPlanner:
             indent=2,
             sort_keys=True,
         )
+        # An action catalog is optional so the general-purpose planner keeps
+        # its existing contract when called outside a controlled runtime.
+        call_metadata = dict(metadata or {})
+        raw_catalog = call_metadata.get("action_catalog")
+        catalog_lines: list[str] = []
+
+        if isinstance(raw_catalog, Sequence) and not isinstance(
+            raw_catalog, (str, bytes)
+        ):
+            seen_action_ids: set[str] = set()
+
+            for item in raw_catalog:
+                if isinstance(item, Mapping):
+                    action_id = item.get("id", item.get("name"))
+                    description = item.get("description", "")
+                    preconditions = item.get("preconditions", {})
+                    effects = item.get("effects", {})
+                else:
+                    action_id = item
+                    description = ""
+                    preconditions = {}
+                    effects = {}
+
+                if not isinstance(action_id, str):
+                    continue
+
+                action_id = action_id.strip()
+                if not action_id or action_id in seen_action_ids:
+                    continue
+
+                seen_action_ids.add(action_id)
+                description = (
+                    description.strip()
+                    if isinstance(description, str)
+                    else ""
+                )
+                suffix = f" â€” {description}" if description else ""
+                catalog_lines.append(f"- {action_id}{suffix}")
+                if isinstance(preconditions, Mapping) and preconditions:
+                    catalog_lines.append("  preconditions: " + json.dumps(dict(preconditions), ensure_ascii=False, sort_keys=True))
+                if isinstance(effects, Mapping) and effects:
+                    catalog_lines.append("  effects: " + json.dumps(dict(effects), ensure_ascii=False, sort_keys=True))
+
+        action_catalog_section = ""
+        if catalog_lines:
+            action_catalog_section = (
+                "### TRUSTED ACTION CATALOG\n"
+                "The following action IDs are the ONLY executable actions "
+                "available in this runtime:\n"
+                + "\n".join(catalog_lines)
+                + "\n\n"
+                "IMPORTANT ACTION CONTRACT:\n"
+                "- Set every steps[].action to one exact ID listed above.\n"
+                "- Do not use natural-language sentences as action IDs.\n"
+                "- Do not invent actions, tools, movement, inspection, or "
+                "verification capabilities absent from the catalog.\n"
+                "- If the goal cannot be achieved with the available actions, "
+                "state the limitation in rationale/assumptions and do not "
+                "invent an executable step.\n\n"
+            )
+
         prompt = (
             "Create a finite plan for the supplied goal using the agent context and reasoning.\n\n"
             "### REASONING\n"
             f"{reasoning_text}\n\n"
             "### AGENT CONTEXT\n"
             f"{context.to_prompt()}\n\n"
+            f"{action_catalog_section}"
             "Plan only; do not execute or report execution results. "
             f"Use at most {self.max_steps} ordered steps.\n\n"
             "Return the required JSON object only."
         )
+        initial_state = call_metadata.get("initial_state")
+        if isinstance(initial_state, Mapping) and catalog_lines:
+            prompt += (
+                "\n\n### INITIAL WORLD STATE (TRUSTED RUNTIME SNAPSHOT)\n"
+                + json.dumps(dict(initial_state), ensure_ascii=False, sort_keys=True)
+                + "\n\nACTION ORDERING RULES:\n"
+                "- Check every action precondition against the current state.\n"
+                "- Apply effects only after preconditions hold.\n"
+                "- Never schedule an action before its preconditions are established.\n"
+                "- Do not add redundant actions after the target is already satisfied.\n"
+            )
+
+        request_metadata = {
+            "operation": "planning",
+            "max_steps": self.max_steps,
+            **call_metadata,
+        }
 
         response = self.llm_service.complete_text(
             prompt,
             system_prompt=self.system_prompt,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            metadata={
-                "operation": "planning",
-                "max_steps": self.max_steps,
-                **dict(metadata or {}),
-            },
+            metadata=request_metadata,
         )
 
-        # plan = LLMPlanParser.parse(
-        #     response.content,
-        #     provider=response.provider,
-        #     model=response.model,
-        #     max_steps=self.max_steps,
-        # )
-        # try:
-        #     plan = LLMPlanParser.parse(
-        #         response.content,
-        #         provider=response.provider,
-        #         model=response.model,
-        #         max_steps=self.max_steps,
-        #     )
-        # except LLMPlanningParseError:
-        #     content = response.content or ""
-        #     logger.warning(
-        #         "LLM planning response could not be parsed as JSON "
-        #         "(provider=%s, model=%s, chars=%d, preview=%r)",
-        #         response.provider,
-        #         response.model,
-        #         len(content),
-        #         content[:200],
-        #     )
-        #     raise
         try:
             plan = LLMPlanParser.parse(
                 response.content,
@@ -446,11 +537,9 @@ class LLMPlanner:
             )
         except LLMPlanningParseError:
             content = response.content or ""
-
             logger.exception(
                 "LLM planning JSON parse failed "
-                "(provider=%s, model=%s, chars=%d, "
-                "head=%r, tail=%r)",
+                "(provider=%s, model=%s, chars=%d, head=%r, tail=%r)",
                 response.provider,
                 response.model,
                 len(content),
@@ -459,6 +548,146 @@ class LLMPlanner:
             )
             raise
 
+        # Only enforce the runtime catalog when the caller explicitly supplies
+        # one. This preserves the general-purpose planner contract elsewhere.
+        # A supplied but empty/invalid catalog is not treated as unrestricted.
+        catalog_was_supplied = "action_catalog" in call_metadata
+        allowed_action_ids = {
+            line[2:].split(" â€” ", 1)[0]
+            for line in catalog_lines
+            if line.startswith("- ")
+        }
+
+        if catalog_was_supplied and not allowed_action_ids:
+            self.last_response = response
+            self.last_plan = None
+            raise LLMPlanningSchemaError(
+                "The runtime supplied an empty or invalid action catalog; "
+                "planning is blocked."
+            )
+
+        if catalog_was_supplied:
+            invalid_actions = [
+                step.action for step in plan.steps
+                if step.action not in allowed_action_ids
+            ]
+
+            if invalid_actions:
+                logger.warning(
+                    "LLM planner produced actions outside the trusted catalog; "
+                    "requesting one bounded correction (invalid_actions=%r)",
+                    invalid_actions,
+                )
+                correction_prompt = (
+                    prompt
+                    + "\\n\\n### ACTION CATALOG VALIDATION FAILED\\n"
+                    + "Your previous plan used action IDs that are not "
+                    "registered in this runtime. Regenerate the ENTIRE plan "
+                    "as valid JSON using only the exact action IDs listed in "
+                    "the trusted catalog. Do not add, rename, or describe an "
+                    "action in the steps[].action field.\\n"
+                    + "Invalid action IDs from your previous response: "
+                    + json.dumps(invalid_actions, ensure_ascii=False)
+                    + "\\nAllowed action IDs: "
+                    + json.dumps(sorted(allowed_action_ids), ensure_ascii=False)
+                    + "\\nReturn only the corrected JSON object."
+                )
+                retry_metadata = {
+                    **request_metadata,
+                    "planning_retry": 1,
+                    "planning_retry_reason": "unknown_action_id",
+                }
+                response = self.llm_service.complete_text(
+                    correction_prompt,
+                    system_prompt=self.system_prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    metadata=retry_metadata,
+                )
+                try:
+                    plan = LLMPlanParser.parse(
+                        response.content,
+                        provider=response.provider,
+                        model=response.model,
+                        max_steps=self.max_steps,
+                    )
+                except LLMPlanningParseError:
+                    content = response.content or ""
+                    logger.exception(
+                        "Corrected LLM planning response could not be parsed "
+                        "(provider=%s, model=%s, chars=%d)",
+                        response.provider,
+                        response.model,
+                        len(content),
+                    )
+                    raise
+
+                remaining_invalid_actions = [
+                    step.action for step in plan.steps
+                    if step.action not in allowed_action_ids
+                ]
+                if remaining_invalid_actions:
+                    # Do not execute or silently rewrite a plan. Returning it
+                    # allows the existing canonical runtime validator to reject
+                    # it through the established HTTP 422 plan_validation_failed
+                    # response, rather than turning a validation failure into 500.
+                    logger.warning(
+                        "LLM planner still produced unknown actions after one "
+                        "correction; downstream canonical validation must reject "
+                        "the plan (invalid_actions=%r)",
+                        remaining_invalid_actions,
+                    )
+
+        catalog_was_supplied = "action_catalog" in call_metadata
+        if catalog_was_supplied:
+            if not isinstance(raw_catalog, Sequence) or isinstance(raw_catalog, (str, bytes)):
+                self.last_response = response
+                self.last_plan = None
+                raise LLMPlanningSchemaError("Runtime action catalog is invalid; planning is blocked.")
+            allowed_ids = {
+                item.get("id", item.get("name")).strip()
+                for item in raw_catalog
+                if isinstance(item, Mapping)
+                and isinstance(item.get("id", item.get("name")), str)
+                and item.get("id", item.get("name")).strip()
+            }
+            if not allowed_ids:
+                self.last_response = response
+                self.last_plan = None
+                raise LLMPlanningSchemaError("Runtime action catalog is empty; planning is blocked.")
+            state_for_validation = initial_state if isinstance(initial_state, Mapping) else {}
+            violations = _validate_action_sequence_against_catalog(plan, raw_catalog, state_for_validation)
+            if violations:
+                correction_prompt = (
+                    prompt
+                    + "\n\n### ACTION ORDER VALIDATION FAILED\n"
+                    + "Fix the entire plan; the previous action order is not executable.\n"
+                    + "Violations:\n- " + "\n- ".join(violations)
+                    + "\nUse only registered action IDs and return only the corrected JSON object."
+                )
+                response = self.llm_service.complete_text(
+                    correction_prompt,
+                    system_prompt=self.system_prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    metadata={"operation": "planning", "max_steps": self.max_steps, **call_metadata,
+                              "planning_retry": 1, "planning_retry_reason": "action_precondition_order"},
+                )
+                try:
+                    plan = LLMPlanParser.parse(response.content, provider=response.provider,
+                                              model=response.model, max_steps=self.max_steps)
+                except LLMPlanningParseError:
+                    self.last_response = response
+                    self.last_plan = None
+                    raise
+                violations = _validate_action_sequence_against_catalog(plan, raw_catalog, state_for_validation)
+                if violations:
+                    self.last_response = response
+                    self.last_plan = None
+                    raise LLMPlanningSchemaError(
+                        "Planner produced a non-executable action sequence after one correction; execution blocked. "
+                        + " | ".join(violations)
+                    )
         self.last_response = response
         self.last_plan = plan
         return plan
@@ -477,3 +706,4 @@ __all__ = [
     "LLMPlanningParseError",
     "LLMPlanningSchemaError",
 ]
+

@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from threading import RLock
@@ -21,6 +23,16 @@ ALLOWED_ACTIONS = (
     "find_spare_key",
     "unlock_door",
 )
+
+
+def _goal_satisfied_for_runtime(
+    state: dict[str, Any],
+    target_state: dict[str, Any],
+) -> bool:
+    return bool(target_state) and all(
+        state.get(key) == expected
+        for key, expected in target_state.items()
+    )
 
 
 def _simulation_handler(**kwargs: Any) -> dict[str, Any]:
@@ -100,11 +112,15 @@ class ExecutionRuntime:
     def __init__(
         self,
         memory_path: str | Path | None = None,
+        environment: Any | None = None,
     ) -> None:
         self.agent = create_simulation_agent(
             memory_path=memory_path,
         )
-        self.environment = RoomEnvironment()
+        self.environment = (
+            environment if environment is not None
+            else RoomEnvironment()
+        )
         self.lock = RLock()
 
     @property
@@ -113,6 +129,45 @@ class ExecutionRuntime:
 
     def get_state(self) -> dict[str, Any]:
         with self.lock:
+            return dict(self.environment.observe())
+
+    def set_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Apply a validated state to the isolated Room simulation."""
+        if not isinstance(state, dict):
+            raise ValueError("state must be a JSON object.")
+
+        allowed_values = {
+            "door": {"locked", "unlocked"},
+            "box": {"closed", "open"},
+            "key": {"inside_box", "agent", "missing"},
+            "spare_key": {"available", "found", "unavailable"},
+            "agent_location": {"room"},
+        }
+        expected_keys = set(allowed_values)
+        received_keys = set(state)
+        if received_keys != expected_keys:
+            missing = sorted(expected_keys - received_keys)
+            unknown = sorted(received_keys - expected_keys)
+            details = []
+            if missing:
+                details.append("missing fields: " + ", ".join(missing))
+            if unknown:
+                details.append("unknown fields: " + ", ".join(unknown))
+            raise ValueError("Invalid world state (" + "; ".join(details) + ").")
+
+        normalized: dict[str, str] = {}
+        for field, choices in allowed_values.items():
+            value = state[field]
+            if not isinstance(value, str) or value not in choices:
+                raise ValueError(
+                    f"Invalid value for '{field}'. Allowed values: {', '.join(sorted(choices))}."
+                )
+            normalized[field] = value
+
+        with self.lock:
+            # Mutate only the sandbox environment, under the same lock used by
+            # state reads, resets, and execution. This is setup, not an action.
+            self.environment.state = dict(normalized)
             return dict(self.environment.observe())
 
     def reset(self) -> dict[str, Any]:
@@ -125,6 +180,7 @@ class ExecutionRuntime:
         actions: list[str],
         goal_description: str,
         target_state: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if not actions:
             raise ValueError("At least one action is required.")
@@ -134,6 +190,21 @@ class ExecutionRuntime:
 
         if not target_state:
             raise ValueError("target_state must not be empty.")
+
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ValueError("idempotency_key must be a non-empty string.")
+            if len(actions) != 1:
+                raise ValueError(
+                    "idempotency_key is supported only for single-action requests."
+                )
+            execute_idempotent = getattr(
+                self.environment, "execute_idempotent", None
+            )
+            if not callable(execute_idempotent):
+                raise ValueError(
+                    "The configured environment does not support single-action idempotency."
+                )
 
         unknown = [
             name for name in actions
@@ -146,6 +217,58 @@ class ExecutionRuntime:
 
         with self.lock:
             state_before = dict(self.environment.observe())
+
+            if idempotency_key is not None:
+                fingerprint_payload = {
+                    "actions": list(actions),
+                    "goal_description": goal_description,
+                    "target_state": target_state,
+                }
+                request_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                idempotent_result = self.environment.execute_idempotent(
+                    action=actions[0],
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                )
+                state_after = dict(self.environment.observe())
+                goal_satisfied = _goal_satisfied_for_runtime(
+                    state_after, target_state
+                )
+                result_payload = dict(idempotent_result)
+                replayed = bool(result_payload.pop("replayed", False))
+                action_success = bool(result_payload.get("success", False))
+                return {
+                    "status": "ok",
+                    "mode": DecisionMode.EXPLOIT.value,
+                    "reason": "Explicit allowlisted simulation execution request.",
+                    "actions": list(actions),
+                    "success": action_success,
+                    "goal_satisfied": goal_satisfied,
+                    "goal": {
+                        "description": goal_description,
+                        "target_state": dict(target_state),
+                        "completed": goal_satisfied,
+                        "failed": not goal_satisfied,
+                    },
+                    "state_before": state_before,
+                    "state_after": state_after,
+                    "steps": [{
+                        "action": actions[0],
+                        "success": action_success,
+                        "message": result_payload.get("message"),
+                    }],
+                    "telemetry_events": [],
+                    "replayed": replayed,
+                    "idempotency_key": idempotency_key,
+                }
 
             goal = Goal(
                 description=goal_description,
@@ -285,5 +408,9 @@ class ExecutionRuntime:
 
 def create_execution_runtime(
     memory_path: str | Path | None = None,
+    environment: Any | None = None,
 ) -> ExecutionRuntime:
-    return ExecutionRuntime(memory_path=memory_path)
+    return ExecutionRuntime(
+        memory_path=memory_path,
+        environment=environment,
+    )

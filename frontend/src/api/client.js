@@ -1,4 +1,4 @@
-export const API_BASE_URL = (
+﻿export const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
 ).replace(/\/+$/, "");
 
@@ -84,6 +84,14 @@ export async function runExecution(payload, signal) {
   });
 }
 
+export async function runCognitivePlan(payload, signal) {
+  return request("/api/v1/execution/plan-run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+}
 export async function resetExecution(signal) {
   return request("/api/v1/execution/reset", {
     method: "POST",

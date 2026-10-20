@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from .models import Memory
@@ -32,34 +32,24 @@ class SemanticMemory(Memory):
         episode_id: str,
         amount: float = 0.1,
     ) -> None:
+        # An episode may reinforce this memory only once.
+        if episode_id in self.source_episodes:
+            return
 
         self.evidence_count += 1
-
         self.confidence = round(
-            min(
-                1.0,
-                self.confidence + amount,
-            ),
+            min(1.0, self.confidence + amount),
             6,
         )
-
-        if episode_id not in self.source_episodes:
-            self.source_episodes.append(
-                episode_id
-            )
+        self.source_episodes.append(episode_id)
 
     def contradict(
         self,
         amount: float = 0.1,
     ) -> None:
-
         self.contradiction_count += 1
-
         self.confidence = round(
-            max(
-                0.0,
-                self.confidence - amount,
-            ),
+            max(0.0, self.confidence - amount),
             6,
         )
 
@@ -68,19 +58,14 @@ class SemanticMemory(Memory):
         episode_id: str,
         amount: float = 0.1,
     ) -> None:
+        # Do not count the same episode twice as contradiction evidence.
+        if episode_id in self.source_episodes:
+            return
 
         self.contradiction_count += 1
-
-        if episode_id not in self.source_episodes:
-            self.source_episodes.append(
-                episode_id
-            )
-
+        self.source_episodes.append(episode_id)
         self.confidence = round(
-            max(
-                0.0,
-                self.confidence - amount,
-            ),
+            max(0.0, self.confidence - amount),
             6,
         )
 
@@ -88,9 +73,7 @@ class SemanticMemory(Memory):
         self,
         context: Dict[str, Any],
     ) -> bool:
-
         for key, expected_value in self.context.items():
-
             if context.get(key) != expected_value:
                 return False
 

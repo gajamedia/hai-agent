@@ -305,6 +305,44 @@ def test_plan_run_rejects_unknown_action_before_execution(
     assert state["door"] == "locked"
 
 
+def test_plan_run_stops_when_target_state_is_satisfied(monkeypatch):
+    monkeypatch.setattr(
+        FakeCognitiveRuntime,
+        "plan",
+        make_plan(
+            "Open the box",
+            ["open_box", "take_key"],
+        ),
+    )
+
+    with make_client() as client:
+        response = client.post(
+            "/api/v1/execution/plan-run",
+            json={
+                "observation": "The box is closed.",
+                "goal_description": "Open the box",
+                "target_state": {"box": "open"},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["success"] is True
+    assert body["goal"]["satisfied"] is True
+    assert body["execution"]["success"] is True
+    assert body["execution"]["completed"] is False
+    assert body["execution"]["stopped"] is True
+    assert body["execution"]["stop_reason"] == "goal_satisfied"
+    assert body["execution"]["planned_step_count"] == 2
+    assert body["execution"]["executed_step_count"] == 1
+    assert [step["action"] for step in body["execution"]["steps"]] == [
+        "open_box"
+    ]
+    assert body["state_after"]["box"] == "open"
+    assert body["state_after"]["key"] == "inside_box"
+
+
 def test_plan_run_stops_after_failed_action(monkeypatch):
     monkeypatch.setattr(
         FakeCognitiveRuntime,
@@ -545,3 +583,98 @@ def test_execution_run_records_unknown_outcome_for_missing_step_evidence(
     assert outcomes[1].action == "take_key"
     assert outcomes[1].execution_success is None
     assert outcomes[1].reason == "execution_outcome_unknown"
+
+
+def test_plan_run_rejects_unreachable_goal_without_changing_state(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        FakeCognitiveRuntime,
+        "plan",
+        make_plan("Unlock the door", ["unlock_door"]),
+    )
+
+    with make_client() as client:
+        before_response = client.get("/api/v1/execution/state")
+        assert before_response.status_code == 200
+        state_before = before_response.json()["state"]
+
+        # The default room state has a key inside the box, so this test
+        # first changes the key state to make the target unreachable.
+        state_update = client.put(
+            "/api/v1/execution/state",
+            json={
+                "door": "locked",
+                "box": "closed",
+                "key": "missing",
+                "spare_key": "unavailable",
+                "agent_location": "room",
+            },
+        )
+
+        if state_update.status_code not in (200, 204):
+            # Do not silently pass if this API does not support state updates.
+            raise AssertionError(
+                "Could not set test world state: "
+                f"{state_update.status_code} {state_update.text}"
+            )
+
+        state_before_run = client.get("/api/v1/execution/state").json()["state"]
+
+        response = client.post(
+            "/api/v1/execution/plan-run",
+            json={
+                "observation": "The key is missing and no spare key is available.",
+                "goal_description": "Unlock the door",
+                "target_state": {"door": "unlocked"},
+            },
+        )
+
+        state_after_run = client.get("/api/v1/execution/state").json()["state"]
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["error"] == "goal_unreachable"
+    assert detail["goal_achieved"] is False
+    assert detail["execution_started"] is False
+    assert state_after_run == state_before_run
+
+def test_plan_run_continues_when_feasibility_is_inconclusive(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        FakeCognitiveRuntime,
+        "plan",
+        make_plan("Open the box", ["open_box"]),
+    )
+
+    # Simulate an inconclusive assessment. This must not be treated
+    # as proof that the goal is unreachable.
+    monkeypatch.setattr(
+        "api.routes.execution.assess_goal_feasibility",
+        lambda **kwargs: SimpleNamespace(
+            status="inconclusive",
+            explored_states=1,
+            action_sequence=(),
+            reason="Test exploration limit reached.",
+        ),
+    )
+
+    with make_client() as client:
+        response = client.post(
+            "/api/v1/execution/plan-run",
+            json={
+                "observation": "The box is closed.",
+                "goal_description": "Open the box",
+                "target_state": {"box": "open"},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["execution"]["success"] is True
+    assert body["goal"]["satisfied"] is True
+    assert body["state_after"]["box"] == "open"

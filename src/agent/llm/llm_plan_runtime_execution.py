@@ -105,6 +105,11 @@ class LLMPlanRuntimeEvent:
 RuntimeEventObserver = Callable[[LLMPlanRuntimeEvent], None]
 
 
+class _RuntimeEventObserverError(RuntimeError):
+    """Distinguish telemetry/state observer failures from action failures."""
+
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -255,7 +260,14 @@ class LLMPlanRuntimeExecutor:
             observers.append(self.runtime_event_observer)
         observers.extend(tuple(self._additional_event_observers))
         for observer in observers:
-            observer(event)
+            try:
+                observer(event)
+            except Exception as exc:
+                # An observer failure is not an action execution failure.
+                # Propagate it distinctly so the step is never recorded twice.
+                raise _RuntimeEventObserverError(
+                    f"Runtime event observer failed during '{event.phase}': {exc}"
+                ) from exc
 
     def add_event_observer(self, observer: RuntimeEventObserver) -> None:
         if not callable(observer):
@@ -389,6 +401,18 @@ class LLMPlanRuntimeExecutor:
             return bool(checker(world_state))
         return None
 
+    @staticmethod
+    def _next_planned_step_index(
+        plan: LLMPlan,
+        current_step_index: int,
+    ) -> int | None:
+        """Return the next actual plan index, or None when no step remains."""
+        remaining = sorted(
+            step.index for step in plan.steps
+            if step.index > current_step_index
+        )
+        return remaining[0] if remaining else None
+
     def execute(
         self,
         plan: LLMPlan,
@@ -437,11 +461,47 @@ class LLMPlanRuntimeExecutor:
         records: list[LLMPlanStepExecutionRecord] = []
         current_world_state = world_state
         stop_reason: str | None = None
+        goal_satisfied: bool | None = None
         stopped = False
         next_step_index: int | None = None
         last_result: Any = None
 
         for step in sorted(plan.steps, key=lambda item: item.index):
+            # A verified goal is terminal: do not execute further plan steps
+            # when the observed state already satisfies it.
+            # Only perform the pre-action check when the caller supplied an
+            # observed initial state. If it did not, let the first action run
+            # and verify against the fresh environment observation afterward.
+            goal_already_satisfied = (
+                self._verify_goal_satisfaction(
+                    resolved_goal,
+                    current_world_state,
+                    plan=plan,
+                    records=records,
+                    environment=environment,
+                )
+                if world_state is not None
+                else None
+            )
+            if goal_already_satisfied is True:
+                goal_satisfied = True
+                stopped = True
+                stop_reason = "goal_satisfied"
+                next_step_index = step.index
+                self._emit_event(
+                    LLMPlanRuntimeEvent(
+                        phase="stopped",
+                        plan=plan,
+                        step=step,
+                        world_state=current_world_state,
+                        result=last_result,
+                        stop_reason=stop_reason,
+                        next_step_index=next_step_index,
+                        metadata=dict(metadata or {}),
+                    )
+                )
+                break
+
             stop_requested, condition = self._evaluate_stop_conditions(
                 plan,
                 phase="before_step",
@@ -603,13 +663,13 @@ class LLMPlanRuntimeExecutor:
                             record=record,
                             world_state=current_world_state,
                             result=result,
-                            next_step_index=step.index + 1,
+                            next_step_index=self._next_planned_step_index(plan, step.index),
                             metadata=dict(runtime_metadata),
                         )
                     )
                     stopped = True
                     stop_reason = "step_failed"
-                    next_step_index = step.index + 1
+                    next_step_index = self._next_planned_step_index(plan, step.index)
                     self._emit_event(
                         LLMPlanRuntimeEvent(
                             phase="stopped",
@@ -625,18 +685,27 @@ class LLMPlanRuntimeExecutor:
                     )
                     break
 
-                stop_requested, condition = self._evaluate_stop_conditions(
-                    plan,
-                    phase="after_step",
-                    step=step,
+                # Verify the explicit goal against the freshly observed state
+                # after every successful action. This is independent of the
+                # planner's natural-language stop_conditions.
+                goal_now_satisfied = self._verify_goal_satisfaction(
+                    resolved_goal,
+                    current_world_state,
+                    plan=plan,
                     records=records,
-                    world_state=current_world_state,
-                    last_result=last_result,
+                    environment=environment,
                 )
-                if stop_requested:
+                goal_satisfied = goal_now_satisfied
+                remaining_step_index = self._next_planned_step_index(
+                    plan, step.index
+                )
+                # A satisfied goal only stops execution early when there are
+                # additional planned actions to skip. If this was the final
+                # step, let the run complete normally (stop_reason=None).
+                if goal_now_satisfied is True and remaining_step_index is not None:
                     stopped = True
-                    stop_reason = f"stop_condition:{condition}"
-                    next_step_index = step.index + 1
+                    stop_reason = "goal_satisfied"
+                    next_step_index = remaining_step_index
                     records[-1] = LLMPlanStepExecutionRecord(
                         step=record.step,
                         request=record.request,
@@ -656,7 +725,60 @@ class LLMPlanRuntimeExecutor:
                             record=record,
                             world_state=current_world_state,
                             result=result,
-                            next_step_index=step.index + 1,
+                            next_step_index=next_step_index,
+                            metadata=dict(runtime_metadata),
+                        )
+                    )
+                    self._emit_event(
+                        LLMPlanRuntimeEvent(
+                            phase="stopped",
+                            plan=plan,
+                            step=step,
+                            record=record,
+                            world_state=current_world_state,
+                            result=result,
+                            stop_reason=stop_reason,
+                            next_step_index=next_step_index,
+                            metadata={
+                                **dict(runtime_metadata),
+                                "goal_satisfied": True,
+                            },
+                        )
+                    )
+                    break
+
+                stop_requested, condition = self._evaluate_stop_conditions(
+                    plan,
+                    phase="after_step",
+                    step=step,
+                    records=records,
+                    world_state=current_world_state,
+                    last_result=last_result,
+                )
+                if stop_requested:
+                    stopped = True
+                    stop_reason = f"stop_condition:{condition}"
+                    next_step_index = self._next_planned_step_index(plan, step.index)
+                    records[-1] = LLMPlanStepExecutionRecord(
+                        step=record.step,
+                        request=record.request,
+                        result=record.result,
+                        success=record.success,
+                        observation=record.observation,
+                        skipped=record.skipped,
+                        stop_requested=True,
+                        error=record.error,
+                    )
+                    record = records[-1]
+                    self._emit_event(
+                        LLMPlanRuntimeEvent(
+                            phase="step_recorded",
+                            plan=plan,
+                            step=step,
+                            record=record,
+                            world_state=current_world_state,
+                            result=result,
+                            next_step_index=self._next_planned_step_index(plan, step.index),
                             metadata=dict(runtime_metadata),
                         )
                     )
@@ -683,11 +805,15 @@ class LLMPlanRuntimeExecutor:
                         record=record,
                         world_state=current_world_state,
                         result=result,
-                        next_step_index=step.index + 1,
+                        next_step_index=self._next_planned_step_index(plan, step.index),
                         metadata=dict(runtime_metadata),
                     )
                 )
 
+            except _RuntimeEventObserverError:
+                # Do not convert telemetry/state-transition failures into a new
+                # failed action record: the current step may already be recorded.
+                raise
             except Exception as exc:
                 record = LLMPlanStepExecutionRecord(
                     step=step,
@@ -733,15 +859,27 @@ class LLMPlanRuntimeExecutor:
         completed = len(records) == len(plan.steps) and all(
             record.success and not record.skipped for record in records
         )
-        goal_satisfied = self._verify_goal_satisfaction(
-            resolved_goal,
-            current_world_state,
-            plan=plan,
-            records=records,
-            environment=environment,
-        )
+        if goal_satisfied is None:
+            goal_satisfied = self._verify_goal_satisfaction(
+                resolved_goal,
+                current_world_state,
+                plan=plan,
+                records=records,
+                environment=environment,
+            )
         # Successful individual actions do not imply that the goal was reached.
-        success = completed and not stopped and goal_satisfied is not False
+        # An early stop is successful only when the explicit goal verifier
+        # confirms the goal was reached. Ordinary stop conditions and failed
+        # actions remain unsuccessful.
+        success = (
+            completed and not stopped and goal_satisfied is not False
+        ) or (
+            stopped
+            and stop_reason == "goal_satisfied"
+            and goal_satisfied is True
+        )
+        if goal_satisfied is False:
+            success = False
         if completed:
             next_step_index = None
 

@@ -254,6 +254,7 @@ class LLMPlanRuntimeStateTracker:
         *,
         reason: str,
         next_step_index: int | None = None,
+        success: bool = False,
     ) -> LLMPlanRuntimeState:
         self._require_started()
         if not isinstance(reason, str) or not reason.strip():
@@ -273,7 +274,7 @@ class LLMPlanRuntimeStateTracker:
         self._status = LLMPlanRuntimeStatus.STOPPED
         self._completed = False
         self._stopped = True
-        self._success = False
+        self._success = bool(success)
         self._stop_reason = reason.strip()
         self._next_step_index = next_step_index
         return self.snapshot()
@@ -323,6 +324,10 @@ class LLMPlanRuntimeStateTracker:
             self.mark_stopped(
                 reason=report.stop_reason or "stopped",
                 next_step_index=report.next_step_index,
+                success=(
+                    report.stop_reason == "goal_satisfied"
+                    and report.goal_satisfied is True
+                ),
             )
         elif report.completed:
             self.mark_completed(

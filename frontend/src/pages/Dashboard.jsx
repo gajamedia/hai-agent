@@ -1,4 +1,4 @@
-import "./execution.css";
+﻿import "./execution.css";
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
@@ -9,6 +9,8 @@ import {
   CheckCircle2,
   CircleHelp,
   Code2,
+  ChevronUp,
+  ChevronDown,
   FileJson,
   FlaskConical,
   LoaderCircle,
@@ -30,6 +32,7 @@ import {
   getStrategies,
   resetExecution,
   runCognitive,
+  runCognitivePlan,
   runExecution,
 } from "../api/client.js";
 
@@ -109,6 +112,7 @@ function ExecutionSection({
   targetStateText,
   setTargetStateText,
   onRun,
+  onPlanRun,
   onReset,
   onRefresh,
 }) {
@@ -284,7 +288,7 @@ function ExecutionSection({
                       disabled={busy || resetting || index === 0}
                       onClick={() => moveAction(index, -1)}
                     >
-                      ↑
+                      <ChevronUp size={15} aria-hidden="true" />
                     </button>
                     <button
                       type="button"
@@ -297,7 +301,7 @@ function ExecutionSection({
                       }
                       onClick={() => moveAction(index, 1)}
                     >
-                      ↓
+                      <ChevronDown size={15} aria-hidden="true" />
                     </button>
                   </div>
                 </div>
@@ -347,6 +351,19 @@ function ExecutionSection({
               )}
               {busy ? "Menjalankan..." : "Execute actions"}
             </button>
+            <button
+              type="button"
+              className="primary"
+              disabled={!canRun}
+              onClick={() => onPlanRun(targetParsed.value)}
+            >
+              {busy ? (
+                <LoaderCircle className="spin" size={15} />
+              ) : (
+                <Activity size={15} />
+              )}
+              {busy ? "Merencanakan & menjalankan..." : "Plan & Run Goal"}
+            </button>
           </div>
 
           <p className="footnote">
@@ -395,92 +412,167 @@ function ExecutionSection({
 
           <StateView title="Current environment state" state={currentState} />
 
-          {result && (
-            <>
-              <section className="panel">
-                <div className="panel-head">
-                  <h3>Latest execution result</h3>
-                  <span
-                    className={`tag ${
-                      result.goal_satisfied ? "execution-tag-success" : ""
-                    }`}
-                  >
-                    {result.goal_satisfied
-                      ? "Goal tercapai"
-                      : result.success
-                        ? "Aksi selesai"
-                        : "Belum tercapai"}
-                  </span>
-                </div>
+          {result && (() => {
+            const isPlanRun = result.mode === "cognitive_plan_execution";
+            const goalSatisfied = isPlanRun
+              ? result.goal?.satisfied === true
+              : result.goal_satisfied === true;
+            const executionSuccess = isPlanRun
+              ? result.execution?.success === true
+              : result.success === true;
+            const steps = isPlanRun
+              ? result.execution?.steps || []
+              : result.steps || [];
+            const planSteps = result.plan?.steps || [];
 
-                <div className="execution-result-metrics">
-                  <div>
-                    <small>EXECUTION</small>
-                    <b>{result.success ? "Berhasil" : "Gagal"}</b>
+            return (
+              <>
+                <section className="panel">
+                  <div className="panel-head">
+                    <h3>Latest execution result</h3>
+                    <span
+                      className={`tag ${
+                        goalSatisfied ? "execution-tag-success" : ""
+                      }`}
+                    >
+                      {goalSatisfied
+                        ? "Goal tercapai"
+                        : executionSuccess
+                          ? "Aksi selesai, goal belum tercapai"
+                          : "Belum tercapai"}
+                    </span>
                   </div>
-                  <div>
-                    <small>GOAL VERIFICATION</small>
-                    <b>{result.goal_satisfied ? "Lulus" : "Belum lulus"}</b>
-                  </div>
-                  <div>
-                    <small>MODE</small>
-                    <b>{result.mode || "—"}</b>
-                  </div>
-                </div>
 
-                <p className="summary">
-                  {result.goal?.description ||
-                    result.reason ||
-                    "Eksekusi selesai."}
-                </p>
-
-                {result.steps?.length > 0 && (
-                  <>
-                    <h4>Step outcomes</h4>
-                    <div className="execution-steps">
-                      {result.steps.map((step, index) => (
-                        <div
-                          className="execution-order-item"
-                          key={`${step.action || "step"}-${index}`}
-                        >
-                          {step.success ? (
-                            <CheckCircle2
-                              size={17}
-                              className="execution-success-icon"
-                            />
-                          ) : (
-                            <AlertCircle
-                              size={17}
-                              className="execution-failure-icon"
-                            />
-                          )}
-                          <div>
-                            <b>{step.action || `Step ${index + 1}`}</b>
-                            <small>
-                              {step.message ||
-                                (step.success ? "Berhasil" : "Gagal")}
-                            </small>
-                          </div>
-                        </div>
-                      ))}
+                  <div className="execution-result-metrics">
+                    <div>
+                      <small>EXECUTION</small>
+                      <b>{executionSuccess ? "Berhasil" : "Gagal / tidak lengkap"}</b>
                     </div>
-                  </>
-                )}
+                    <div>
+                      <small>GOAL VERIFICATION</small>
+                      <b>{goalSatisfied ? "Lulus" : "Belum lulus"}</b>
+                    </div>
+                    <div>
+                      <small>MODE</small>
+                      <b>{result.mode || "—"}</b>
+                    </div>
+                  </div>
 
-                <details>
-                  <summary>Detail respons execution</summary>
-                  <pre className="execution-json">
-                    {pretty(result)}
-                  </pre>
-                </details>
-              </section>
+                  <p className="summary">
+                    {result.goal?.description ||
+                      result.reason ||
+                      (goalSatisfied
+                        ? "Goal terverifikasi tercapai."
+                        : "Goal belum terverifikasi tercapai.")}
+                  </p>
+                  {result.status === "error" && (
+                    <div className="alert error">
+                      <AlertCircle size={17} />
+                      <div>
+                        <b>
+                          HTTP {result.http_status || "Error"} — {result.error}
+                        </b>
+                        <p>
+                          {result.execution_started === false
+                            ? "Eksekusi tidak dimulai. State simulasi tidak diubah oleh permintaan ini."
+                            : "Permintaan gagal. Periksa detail respons backend."}
+                        </p>
 
-              <StateView
-                title="State after execution"
-                state={result.state_after}
-              />
-            </>
-          )}
+                        {result.feasibility && (
+                          <pre>{pretty(result.feasibility)}</pre>
+                        )}
+
+                        {result.raw_response && (
+                          <details>
+                            <summary>Detail respons backend</summary>
+                            <pre>{pretty(result.raw_response)}</pre>
+                          </details>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {planSteps.length > 0 && (
+                    <>
+                      <h4>Generated plan</h4>
+                      <div className="execution-steps">
+                        {planSteps.map((step, index) => (
+                          <div
+                            className="execution-order-item"
+                            key={`plan-${step.action || index}-${index}`}
+                          >
+                            <span className="step-number">{index + 1}</span>
+                            <div>
+                              <b>{step.action || step.name || `Step ${index + 1}`}</b>
+                              {step.description && <small>{step.description}</small>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {steps.length > 0 && (
+                    <>
+                      <h4>Step outcomes</h4>
+                      <div className="execution-steps">
+                        {steps.map((step, index) => {
+                          const succeeded = step.success === true && step.skipped !== true;
+                          return (
+                            <div
+                              className="execution-order-item"
+                              key={`${step.action || "step"}-${index}`}
+                            >
+                              {succeeded ? (
+                                <CheckCircle2
+                                  size={17}
+                                  className="execution-success-icon"
+                                />
+                              ) : (
+                                <AlertCircle
+                                  size={17}
+                                  className="execution-failure-icon"
+                                />
+                              )}
+                              <div>
+                                <b>{step.action || `Step ${index + 1}`}</b>
+                                <small>
+                                  {step.error ||
+                                    step.message ||
+                                    (step.skipped
+                                      ? "Dilewati"
+                                      : succeeded
+                                        ? "Berhasil"
+                                        : "Gagal")}
+                                </small>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+
+                  <details>
+                    <summary>Detail respons execution</summary>
+                    <pre className="execution-json">{pretty(result)}</pre>
+                  </details>
+                </section>
+
+                <StateView
+                  title="State after execution"
+                  state={
+                    result.state_after &&
+                    Object.keys(result.state_after).length > 0
+                      ? result.state_after
+                      : result.status === "error"
+                        ? currentState
+                        : {}
+                  }
+                />
+              </>
+            );
+          })()}
         </div>
       </div>
     </section>
@@ -575,7 +667,7 @@ function TelemetrySection({ telemetrySources, loading, error, onRefresh, refresh
           {loading ? "Memuat..." : "Refresh"}
         </button>
       </div>
-      <p className="telemetry-contract-note"><code>GET /api/v1/telemetry/capabilities/sources</code> · Snapshot tidak digabungkan antar-runtime.</p>
+      <p className="telemetry-contract-note"><code>GET /api/v1/telemetry/capabilities/sources</code> Â· Snapshot tidak digabungkan antar-runtime.</p>
       {error && <div className="alert error telemetry-error"><AlertCircle size={17} /><div><b>Telemetry tidak dapat dimuat</b><p>{error}</p></div></div>}
       {loading && !telemetrySources && <div className="empty telemetry-empty"><LoaderCircle className="spin" size={24} /><h3>Memuat telemetry</h3><p>Mengambil sumber telemetry dari API backend.</p></div>}
       {!loading && !telemetrySources && !error && <div className="empty telemetry-empty"><CircleHelp size={24} /><h3>Telemetry belum tersedia</h3><p>Belum ada respons telemetry dari backend.</p></div>}
@@ -583,7 +675,7 @@ function TelemetrySection({ telemetrySources, loading, error, onRefresh, refresh
         <TelemetrySourcePanel title="Cognitive Runtime" description="Penalaran dan kapabilitas runtime kognitif." sourceData={sources.cognitive_runtime} />
         <TelemetrySourcePanel title="Execution Runtime" description="Aksi simulasi dan outcome runtime eksekusi." sourceData={sources.execution_runtime} />
       </div>}
-      <p className="telemetry-updated">{refreshedAt ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}` : "Waktu pembaruan belum tersedia."} · Data runtime saat ini; tidak dijamin persisten setelah server restart.</p>
+      <p className="telemetry-updated">{refreshedAt ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}` : "Waktu pembaruan belum tersedia."} Â· Data runtime saat ini; tidak dijamin persisten setelah server restart.</p>
     </section>
   );
 }
@@ -685,9 +777,12 @@ export default function Dashboard() {
     }
   }
 
-  async function refreshExecutionState(signal) {
+  async function refreshExecutionState(signal, preserveError = false) {
     setExecutionLoading(true);
-    setExecutionError("");
+
+    if (!preserveError) {
+      setExecutionError("");
+    }
 
     try {
       const data = await getExecutionState(signal);
@@ -788,6 +883,80 @@ export default function Dashboard() {
 
       await Promise.all([
         refreshExecutionState(),
+        refreshTelemetry(),
+        refreshStrategies(),
+      ]);
+    } finally {
+      setExecutionBusy(false);
+    }
+  }
+
+  async function runCognitivePlanGoal(targetState) {
+    setExecutionError("");
+    setExecutionResult(null);
+    setExecutionBusy(true);
+
+    try {
+      const observation = executionState?.state;
+
+      if (!observation || typeof observation !== "object") {
+        throw new Error(
+          "State simulasi belum tersedia. Refresh execution state lalu coba lagi.",
+        );
+      }
+
+      if (!goalDescription.trim()) {
+        throw new Error("Goal description wajib diisi.");
+      }
+
+      const data = await runCognitivePlan(
+        {
+          observation,
+          goal_description: goalDescription.trim(),
+          target_state: targetState,
+        },
+      );
+
+      setExecutionResult(data);
+
+      await Promise.all([
+        refreshExecutionState(),
+        refreshTelemetry(),
+        refreshStrategies(),
+      ]);
+    } catch (exception) {
+      const errorBody = exception.body || {};
+      const detail = errorBody.detail || {};
+      const assessment = detail.assessment || {};
+
+      setExecutionError(
+        `HTTP ${exception.status || "ERROR"}: ${exception.message}\n${pretty(errorBody)}`,
+      );
+
+      setExecutionResult({
+        mode: "cognitive_plan_execution",
+        status: "error",
+        error: detail.error || "execution_error",
+        reason: detail.message || exception.message,
+        http_status: exception.status || null,
+        execution_started: detail.execution_started ?? false,
+        goal: {
+          description: goalDescription.trim(),
+          satisfied: false,
+        },
+        plan: {
+          steps: assessment.action_sequence || [],
+        },
+        execution: {
+          success: false,
+          steps: [],
+        },
+        feasibility: assessment,
+        raw_response: errorBody,
+      });
+
+      await Promise.all([
+        refreshExecutionState(undefined, true),
         refreshTelemetry(),
         refreshStrategies(),
       ]);
@@ -913,13 +1082,13 @@ export default function Dashboard() {
           animate={{ opacity: 1, y: 0 }}
         >
           <div>
-            <p className="mint-label">✦ AGENT COGNITION</p>
+            <p className="mint-label">âœ¦ AGENT COGNITION</p>
             <h2>From observation<br />to a structured plan.</h2>
             <p>
               Jalankan cognitive pass, eksekusi aksi simulasi yang diizinkan,
               verifikasi goal, dan tinjau telemetry dalam satu workspace.
             </p>
-            <a href="#request">Mulai cognitive run ↗</a>
+            <a href="#request">Mulai cognitive run â†—</a>
           </div>
           <div className="hero-graphic">
             <div className="ring r1" />
@@ -1121,8 +1290,8 @@ export default function Dashboard() {
                             {step.preconditions?.length > 0 && (
                               <details><summary>Preconditions</summary><List items={step.preconditions} /></details>
                             )}
-                            {step.success_criteria && <p className="good">✓ {step.success_criteria}</p>}
-                            {step.risk && <p className="risk">⚠ {step.risk}</p>}
+                            {step.success_criteria && <p className="good">âœ“ {step.success_criteria}</p>}
+                            {step.risk && <p className="risk">âš  {step.risk}</p>}
                           </div>
                         </div>
                       ))}
@@ -1159,6 +1328,7 @@ export default function Dashboard() {
           targetStateText={targetStateText}
           setTargetStateText={setTargetStateText}
           onRun={executeSelectedActions}
+          onPlanRun={runCognitivePlanGoal}
           onReset={resetSimulation}
           onRefresh={() => refreshExecutionState()}
         />
@@ -1180,10 +1350,14 @@ export default function Dashboard() {
         />
 
         <footer>
-          hAI Agent · Cognitive API
+          hAI Agent Â· Cognitive API
           <span><Activity size={12} /> Local development workspace</span>
         </footer>
       </main>
     </div>
   );
 }
+
+
+
+

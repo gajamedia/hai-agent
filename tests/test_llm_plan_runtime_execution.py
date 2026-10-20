@@ -202,6 +202,52 @@ def test_result_mapping_can_supply_observation_without_environment():
     assert report.final_world_state == {"key": "held"}
 
 
+def test_verified_goal_stops_execution_after_satisfying_step():
+    api = FakeAPI()
+    api.results = [FakeResult(True, {}), FakeResult(True, {})]
+    runtime, api = make_runtime(
+        api,
+        goal_satisfaction_evaluator=lambda goal, world_state, context: (
+            len(context["records"]) >= 1
+        ),
+    )
+
+    report = runtime.execute(make_plan(), world_state={"box": "closed"})
+
+    assert report.success is True
+    assert report.completed is False
+    assert report.stopped is True
+    assert report.stop_reason == "goal_satisfied"
+    assert report.goal_satisfied is True
+    assert report.executed_step_indices == (1,)
+    assert report.next_step_index == 2
+    assert report.records[0].stop_requested is True
+    assert len(api.calls) == 1
+
+
+def test_already_satisfied_goal_prevents_first_action():
+    runtime, api = make_runtime(
+        goal_satisfaction_evaluator=lambda goal, world_state, context: (
+            isinstance(world_state, dict)
+            and world_state.get("door") == "unlocked"
+        ),
+    )
+
+    report = runtime.execute(
+        make_plan(),
+        world_state={"door": "unlocked"},
+    )
+
+    assert report.success is True
+    assert report.completed is False
+    assert report.stopped is True
+    assert report.stop_reason == "goal_satisfied"
+    assert report.goal_satisfied is True
+    assert report.executed_step_indices == ()
+    assert report.next_step_index == 1
+    assert not api.calls
+
+
 def test_stop_condition_can_stop_before_next_step():
     api = FakeAPI()
     api.results = [FakeResult(True, {})]

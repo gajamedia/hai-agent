@@ -155,6 +155,10 @@ class LLMPlanLiveRuntimeExecutor:
                 state = self.state_tracker.mark_stopped(
                     reason=event.stop_reason or "stopped",
                     next_step_index=event.next_step_index,
+                    success=(
+                        event.stop_reason == "goal_satisfied"
+                        and event.metadata.get("goal_satisfied") is True
+                    ),
                 )
                 self._publish_state(state)
                 return

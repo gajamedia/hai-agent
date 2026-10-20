@@ -8,6 +8,9 @@ from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
+from agent.llm.orchestrator import LLMOrchestrationStageError
+from agent.llm.planning import LLMPlanningSchemaError
+
 from agent.cognition.agent_decision import AgentDecision, DecisionMode
 from agent.llm.agent_canonical_single_action_api import (
     AgentCanonicalSingleActionAPI,
@@ -41,6 +44,7 @@ from agent.llm.llm_plan_single_action_bridge import (
 
 from api.dependencies import get_runtime
 from api.schemas import ExecutionRunRequest
+from agent.llm.goal_feasibility import assess_goal_feasibility
 
 
 router = APIRouter(prefix="/execution", tags=["execution"])
@@ -287,6 +291,32 @@ def get_execution_state(request: Request) -> dict[str, Any]:
     }
 
 
+@router.put("/state")
+def set_execution_state(
+    payload: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    """Set a validated initial state for the isolated Room sandbox."""
+    runtime = _get_runtime(request)
+    try:
+        state = runtime.set_state(payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_world_state",
+                "message": str(exc),
+            },
+        ) from exc
+
+    return {
+        "status": "ok",
+        "message": "Sandbox world state updated. No agent action was executed.",
+        "state": state,
+        "allowed_actions": list(runtime.allowed_actions),
+    }
+
+
 @router.post("/run")
 def run_execution(
     payload: ExecutionRunRequest,
@@ -455,6 +485,58 @@ def run_cognitive_plan(
         with execution_runtime.lock:
             state_before = dict(execution_runtime.environment.observe())
 
+            # Build the planner catalog only from actions registered by the
+            # trusted simulation runtime. Never accept this catalog from payload.
+            registered_names = _registered_action_names(execution_runtime)
+            registered_actions = getattr(
+                getattr(execution_runtime, "agent", None),
+                "actions",
+                {},
+            )
+
+            action_catalog = []
+            for action_name in sorted(registered_names):
+                action_object = (
+                    registered_actions.get(action_name)
+                    if isinstance(registered_actions, Mapping)
+                    else None
+                )
+                action_catalog.append(
+                    {
+                        "id": action_name,
+                        "description": str(
+                            getattr(action_object, "description", "") or ""
+                        ),
+                        "preconditions": dict(getattr(action_object, "preconditions", {}) or {}),
+                        "effects": dict(getattr(action_object, "effects", {}) or {}),
+                    }
+                )
+
+            # Assess feasibility using trusted runtime state and action catalog.
+            # An inconclusive result must not be treated as unreachable.
+            if action_catalog:
+                feasibility = assess_goal_feasibility(
+                    initial_state=state_before,
+                    goal=target_state,
+                    action_catalog=action_catalog,
+                )
+
+                if feasibility.status == "unreachable":
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "goal_unreachable",
+                            "stage": "feasibility_assessment",
+                            "message": (
+                                "The goal is unreachable using the supplied "
+                                "trusted action catalog."
+                            ),
+                            "assessment": feasibility.to_dict(),
+                            "goal_achieved": False,
+                            "execution_started": False,
+                        },
+                    )
+
             cognitive_result = cognitive_runtime.run(
                 observation,
                 goal=goal_description,
@@ -462,6 +544,8 @@ def run_cognitive_plan(
                 metadata={
                     "source": "execution_plan_run",
                     "execution_mode": "isolated_simulation",
+                    "action_catalog": action_catalog,
+                "initial_state": dict(state_before),
                 },
             )
             plan = cognitive_result.plan
@@ -498,6 +582,9 @@ def run_cognitive_plan(
                 ),
                 step_success_evaluator=lambda step, result, world_state: bool(
                     getattr(result, "success", False)
+                ),
+                goal_satisfaction_evaluator=lambda goal, world_state, context: (
+                    _goal_satisfied(world_state, target_state)
                 ),
             )
             live_runtime = LLMPlanLiveRuntimeExecutor(runtime_executor)
@@ -537,7 +624,10 @@ def run_cognitive_plan(
             if callable(telemetry):
                 telemetry(
                     "execution",
-                    report.success,
+                    bool(report.records) and all(
+                        record.success and not record.skipped
+                        for record in report.records
+                    ),
                     source="cognitive_plan_execution_api",
                 )
                 telemetry(
@@ -577,7 +667,13 @@ def run_cognitive_plan(
                 "mode": "cognitive_plan_execution",
                 "plan": plan.to_dict(),
                 "execution": {
-                    "success": report.success,
+                    # Keep action execution status distinct from goal
+                    # achievement. A plan can execute its attempted actions
+                    # successfully while the requested target remains unmet.
+                    "success": bool(report.records) and all(
+                        record.success and not record.skipped
+                        for record in report.records
+                    ),
                     "completed": report.completed,
                     "stopped": report.stopped,
                     "stop_reason": report.stop_reason,
@@ -655,6 +751,28 @@ def run_cognitive_plan(
                 "message": str(exc),
             },
         ) from exc
+    except HTTPException:
+        raise
+    except LLMOrchestrationStageError as exc:
+        if (
+            exc.stage == "planning"
+            and isinstance(exc.cause, LLMPlanningSchemaError)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "planning_failed",
+                    "stage": "planning",
+                    "message": (
+                        "No executable plan could be produced "
+                        "for the current world state."
+                    ),
+                    "reason": str(exc.cause),
+                    "goal_achieved": False,
+                    "execution_started": False,
+                },
+            ) from exc
+        raise
     except Exception as exc:
         import logging
 
@@ -683,3 +801,4 @@ def reset_execution(request: Request) -> dict[str, Any]:
         ),
         "state": runtime.reset(),
     }
+
