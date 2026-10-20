@@ -1069,7 +1069,7 @@ export default function App() {
                     Runtime feedback
                   </div>
 
-                  {feedbackItems.map((item, index) => (
+                  {/* {feedbackItems.map((item, index) => (
                     <div
                       className="feedback-row"
                       key={`${item?.step_index ?? "step"}-${index}`}
@@ -1082,6 +1082,43 @@ export default function App() {
                           item?.diagnosis || "Feedback tersedia"
                         )}
                       </span>
+                      <span
+                        className={`risk ${
+                          item?.risk_level === "high" ? "high" : ""
+                        }`}
+                      >
+                        {formatValue(item?.risk_level || "unknown")} risk
+                      </span>
+                    </div>
+                  ))} */}
+                  {feedbackItems.map((item, index) => (
+                    <div
+                      className="feedback-row"
+                      key={`${item?.step_index ?? "step"}-${index}`}
+                    >
+                      <span>
+                        Langkah {formatValue(item?.step_index)}
+                      </span>
+
+                      <span>
+                        <strong>
+                          {formatValue(item?.diagnosis || "Feedback tersedia")}
+                        </strong>
+
+                        {item?.lesson && (
+                          <div className="feedback-detail">
+                            {formatValue(item.lesson)}
+                          </div>
+                        )}
+
+                        {item?.next_step && (
+                          <div className="feedback-detail">
+                            <strong>Berikutnya:</strong>{" "}
+                            {formatValue(item.next_step)}
+                          </div>
+                        )}
+                      </span>
+
                       <span
                         className={`risk ${
                           item?.risk_level === "high" ? "high" : ""

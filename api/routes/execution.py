@@ -654,6 +654,8 @@ def run_cognitive_plan(
                     "success": item.success,
                     "progress_delta": item.progress_delta,
                     "diagnosis": item.diagnosis,
+                    "lesson": item.lesson,
+                    "next_step": item.next_step,
                     "continue_recommended": item.continue_recommended,
                     "exploration_recommended": item.exploration_recommended,
                     "risk_level": item.risk_level,

@@ -394,3 +394,21 @@ def test_feedback_diagnosis_is_preserved():
     )
     result = bridge.observe_experience(experience(success=False), 1, "a", {})
     assert result.diagnosis == "failure_with_partial_progress"
+
+def test_success_without_target_progress_preserves_action_success():
+    result = LLMPlanRuntimeLearningFeedbackEngine().build(
+        experience(action="open_box", success=True),
+        reflection(
+            success=True,
+            progress_delta=0.0,
+            diagnosis="no_observed_target_progress",
+            lesson="The observed state did not advance the target.",
+            next_step="Reassess whether another action is appropriate.",
+        ),
+    )
+
+    assert result.success is True
+    assert result.progress_delta == 0.0
+    assert result.diagnosis == "no_observed_target_progress"
+    assert result.risk_level == "medium"
+    assert result.change_required is False

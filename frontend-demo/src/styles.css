@@ -162,6 +162,13 @@ select:focus, textarea:focus { border-color: #8cb85f; box-shadow: 0 0 0 2px #b9f
 .modal-actions button { flex: 1; }
 .modal-run { margin: 0; }
 .spin { animation: spin 1s linear infinite; }
+.feedback-detail {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 1050px) {
   .sidebar { width: 210px; }
