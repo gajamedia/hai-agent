@@ -21,13 +21,17 @@ from agent.llm.service import LLMService
 class FakeProvider:
     name = "fake"
 
-    def __init__(self, content: str = "") -> None:
+    def __init__(self, content: str | list[str] = "") -> None:
         self.content = content
         self.requests = []
 
     def complete(self, request):
         self.requests.append(request)
-        return LLMResponse(content=self.content, provider=self.name, model="fake-model")
+        if isinstance(self.content, list):
+            content = self.content.pop(0) if self.content else ""
+        else:
+            content = self.content
+        return LLMResponse(content=content, provider=self.name, model="fake-model")
 
 
 def make_service(content: str) -> tuple[LLMService, FakeProvider]:
@@ -307,3 +311,64 @@ def test_plan_step_to_dict_returns_plain_data():
     )
     assert step.to_dict()["preconditions"] == ["box open"]
 
+
+
+
+def test_planner_retries_once_when_schema_is_invalid():
+    invalid_payload = json.loads(valid_payload())
+    invalid_payload["steps"][1]["preconditions"] = {
+        "inspection": "completed"
+    }
+    provider = FakeProvider([json.dumps(invalid_payload), valid_payload()])
+    planner = LLMPlanner(LLMService(provider), max_steps=4)
+
+    result = planner.plan(make_reasoning(), make_context())
+
+    assert result.goal == "inspect box"
+    assert len(provider.requests) == 2
+    assert provider.requests[1].metadata["planning_retry_reason"] == "schema_validation"
+    correction_prompt = provider.requests[1].messages[1].content
+    assert "array of strings" in correction_prompt
+    assert "preconditions" in correction_prompt
+
+
+def test_planner_stops_after_one_schema_correction_attempt():
+    invalid_payload = json.loads(valid_payload())
+    invalid_payload["steps"][1]["preconditions"] = {
+        "inspection": "completed"
+    }
+    provider = FakeProvider([json.dumps(invalid_payload), json.dumps(invalid_payload)])
+    planner = LLMPlanner(LLMService(provider), max_steps=4)
+
+    with pytest.raises(LLMPlanningSchemaError, match="preconditions"):
+        planner.plan(make_reasoning(), make_context())
+
+    assert len(provider.requests) == 2
+    assert planner.last_plan is None
+
+
+def test_planner_retries_once_when_initial_json_is_malformed():
+    malformed = valid_payload()[:-1]  # Missing final closing brace.
+    provider = FakeProvider([malformed, valid_payload()])
+    planner = LLMPlanner(LLMService(provider), max_steps=4)
+
+    result = planner.plan(make_reasoning(), make_context())
+
+    assert result.goal == "inspect box"
+    assert len(provider.requests) == 2
+    assert provider.requests[1].metadata["planning_retry_reason"] == "json_parse"
+    retry_prompt = provider.requests[1].messages[1].content
+    assert "syntactically valid JSON object" in retry_prompt
+    assert "meta-steps" in retry_prompt
+
+
+def test_planner_stops_after_one_malformed_json_retry():
+    malformed = valid_payload()[:-1]
+    provider = FakeProvider([malformed, malformed])
+    planner = LLMPlanner(LLMService(provider), max_steps=4)
+
+    with pytest.raises(LLMPlanningParseError, match="valid planning JSON"):
+        planner.plan(make_reasoning(), make_context())
+
+    assert len(provider.requests) == 2
+    assert planner.last_plan is None

@@ -255,6 +255,7 @@ def test_plan_run_executes_cognitive_plan_and_verifies_goal(
 
     assert body["plan"]["goal"] == "Unlock the door"
     assert body["plan"]["steps"][0]["action"] == "open_box"
+    assert body["plan_source"] == "runtime_generated_legacy"
 
     assert body["execution"]["success"] is True
     assert body["execution"]["planned_step_count"] == 3
@@ -268,6 +269,45 @@ def test_plan_run_executes_cognitive_plan_and_verifies_goal(
 
     assert body["audit"]["source"] == "execution_plan_run"
     assert body["audit"]["execution_mode"] == "isolated_simulation"
+
+
+def test_plan_run_executes_the_supplied_cognitive_pass_plan_without_replanning(
+    monkeypatch,
+):
+    supplied_plan = make_plan(
+        "Unlock the door",
+        ["open_box", "take_key", "unlock_door"],
+    ).to_dict()
+
+    def fail_if_replanned(*args, **kwargs):
+        raise AssertionError(
+            "Cognitive runtime must not generate a new plan when a plan is supplied."
+        )
+
+    monkeypatch.setattr(FakeCognitiveRuntime, "run", fail_if_replanned)
+
+    with make_client() as client:
+        response = client.post(
+            "/api/v1/execution/plan-run",
+            json={
+                "observation": {
+                    "description": "A locked door and a closed box."
+                },
+                "goal_description": "Unlock the door",
+                "target_state": {"door": "unlocked"},
+                "plan": supplied_plan,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["status"] == "ok"
+    assert body["plan_source"] == "cognitive_pass_handoff"
+    assert body["plan"] == supplied_plan
+    assert body["execution"]["success"] is True
+    assert body["goal"]["satisfied"] is True
+    assert body["audit"]["plan_source"] == "cognitive_pass_handoff"
 
 
 def test_plan_run_rejects_unknown_action_before_execution(

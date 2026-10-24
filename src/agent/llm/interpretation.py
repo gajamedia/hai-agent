@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -9,6 +10,9 @@ from typing import Any
 from .context import AgentContext
 from .contracts import LLMResponse
 from .service import LLMService
+
+
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_SYSTEM_PROMPT = """You are the interpretation layer of an autonomous agent.
@@ -127,10 +131,9 @@ class LLMInterpretationParser:
 
     @classmethod
     def _decode_json(cls, content: str) -> Any:
-        text = content.strip()
-
+        """Decode JSON robustly without weakening interpretation schema checks."""
+        text = content.strip().lstrip("\ufeff")
         candidates = [text]
-
         fenced = re.fullmatch(
             r"```(?:json)?\s*(.*?)\s*```",
             text,
@@ -138,17 +141,32 @@ class LLMInterpretationParser:
         )
         if fenced:
             candidates.append(fenced.group(1).strip())
-
         object_match = cls._extract_json_object(text)
         if object_match is not None:
             candidates.append(object_match)
 
-        for candidate in candidates:
+        errors: list[json.JSONDecodeError] = []
+        for candidate in dict.fromkeys(candidates):
             try:
                 return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                errors.append(exc)
+            # Some providers emit literal newlines/control characters inside a
+            # JSON string. This compatibility mode only affects decoding; the
+            # parsed object still goes through the strict schema validation.
+            try:
+                return json.loads(candidate, strict=False)
+            except json.JSONDecodeError as exc:
+                errors.append(exc)
 
+        if errors:
+            error = min(errors, key=lambda exc: (exc.pos, -len(exc.doc)))
+            logger.warning(
+                "LLM interpretation JSON decode failed: candidates=%d, chars=%d, "
+                "line=%d, column=%d, position=%d, reason=%s",
+                len(list(dict.fromkeys(candidates))), len(text), error.lineno,
+                error.colno, error.pos, error.msg,
+            )
         raise LLMInterpretationParseError(
             "LLM response does not contain valid interpretation JSON."
         )
@@ -247,22 +265,64 @@ class LLMInterpreter:
             "Return the required JSON object only."
         )
 
+        request_metadata = {
+            "operation": "interpretation",
+            **dict(metadata or {}),
+        }
         response = self.llm_service.complete_text(
             prompt,
             system_prompt=self.system_prompt,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            metadata={
-                "operation": "interpretation",
-                **dict(metadata or {}),
-            },
+            metadata=request_metadata,
         )
 
-        interpretation = LLMInterpretationParser.parse(
-            response.content,
-            provider=response.provider,
-            model=response.model,
-        )
+        try:
+            interpretation = LLMInterpretationParser.parse(
+                response.content,
+                provider=response.provider,
+                model=response.model,
+            )
+        except (LLMInterpretationParseError, LLMInterpretationSchemaError) as parse_error:
+            logger.warning(
+                "LLM interpretation response failed parsing/schema validation; "
+                "requesting one bounded correction (provider=%s, model=%s, error=%s)",
+                response.provider,
+                response.model,
+                str(parse_error),
+            )
+            correction_prompt = (
+                prompt
+                + "\n\n### OUTPUT VALIDATION FAILED\n"
+                + "Regenerate the entire interpretation as exactly one valid JSON object.\n"
+                + "Required fields: summary (non-empty string), facts (array of strings), "
+                + "entities (object), uncertainties (array of strings), implications "
+                + "(array of strings), confidence (number from 0.0 to 1.0).\n"
+                + "Do not include markdown fences or text outside JSON. Do not invent facts.\n"
+                + "Validation error: " + str(parse_error)
+                + "\nReturn only the corrected JSON object."
+            )
+            response = self.llm_service.complete_text(
+                correction_prompt,
+                system_prompt=self.system_prompt,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                metadata={
+                    **request_metadata,
+                    "interpretation_retry": 1,
+                    "interpretation_retry_reason": (
+                        "json_parse" if isinstance(parse_error, LLMInterpretationParseError)
+                        else "schema_validation"
+                    ),
+                },
+            )
+            # A second invalid response is intentionally surfaced; never return
+            # an unvalidated or fabricated interpretation.
+            interpretation = LLMInterpretationParser.parse(
+                response.content,
+                provider=response.provider,
+                model=response.model,
+            )
 
         self.last_response = response
         self.last_interpretation = interpretation

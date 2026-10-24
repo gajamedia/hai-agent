@@ -1,4 +1,4 @@
-﻿import "./execution.css";
+import "./execution.css";
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
@@ -43,6 +43,194 @@ import { exampleRequest } from "../data/exampleRequest.js";
 import "./telemetry.css";
 
 const pretty = (value) => JSON.stringify(value, null, 2);
+
+// Map the user's explicit goal to actions registered by the simulation.
+// Cognitive Pass prose is deliberately NOT scanned for action keywords: its
+// reasoning may mention actions that the user explicitly ruled out.
+function normalizeGoalText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’‘]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function actionIsNegated(text, action) {
+  // Support active and passive Indonesian constructions:
+  // "jangan membuka kotak", "kotak tidak boleh dibuka",
+  // "kunci di dalamnya tidak boleh diambil".
+  const negation = String.raw`(?:jangan|tidak|tak|tanpa|don't|do not|never|not|nggak|gak)`;
+  const objectSuffix = String.raw`(?:nya|\s+itu)?`;
+  const patterns = {
+    open_box: [
+      new RegExp(
+        `${negation}\\s+(?:(?:perlu|boleh)\\s+)?(?:untuk\\s+)?(?:membuka|buka|open)\\s+(?:the\\s+)?(?:kotak|box)${objectSuffix}\\b`,
+      ),
+      new RegExp(
+        `\\b(?:kotak|box)${objectSuffix}\\s+(?:itu\\s+)?${negation}\\s+(?:(?:boleh|dapat|bisa)\\s+)?(?:di)?(?:buka|open)\\b`,
+      ),
+    ],
+    take_key: [
+      new RegExp(
+        `${negation}\\s+(?:(?:perlu|boleh)\\s+)?(?:untuk\\s+)?(?:mengambil|ambil|ambilkan|take|get|retrieve)\\s+(?:the\\s+)?(?:kunci|key)${objectSuffix}\\b`,
+      ),
+      new RegExp(
+        `\\b(?:kunci|key)${objectSuffix}(?:\\s+di\\s+(?:dalam|dalamnya|dalam\\s+kotak))?\\s+(?:itu\\s+)?${negation}\\s+(?:(?:boleh|dapat|bisa)\\s+)?(?:di)?(?:ambil|ambilkan|take|get|retrieve)\\b`,
+      ),
+    ],
+    find_spare_key: [
+      new RegExp(
+        `${negation}\\s+(?:(?:perlu|boleh)\\s+)?(?:untuk\\s+)?(?:mencari|cari|temukan|find|locate)\\s+(?:the\\s+)?(?:kunci\\s+cadangan|spare\\s+key)${objectSuffix}\\b`,
+      ),
+      new RegExp(
+        `\\b(?:kunci\\s+cadangan|spare\\s+key)${objectSuffix}\\s+(?:itu\\s+)?${negation}\\s+(?:(?:boleh|dapat|bisa)\\s+)?(?:di)?(?:cari|temukan|find|locate)\\b`,
+      ),
+    ],
+    unlock_door: [
+      new RegExp(
+        `${negation}\\s+(?:(?:perlu|boleh)\\s+)?(?:untuk\\s+)?(?:membuka\\s+kunci|buka\\s+kunci|membuka|buka|unlock|open)\\s+(?:the\\s+)?(?:pintu|door)${objectSuffix}\\b`,
+      ),
+      new RegExp(
+        `\\b(?:pintu|door)${objectSuffix}\\s+(?:itu\\s+)?${negation}\\s+(?:(?:boleh|dapat|bisa)\\s+)?(?:di)?(?:buka|unlock)\\b`,
+      ),
+    ],
+  };
+  return (patterns[action] || []).some((pattern) => pattern.test(text));
+}
+
+function goalRequestsOpenBox(text) {
+  return (
+    /\b(?:buka|membuka|open)\b.{0,35}\b(?:kotak|box)(?:nya)?\b/.test(text) ||
+    /\b(?:kotak|box)(?:nya)?\s+(?:itu\s+)?(?:boleh|dapat|bisa|harus|perlu)\s+(?:di)?(?:buka|open)\b/.test(text)
+  );
+}
+
+function goalRequestsTakeKey(text) {
+  return (
+    /\b(?:ambil|mengambil|ambilkan|take|get|retrieve)\b.{0,40}\b(?:kunci|key)(?:nya)?\b/.test(text) ||
+    /\b(?:kunci|key)(?:nya)?(?:\s+di\s+(?:dalam|dalamnya|dalam\s+kotak))?\s+(?:boleh|dapat|bisa|harus|perlu)\s+(?:di)?(?:ambil|ambilkan|take|get|retrieve)\b/.test(text)
+  );
+}
+
+function goalStatesSpareKeyUnavailable(text) {
+  return (
+    /\b(?:kunci\s+cadangan|spare\s+key|backup\s+key)\b.{0,24}\b(?:tidak|tak|nggak|gak|belum|unavailable|missing|not\s+available|not\s+found)\b/.test(text) ||
+    /\b(?:no|without)\s+(?:available\s+)?(?:spare|backup)\s+key\b/.test(text)
+  );
+}
+
+function goalRequestsUnlockDoor(text) {
+  // A locked door is a state description, not by itself a request to unlock it.
+  // Preserve the existing Tes D shorthand only when the user also says the
+  // spare key is available. Explicitly unavailable spare keys must not trigger
+  // an inferred unlock goal or an action proposal.
+  const explicitlyRequestsUnlock = (
+    /\b(?:buka|membuka|bukakan|open|unlock|unlatch)\b.{0,35}\b(?:pintu|door)(?:nya)?\b/.test(text) ||
+    /\b(?:pintu|door)(?:nya)?\b.{0,35}\b(?:unlock|terbuka\s+kuncinya|tidak\s+terkunci)\b/.test(text) ||
+    /\b(?:gunakan|gunakanlah|pakai|use)\b.{0,45}\b(?:kunci|key)(?:nya)?\b.{0,60}\b(?:membuka|buka|open|unlock)\b.{0,25}\b(?:pintu|door)(?:nya)?\b/.test(text) ||
+    /\b(?:buka|membuka|bukakan|open|unlock)\b.{0,35}\b(?:pintu|door)(?:nya)?\b.{0,45}\b(?:dengan|pakai|gunakan|using|with)\b.{0,25}\b(?:kunci\s+cadangan|spare\s+key)(?:nya)?\b/.test(text)
+  );
+
+  if (explicitlyRequestsUnlock) return true;
+
+  const spareKeyUnavailable = goalStatesSpareKeyUnavailable(text);
+  const spareKeyAvailable =
+    /\b(?:kunci\s+cadangan|spare\s+key|backup\s+key)\b.{0,24}\b(?:tersedia|ada|available|found)\b/.test(text);
+
+  return !spareKeyUnavailable && spareKeyAvailable &&
+    /\b(?:pintu|door)\b.{0,30}\b(?:terkunci|locked)\b/.test(text);
+}
+
+function suggestSimulationActions(goal, allowedActions = [], plan = null) {
+  const allowed = new Set(allowedActions);
+  const text = normalizeGoalText(goal);
+  const selected = [];
+
+  const addIfAllowed = (action) => {
+    if (
+      allowed.has(action) &&
+      !actionIsNegated(text, action) &&
+      !selected.includes(action) &&
+      selected.length < 4
+    ) {
+      selected.push(action);
+    }
+  };
+
+  const wantsOpenBox = goalRequestsOpenBox(text);
+  const wantsTakeKey = goalRequestsTakeKey(text);
+  const mentionsSpareKey =
+    /\b(?:kunci\s+cadangan|spare\s+key)(?:nya)?\b/.test(text);
+  const wantsUnlockDoor = goalRequestsUnlockDoor(text);
+  const wantsSpareKey = mentionsSpareKey && (
+    /\b(?:gunakan|gunakanlah|pakai|use|find|cari|temukan|ambil|mengambil|take|get|dengan|with|using)\b/.test(text) ||
+    wantsUnlockDoor
+  );
+
+  if (wantsOpenBox) addIfAllowed("open_box");
+  if (wantsTakeKey) addIfAllowed("take_key");
+  if (wantsSpareKey) addIfAllowed("find_spare_key");
+  if (wantsUnlockDoor) {
+    if (wantsSpareKey) addIfAllowed("find_spare_key");
+    addIfAllowed("unlock_door");
+  }
+
+  // Only use exact registered action IDs from the plan when the user's
+  // instruction has no recognizable intent. Plan prose cannot override a
+  // recognized goal or any explicit prohibition.
+  const hasRecognizedIntent =
+    wantsOpenBox || wantsTakeKey || wantsSpareKey || wantsUnlockDoor;
+  if (
+    selected.length === 0 &&
+    !hasRecognizedIntent &&
+    !goalStatesSpareKeyUnavailable(text)
+  ) {
+    for (const step of plan?.steps || []) {
+      const action = String(step?.action || "").trim();
+      if (allowed.has(action) && !actionIsNegated(text, action)) {
+        addIfAllowed(action);
+      }
+    }
+  }
+
+  return selected;
+}
+
+function suggestTargetState(goal, currentState = {}) {
+  const text = normalizeGoalText(goal);
+  const target = {};
+  const wantsOpenBox = goalRequestsOpenBox(text);
+  const wantsTakeKey = goalRequestsTakeKey(text);
+  const wantsUnlockDoor = goalRequestsUnlockDoor(text);
+
+  if (
+    Object.prototype.hasOwnProperty.call(currentState, "box") &&
+    wantsOpenBox &&
+    !actionIsNegated(text, "open_box")
+  ) {
+    target.box = "open";
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(currentState, "key") &&
+    wantsTakeKey &&
+    !actionIsNegated(text, "take_key")
+  ) {
+    target.key = "agent";
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(currentState, "door") &&
+    wantsUnlockDoor &&
+    !actionIsNegated(text, "unlock_door")
+  ) {
+    target.door = "unlocked";
+  }
+
+  return target;
+}
 
 function List({ items }) {
   return Array.isArray(items) && items.length ? (
@@ -705,6 +893,7 @@ export default function Dashboard() {
   const [executionResetting, setExecutionResetting] = useState(false);
   const [executionError, setExecutionError] = useState("");
   const [executionResult, setExecutionResult] = useState(null);
+  const [preparedCognitivePlan, setPreparedCognitivePlan] = useState(null);
   const [selectedActions, setSelectedActions] = useState(["open_box"]);
   const [goalDescription, setGoalDescription] = useState("Open the box");
   const [targetStateText, setTargetStateText] = useState(
@@ -855,6 +1044,66 @@ export default function Dashboard() {
     }
   }
 
+  function updateExecutionGoal(value) {
+    setGoalDescription(value);
+    // Any manual goal edit invalidates the previously handed-off plan.
+    setPreparedCognitivePlan(null);
+  }
+
+  function prepareExecutionFromAssistant({
+    goalDescription: proposedGoal,
+    plan: proposedPlan,
+  }) {
+    const normalizedGoal = String(proposedGoal || "").trim();
+
+    if (!normalizedGoal) {
+      setExecutionError("Goal belum tersedia. Isi tujuan pada Ask hAI Agent terlebih dahulu.");
+      return;
+    }
+
+    if (
+      !proposedPlan ||
+      typeof proposedPlan !== "object" ||
+      !Array.isArray(proposedPlan.steps) ||
+      proposedPlan.steps.length === 0
+    ) {
+      setExecutionError(
+        "Plan Cognitive Pass tidak tersedia atau tidak memiliki langkah yang dapat dieksekusi.",
+      );
+      return;
+    }
+
+    const liveState = executionState?.state || {};
+    const allowedActions = executionState?.allowed_actions || [];
+    const suggestedActions = suggestSimulationActions(
+      normalizedGoal,
+      allowedActions,
+      proposedPlan,
+    );
+    const suggestedTarget = suggestTargetState(normalizedGoal, liveState);
+
+    setPreparedCognitivePlan(proposedPlan);
+    setGoalDescription(normalizedGoal.slice(0, 500));
+    // Replace stale selections with a goal-specific proposal. Users can still
+    // edit the action order and target before explicitly executing anything.
+    setSelectedActions(suggestedActions);
+    setTargetStateText(pretty(suggestedTarget));
+    setExecutionResult(null);
+    setExecutionError(
+      suggestedActions.length === 0
+        ? "Plan diterima, tetapi tidak ada action simulasi yang dapat dipetakan secara aman. Pilih action yang tersedia secara manual."
+        : "",
+    );
+    window.location.hash = "#execution";
+
+    window.requestAnimationFrame(() => {
+      document.getElementById("execution")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  }
+
   async function executeSelectedActions(targetState) {
     setExecutionError("");
     setExecutionResult(null);
@@ -909,13 +1158,16 @@ export default function Dashboard() {
         throw new Error("Goal description wajib diisi.");
       }
 
-      const data = await runCognitivePlan(
-        {
-          observation,
-          goal_description: goalDescription.trim(),
-          target_state: targetState,
-        },
-      );
+      if (!Array.isArray(selectedActions) || selectedActions.length === 0) {
+        throw new Error("Pilih minimal satu action simulasi sebelum menjalankan goal.");
+      }
+
+      const data = await runCognitivePlan({
+        observation,
+        goal_description: goalDescription.trim(),
+        target_state: targetState,
+        actions: selectedActions,
+      });
 
       setExecutionResult(data);
 
@@ -1082,13 +1334,13 @@ export default function Dashboard() {
           animate={{ opacity: 1, y: 0 }}
         >
           <div>
-            <p className="mint-label">âœ¦ AGENT COGNITION</p>
+            <p className="mint-label">✦ AGENT COGNITION</p>
             <h2>From observation<br />to a structured plan.</h2>
             <p>
               Jalankan cognitive pass, eksekusi aksi simulasi yang diizinkan,
               verifikasi goal, dan tinjau telemetry dalam satu workspace.
             </p>
-            <a href="#request">Mulai cognitive run â†—</a>
+            <a href="#request">Mulai cognitive run ↗</a>
           </div>
           <div className="hero-graphic">
             <div className="ring r1" />
@@ -1097,7 +1349,7 @@ export default function Dashboard() {
           </div>
         </motion.section>
 
-        <AssistantComposer />
+        <AssistantComposer onPrepareExecution={prepareExecutionFromAssistant} />
 
         <section className="metrics">
           <div className="metric">
@@ -1324,7 +1576,7 @@ export default function Dashboard() {
           selectedActions={selectedActions}
           setSelectedActions={setSelectedActions}
           goalDescription={goalDescription}
-          setGoalDescription={setGoalDescription}
+          setGoalDescription={updateExecutionGoal}
           targetStateText={targetStateText}
           setTargetStateText={setTargetStateText}
           onRun={executeSelectedActions}

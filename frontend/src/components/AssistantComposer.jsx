@@ -7,6 +7,7 @@ import {
   LoaderCircle,
   RotateCcw,
   ShieldCheck,
+  ArrowDownToLine,
 } from "lucide-react";
 import { runCognitive } from "../api/client.js";
 import "./assistant-composer.css";
@@ -26,7 +27,7 @@ function listOrEmpty(value) {
  * A friendly natural-language entry point for the existing cognitive API.
  * This component deliberately does not execute generated plan steps.
  */
-export default function AssistantComposer() {
+export default function AssistantComposer({ onPrepareExecution }) {
   const [observation, setObservation] = useState(EMPTY_PROMPT);
   const [goal, setGoal] = useState(EMPTY_GOAL);
   const [includeTrace, setIncludeTrace] = useState(true);
@@ -79,6 +80,33 @@ export default function AssistantComposer() {
         setBusy(false);
       }
     }
+  }
+
+  function prepareExecution() {
+    if (!response) return;
+
+    const normalizedGoal = goal.trim() || observation.trim();
+    if (!normalizedGoal) {
+      setError("Isi tujuan atau instruksi sebelum menyiapkan eksekusi.");
+      return;
+    }
+
+    if (typeof onPrepareExecution !== "function") {
+      setError("Execution Workspace belum terhubung pada halaman ini.");
+      return;
+    }
+
+    const plan = response?.result?.plan;
+
+    if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+      setError("Cognitive Pass belum menghasilkan plan yang valid untuk dieksekusi.");
+      return;
+    }
+
+    onPrepareExecution({
+      goalDescription: normalizedGoal,
+      plan,
+    });
   }
 
   function reset() {
@@ -253,6 +281,22 @@ export default function AssistantComposer() {
                 <p className="assistant-disclaimer">
                   Rencana ini belum dieksekusi dan belum membuktikan bahwa goal tercapai.
                 </p>
+                <div className="assistant-handoff">
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={prepareExecution}
+                    disabled={busy || typeof onPrepareExecution !== "function"}
+                  >
+                    <ArrowDownToLine size={15} />
+                    Siapkan goal di Execution Workspace
+                  </button>
+                  <p className="assistant-disclaimer">
+                    Ini hanya meneruskan goal. Target state JSON tetap harus ditinjau
+                    secara manual. Execution Workspace akan menjalankan alur Plan &amp; Run
+                    tersendiri; rencana cognitive pass ini tidak dieksekusi langsung.
+                  </p>
+                </div>
               </section>
 
               <details className="panel assistant-raw">

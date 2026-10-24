@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
+import re
 import os
 from pathlib import Path
 from typing import Any
@@ -9,7 +11,13 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from agent.llm.orchestrator import LLMOrchestrationStageError
-from agent.llm.planning import LLMPlanningSchemaError
+from agent.llm.planning import (
+    LLMPlan,
+    LLMPlanStep,
+    LLMPlanParser,
+    LLMPlanningParseError,
+    LLMPlanningSchemaError,
+)
 
 from agent.cognition.agent_decision import AgentDecision, DecisionMode
 from agent.llm.agent_canonical_single_action_api import (
@@ -90,6 +98,25 @@ _SIMULATION_ACTION_RISKS: dict[str, float] = {
 }
 
 
+def _simulation_action_catalog(runtime: Any) -> list[dict[str, Any]]:
+    """Return action metadata from the trusted simulation registry only."""
+    registered_actions = getattr(getattr(runtime, "agent", None), "actions", {})
+    catalog: list[dict[str, Any]] = []
+    for name in sorted(_registered_action_names(runtime)):
+        action = (
+            registered_actions.get(name)
+            if isinstance(registered_actions, Mapping)
+            else None
+        )
+        catalog.append({
+            "id": name,
+            "description": str(getattr(action, "description", "") or ""),
+            "preconditions": dict(getattr(action, "preconditions", {}) or {}),
+            "effects": dict(getattr(action, "effects", {}) or {}),
+        })
+    return catalog
+
+
 def _registered_action_names(runtime: Any) -> set[str]:
     """Read action names from the runtime's trusted action allowlist."""
     actions = getattr(runtime, "allowed_actions", ())
@@ -150,6 +177,60 @@ def _goal_satisfied(
         state.get(key) == expected
         for key, expected in target_state.items()
     )
+
+
+# Explicit user assertions must not be silently overridden by a contradictory
+# simulation snapshot. This guard is intentionally narrow: it recognizes clear
+# statements that the spare key is unavailable, and prevents the registered
+# search action from being used to contradict that assertion. It does not mutate
+# the trusted world state or invent an alternative action.
+def _explicitly_states_spare_key_unavailable(goal_description: str) -> bool:
+    text = " ".join(goal_description.casefold().split())
+    patterns = (
+        r"\bkunci cadangan\s+(?:itu\s+)?(?:tidak|tak|nggak|gak)\s+(?:tersedia|ada|ditemukan|diketemukan)\b",
+        r"\bkunci cadangan\s+(?:itu\s+)?(?:belum|sudah tidak|memang tidak)\s+(?:tersedia|ada)\b",
+        r"\bkunci cadangan\s+(?:tidak ada|tidak tersedia|tidak ditemukan)\b",
+        r"\b(?:spare key|backup key)\s+(?:is\s+)?(?:unavailable|not available|missing|does not exist|isn't available|is not available)\b",
+        r"\b(?:there is no|there isn't a|there is not a)\s+(?:available\s+)?(?:spare|backup) key\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _reject_plan_that_violates_explicit_constraints(
+    goal_description: str,
+    actions: Any,
+) -> None:
+    if not _explicitly_states_spare_key_unavailable(goal_description):
+        return
+
+    if isinstance(actions, (str, bytes)) or actions is None:
+        return
+
+    try:
+        action_names = [
+            str(getattr(action, "action", action)).strip()
+            for action in actions
+        ]
+    except TypeError:
+        return
+
+    if "find_spare_key" in action_names:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "explicit_constraint_conflict",
+                "stage": "plan_validation",
+                "message": (
+                    "Instruksi menyatakan kunci cadangan tidak tersedia. "
+                    "Rencana yang mencari kunci cadangan ditolak; agent tidak "
+                    "boleh menganggap kunci tersedia hanya karena state simulasi "
+                    "menyatakan sebaliknya."
+                ),
+                "conflicting_action": "find_spare_key",
+                "goal_achieved": False,
+                "execution_started": False,
+            },
+        )
 
 
 def _read_value(source: Any, *names: str) -> Any:
@@ -288,6 +369,7 @@ def get_execution_state(request: Request) -> dict[str, Any]:
         "status": "ok",
         "state": runtime.get_state(),
         "allowed_actions": list(runtime.allowed_actions),
+        "action_catalog": _simulation_action_catalog(runtime),
     }
 
 
@@ -314,6 +396,7 @@ def set_execution_state(
         "message": "Sandbox world state updated. No agent action was executed.",
         "state": state,
         "allowed_actions": list(runtime.allowed_actions),
+        "action_catalog": _simulation_action_catalog(runtime),
     }
 
 
@@ -441,7 +524,7 @@ def run_cognitive_plan(
     payload: dict[str, Any] = Body(...),
 ) -> dict[str, Any]:
     """
-    Generate a cognitive plan and execute it in the isolated simulation.
+    Execute a supplied Cognitive Pass plan, or generate a legacy plan when none is supplied.
 
     Only actions registered with the simulation Agent can be executed.
     Experience is recorded per step, and feedback is consumed before the
@@ -493,24 +576,7 @@ def run_cognitive_plan(
                 "actions",
                 {},
             )
-
-            action_catalog = []
-            for action_name in sorted(registered_names):
-                action_object = (
-                    registered_actions.get(action_name)
-                    if isinstance(registered_actions, Mapping)
-                    else None
-                )
-                action_catalog.append(
-                    {
-                        "id": action_name,
-                        "description": str(
-                            getattr(action_object, "description", "") or ""
-                        ),
-                        "preconditions": dict(getattr(action_object, "preconditions", {}) or {}),
-                        "effects": dict(getattr(action_object, "effects", {}) or {}),
-                    }
-                )
+            action_catalog = _simulation_action_catalog(execution_runtime)
 
             # Assess feasibility using trusted runtime state and action catalog.
             # An inconclusive result must not be treated as unreachable.
@@ -537,18 +603,151 @@ def run_cognitive_plan(
                         },
                     )
 
-            cognitive_result = cognitive_runtime.run(
-                observation,
-                goal=goal_description,
-                state=state_before,
-                metadata={
-                    "source": "execution_plan_run",
-                    "execution_mode": "isolated_simulation",
-                    "action_catalog": action_catalog,
-                "initial_state": dict(state_before),
-                },
+            # Execution Workspace sends the user's explicitly selected simulation
+            # action IDs. Cognitive Pass prose is not itself an executable action
+            # plan: its steps may describe reasoning that is not registered in the
+            # simulation runtime. Convert only selected, runtime-registered IDs
+            # into a canonical plan; all metadata comes from trusted runtime objects.
+            if "actions" in payload:
+                requested_actions = payload.get("actions")
+                if (
+                    not isinstance(requested_actions, list)
+                    or not requested_actions
+                    or any(not isinstance(action, str) or not action.strip() for action in requested_actions)
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_action_selection",
+                            "message": "actions must be a non-empty array of action IDs.",
+                            "execution_started": False,
+                        },
+                    )
+
+                normalized_actions = [action.strip() for action in requested_actions]
+                if len(set(normalized_actions)) != len(normalized_actions):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_action_selection",
+                            "message": "Duplicate action IDs are not allowed.",
+                            "execution_started": False,
+                        },
+                    )
+
+                unknown_actions = [action for action in normalized_actions if action not in registered_names]
+                if unknown_actions:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "action_not_available",
+                            "message": "Selected actions are not registered: " + ", ".join(unknown_actions),
+                            "execution_started": False,
+                        },
+                    )
+
+                executable_steps = []
+                for index, action_name in enumerate(normalized_actions, start=1):
+                    action_object = (
+                        registered_actions.get(action_name)
+                        if isinstance(registered_actions, Mapping)
+                        else None
+                    )
+                    description = str(getattr(action_object, "description", "") or action_name)
+                    effects = getattr(action_object, "effects", {}) or {}
+                    success_criteria = (
+                        "; ".join(f"{key}={value}" for key, value in effects.items())
+                        if isinstance(effects, Mapping) and effects
+                        else f"Action {action_name} succeeds."
+                    )
+                    preconditions = getattr(action_object, "preconditions", {}) or {}
+                    precondition_text = (
+                        tuple(f"{key}={value}" for key, value in preconditions.items())
+                        if isinstance(preconditions, Mapping)
+                        else ()
+                    )
+                    executable_steps.append(
+                        LLMPlanStep(
+                            index=index,
+                            action=action_name,
+                            purpose=description,
+                            preconditions=precondition_text,
+                            expected_observation=success_criteria,
+                            success_criteria=success_criteria,
+                            risk="low",
+                        )
+                    )
+
+                plan = LLMPlan(
+                    goal=goal_description.strip(),
+                    rationale=(
+                        "Executable simulation plan built from action IDs explicitly "
+                        "selected in Execution Workspace. Cognitive Pass reasoning "
+                        "is contextual and is not treated as runtime actions."
+                    ),
+                    steps=tuple(executable_steps),
+                    assumptions=(),
+                    constraints=("Only runtime-registered actions may execute.",),
+                    stop_conditions=("Stop when an action fails or the goal is satisfied.",),
+                    confidence=1.0,
+                    provider="execution_workspace",
+                    model=None,
+                )
+                plan_source = "validated_action_selection"
+            elif "plan" in payload:
+                supplied_plan = payload.get("plan")
+                if not isinstance(supplied_plan, Mapping):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_supplied_plan",
+                            "message": "plan must be a JSON object.",
+                            "execution_started": False,
+                        },
+                    )
+
+                try:
+                    plan = LLMPlanParser.parse(
+                        json.dumps(dict(supplied_plan)),
+                        provider=supplied_plan.get("provider"),
+                        model=supplied_plan.get("model"),
+                    )
+                except (LLMPlanningParseError, LLMPlanningSchemaError, TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_supplied_plan",
+                            "message": str(exc),
+                            "execution_started": False,
+                        },
+                    ) from exc
+
+                plan_source = "cognitive_pass_handoff"
+            else:
+                # Backward compatibility for existing direct API callers.
+                # The response explicitly identifies this path so replanning
+                # cannot happen silently.
+                cognitive_result = cognitive_runtime.run(
+                    observation,
+                    goal=goal_description,
+                    state=state_before,
+                    metadata={
+                        "source": "execution_plan_run",
+                        "execution_mode": "isolated_simulation",
+                        "action_catalog": action_catalog,
+                        "initial_state": dict(state_before),
+                    },
+                )
+                plan = cognitive_result.plan
+                plan_source = "runtime_generated_legacy"
+
+            # Validate explicit negative facts from the user's instruction before
+            # the execution boundary. A contradiction must stop before any action
+            # executes, even if the simulation snapshot says the resource exists.
+            _reject_plan_that_violates_explicit_constraints(
+                goal_description,
+                plan.steps,
             )
-            plan = cognitive_result.plan
 
             # The feedback state is request-local; no stale feedback leaks
             # into a later plan execution.
@@ -668,6 +867,7 @@ def run_cognitive_plan(
                 "status": "ok",
                 "mode": "cognitive_plan_execution",
                 "plan": plan.to_dict(),
+                "plan_source": plan_source,
                 "execution": {
                     # Keep action execution status distinct from goal
                     # achievement. A plan can execute its attempted actions
@@ -723,6 +923,7 @@ def run_cognitive_plan(
                 "audit": {
                     "source": "execution_plan_run",
                     "execution_mode": "isolated_simulation",
+                    "plan_source": plan_source,
                     "actions": list(plan.actions),
                     "experience_count": len(experiences),
                     "feedback_count": len(feedback),

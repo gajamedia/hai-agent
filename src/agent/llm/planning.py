@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SYSTEM_PROMPT = """You are the planning layer of an autonomous agent.
 Create a structured, minimal, goal-directed plan from the supplied goal, agent context, and reasoning.
+Prefer the smallest sufficient plan: normally 1-3 steps for a clear, simple goal.
+Do not create investigation, meta-planning, documentation, or speculative branches when the goal and relevant state are already clear.
+Treat explicit user prohibitions as hard constraints; never propose an action that violates them, even as an experiment or fallback.
+If the user states a resource is unavailable, do not search for or use that resource unless asked to verify the statement.
+If the goal is contradictory or impossible under the stated constraints, explain the conflict and produce a short safe clarification/stop plan rather than pretending it is executable.
 Do not execute actions, call tools, modify the world model, modify memory, or claim that any action has already happened.
 Every step must describe an intended action, not an execution result.
 Keep the plan finite and ordered.
@@ -260,8 +265,17 @@ class LLMPlanParser:
 
     @classmethod
     def _decode_json(cls, content: str) -> Any:
-        text = content.strip()
-        candidates = [text]
+        """Decode a provider response while preserving strict schema validation.
+
+        Some providers occasionally emit literal control characters inside JSON
+        string values. Try strict JSON first, then a compatibility parse that
+        permits those characters. This does not relax the planning schema: the
+        parsed object is still validated by ``parse`` immediately afterwards.
+        If parsing still fails, include line/column diagnostics without logging
+        the potentially sensitive full provider response.
+        """
+        text = content.strip().lstrip("\ufeff")
+        candidates: list[str] = [text]
 
         fenced = re.fullmatch(
             r"```(?:json)?\s*(.*?)\s*```",
@@ -275,14 +289,44 @@ class LLMPlanParser:
         if object_match is not None:
             candidates.append(object_match)
 
-        for candidate in candidates:
+        # Keep order while avoiding repeated attempts on identical candidates.
+        unique_candidates = list(dict.fromkeys(candidates))
+        errors: list[json.JSONDecodeError] = []
+
+        for candidate in unique_candidates:
             try:
                 return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                errors.append(exc)
+
+            # Compatibility fallback for raw control characters in strings.
+            # Schema validation remains strict after JSON decoding.
+            try:
+                return json.loads(candidate, strict=False)
+            except json.JSONDecodeError as exc:
+                errors.append(exc)
+
+        if errors:
+            best_error = min(errors, key=lambda exc: (exc.pos, -len(exc.doc)))
+            logger.warning(
+                "LLM planning JSON decode failed: candidates=%d, chars=%d, "
+                "line=%d, column=%d, position=%d, reason=%s",
+                len(unique_candidates),
+                len(text),
+                best_error.lineno,
+                best_error.colno,
+                best_error.pos,
+                best_error.msg,
+            )
+            detail = (
+                f" line={best_error.lineno}, column={best_error.colno}: "
+                f"{best_error.msg}"
+            )
+        else:
+            detail = " no JSON object candidate was found."
 
         raise LLMPlanningParseError(
-            "LLM response does not contain valid planning JSON."
+            "LLM response does not contain valid planning JSON." + detail
         )
 
     @staticmethod
@@ -486,13 +530,23 @@ class LLMPlanner:
                 "- Do not use natural-language sentences as action IDs.\n"
                 "- Do not invent actions, tools, movement, inspection, or "
                 "verification capabilities absent from the catalog.\n"
+                "- Use the smallest executable action sequence that achieves the "
+                "goal; do not add meta-steps for interpreting, restating, or "
+                "documenting the instruction.\n"
+                "- Do not add hypothetical branches or actions for goals already "
+                "covered by the chosen action sequence.\n"
+                "- If the user explicitly states that a resource is unavailable, missing, or absent, treat that statement as a binding constraint for this plan. Do not schedule a search action for that same resource unless the user asks to verify the claim or new trusted evidence contradicts it.\n"
+                "- Never infer that a resource is available merely because the initial world state says it is available when the user's goal explicitly asserts the opposite. Surface the conflict in rationale/constraints and do not execute a plan that depends on the disputed resource.\n"
                 "- If the goal cannot be achieved with the available actions, "
                 "state the limitation in rationale/assumptions and do not "
                 "invent an executable step.\n\n"
             )
 
         prompt = (
-            "Create a finite plan for the supplied goal using the agent context and reasoning.\n\n"
+            "Create a finite plan for the supplied goal using the agent context and reasoning.\n"
+            "Use the smallest sufficient number of steps; for a clear simple goal, use 1-3 steps.\n"
+            "Treat explicit prohibitions as hard constraints and never test, bypass, or violate them.\n"
+            "Do not add speculative investigation, meta-steps, or hypothetical branches when the available facts determine the action.\n\n"
             "### REASONING\n"
             f"{reasoning_text}\n\n"
             "### AGENT CONTEXT\n"
@@ -535,6 +589,67 @@ class LLMPlanner:
                 model=response.model,
                 max_steps=self.max_steps,
             )
+        except (LLMPlanningSchemaError, LLMPlanningParseError) as planning_error:
+            # Provider output may be malformed JSON or valid JSON that violates
+            # the planning schema. Request one bounded repair. The parser remains
+            # strict; no malformed or unvalidated plan is returned for execution.
+            logger.warning(
+                "LLM planning response failed parsing/schema validation; "
+                "requesting one bounded correction "
+                "(provider=%s, model=%s, error=%s)",
+                response.provider,
+                response.model,
+                str(planning_error),
+            )
+            correction_prompt = (
+                prompt
+                + "\n\n### PLANNING OUTPUT VALIDATION FAILED\n"
+                + "Your previous response could not be accepted. Regenerate the "
+                "ENTIRE plan as one syntactically valid JSON object matching the "
+                "required schema exactly.\n"
+                + "Keep the plan minimal and goal-directed. Do not include "
+                "meta-steps that merely restate, interpret, or document the goal.\n"
+                + "Every steps[].preconditions, assumptions, constraints, and "
+                "stop_conditions field MUST be an array of strings; use [] when "
+                "empty. Every step must include index, action, purpose, "
+                "preconditions, expected_observation, success_criteria, and risk.\n"
+                + "Use sequential integer indices starting at 1, confidence from "
+                "0.0 to 1.0, and no markdown fences or text outside the JSON.\n"
+                + "Validation error: "
+                + str(planning_error)
+                + "\nReturn only the corrected JSON object."
+            )
+            response = self.llm_service.complete_text(
+                correction_prompt,
+                system_prompt=self.system_prompt,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                metadata={
+                    **request_metadata,
+                    "planning_retry": 1,
+                    "planning_retry_reason": (
+                        "json_parse" if isinstance(planning_error, LLMPlanningParseError)
+                        else "schema_validation"
+                    ),
+                },
+            )
+            try:
+                plan = LLMPlanParser.parse(
+                    response.content,
+                    provider=response.provider,
+                    model=response.model,
+                    max_steps=self.max_steps,
+                )
+            except (LLMPlanningParseError, LLMPlanningSchemaError):
+                self.last_response = response
+                self.last_plan = None
+                logger.exception(
+                    "Corrected LLM planning response still violates the planning "
+                    "contract (provider=%s, model=%s)",
+                    response.provider,
+                    response.model,
+                )
+                raise
         except LLMPlanningParseError:
             content = response.content or ""
             logger.exception(
@@ -580,17 +695,17 @@ class LLMPlanner:
                 )
                 correction_prompt = (
                     prompt
-                    + "\\n\\n### ACTION CATALOG VALIDATION FAILED\\n"
+                    + "\n\n### ACTION CATALOG VALIDATION FAILED\n"
                     + "Your previous plan used action IDs that are not "
                     "registered in this runtime. Regenerate the ENTIRE plan "
                     "as valid JSON using only the exact action IDs listed in "
                     "the trusted catalog. Do not add, rename, or describe an "
-                    "action in the steps[].action field.\\n"
+                    "action in the steps[].action field.\n"
                     + "Invalid action IDs from your previous response: "
                     + json.dumps(invalid_actions, ensure_ascii=False)
-                    + "\\nAllowed action IDs: "
+                    + "\nAllowed action IDs: "
                     + json.dumps(sorted(allowed_action_ids), ensure_ascii=False)
-                    + "\\nReturn only the corrected JSON object."
+                    + "\nReturn only the corrected JSON object."
                 )
                 retry_metadata = {
                     **request_metadata,

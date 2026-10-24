@@ -234,3 +234,32 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+
+/* Explicit handoff from cognitive planning to the simulation workspace. */
+.assistant-handoff {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.assistant-handoff button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
+}
+
+.assistant-handoff .assistant-disclaimer {
+  max-width: 620px;
+}
+
+@media (max-width: 560px) {
+  .assistant-handoff button {
+    width: 100%;
+    white-space: normal;
+  }
+}

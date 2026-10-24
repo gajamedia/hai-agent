@@ -22,3 +22,7 @@ data/*.db-shm
 
 # Local source backups
 *backup.py
+# Local runtime evidence databases and event logs
+artifacts/**/*.sqlite
+artifacts/**/*.sqlite3
+artifacts/**/*.jsonl
