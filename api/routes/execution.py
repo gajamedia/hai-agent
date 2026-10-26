@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
+import logging
 import re
 import os
 from pathlib import Path
@@ -53,9 +55,15 @@ from agent.llm.llm_plan_single_action_bridge import (
 from api.dependencies import get_runtime
 from api.schemas import ExecutionRunRequest
 from agent.llm.goal_feasibility import assess_goal_feasibility
+from api.plan_run_idempotency import (
+    PlanRunIdempotencyConflict,
+    PlanRunIdempotencyInProgress,
+    PlanRunIdempotencyStore,
+)
 
 
 router = APIRouter(prefix="/execution", tags=["execution"])
+logger = logging.getLogger(__name__)
 
 
 def _get_runtime(request: Request) -> Any:
@@ -518,10 +526,9 @@ def run_execution(
         ) from exc
 
 
-@router.post("/plan-run")
-def run_cognitive_plan(
+def _run_cognitive_plan_impl(
     request: Request,
-    payload: dict[str, Any] = Body(...),
+    payload: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Execute a supplied Cognitive Pass plan, or generate a legacy plan when none is supplied.
@@ -991,6 +998,153 @@ def run_cognitive_plan(
                 ),
             },
         ) from exc
+
+
+@router.post("/plan-run")
+def run_cognitive_plan(
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Execute a plan, optionally with durable HTTP request idempotency.
+
+    Clients opt in with the ``Idempotency-Key`` header. Completed responses are
+    replayed from a persistent SQLite ledger. If a prior execution was interrupted
+    after it may have started, the key is blocked rather than executing the plan
+    again; that outcome requires reconciliation.
+    """
+    raw_key = request.headers.get("Idempotency-Key")
+    if raw_key is None:
+        return _run_cognitive_plan_impl(request, payload)
+
+    key = raw_key.strip()
+    if not key or len(key) > 255:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_idempotency_key",
+                "message": "Idempotency-Key must contain 1 to 255 non-whitespace characters.",
+            },
+        )
+
+    # Validate required request fields before reserving a key. Invalid requests
+    # that cannot execute must not leave a durable reservation behind.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail={"error": "invalid_request", "message": "Request body must be a JSON object."})
+    if payload.get("observation") is None:
+        raise HTTPException(status_code=422, detail={"error": "observation_required", "message": "observation is required."})
+    goal_description = payload.get("goal_description")
+    if not isinstance(goal_description, str) or not goal_description.strip():
+        raise HTTPException(status_code=422, detail={"error": "goal_description_required", "message": "goal_description must be a non-empty string."})
+    target_state = payload.get("target_state")
+    if not isinstance(target_state, dict) or not target_state:
+        raise HTTPException(status_code=422, detail={"error": "target_state_required", "message": "target_state must be a non-empty object."})
+
+    try:
+        canonical_request = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_request_json", "message": "Request body must contain JSON-compatible values."},
+        ) from exc
+    fingerprint = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+
+    store = getattr(request.app.state, "plan_run_idempotency_store", None)
+    if store is None:
+        configured_path = os.environ.get("HAI_PLAN_RUN_IDEMPOTENCY_DB")
+        database_path = (
+            Path(configured_path).expanduser()
+            if configured_path and configured_path.strip()
+            else Path(__file__).resolve().parents[2] / "data" / "execution_plan_run_idempotency.sqlite3"
+        )
+        store = PlanRunIdempotencyStore(database_path)
+        request.app.state.plan_run_idempotency_store = store
+
+    try:
+        claim = store.claim(idempotency_key=key, request_fingerprint=fingerprint)
+    except PlanRunIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "idempotency_key_conflict", "message": str(exc), "retry_safe": False},
+        ) from exc
+    except PlanRunIdempotencyInProgress as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "idempotency_outcome_unknown", "message": str(exc), "retry_safe": False, "reconciliation_required": True},
+        ) from exc
+
+    if claim.status == "completed":
+        result = dict(claim.response or {})
+        result["idempotency"] = {"key": key, "replayed": True}
+        return result
+    if claim.status == "rejected":
+        stored_error = dict(claim.response or {})
+        stored_detail = stored_error.get("detail", {"error": "request_rejected"})
+        if isinstance(stored_detail, dict):
+            stored_detail = dict(stored_detail)
+            stored_detail.setdefault("idempotency", {"key": key, "replayed": True})
+        raise HTTPException(
+            status_code=int(stored_error.get("status_code", 422)),
+            detail=stored_detail,
+        )
+    if claim.status == "unknown":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "idempotency_outcome_unknown", "message": "A previous attempt may have started execution; reconcile the simulation state before using a new key.", "retry_safe": False, "reconciliation_required": True},
+        )
+
+    def mark_unknown_without_masking_original_error() -> None:
+        """Best-effort ledger update that must not replace the triggering error."""
+        try:
+            store.mark_unknown(idempotency_key=key, request_fingerprint=fingerprint)
+        except Exception:
+            # If the ledger itself is unavailable, the row may remain `running`.
+            # That state is deliberately fail-closed: a retry will be blocked.
+            logger.exception(
+                "Unable to mark plan-run idempotency key %r as unknown; "
+                "the original execution/storage error will be preserved.",
+                key,
+            )
+
+    try:
+        result = _run_cognitive_plan_impl(request, payload)
+        response = dict(result)
+        response["idempotency"] = {"key": key, "replayed": False}
+        store.complete(
+            idempotency_key=key,
+            request_fingerprint=fingerprint,
+            response=response,
+        )
+        return response
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        # Only explicitly pre-execution errors are safely replayable as rejected.
+        try:
+            if detail.get("execution_started") is False:
+                store.reject(
+                    idempotency_key=key,
+                    request_fingerprint=fingerprint,
+                    status_code=exc.status_code,
+                    detail=detail,
+                )
+            else:
+                mark_unknown_without_masking_original_error()
+        except Exception:
+            # A failed ledger transition must not hide the API's original HTTP error.
+            logger.exception(
+                "Unable to persist plan-run idempotency rejection for key %r.", key
+            )
+        raise
+    except Exception:
+        # A failure after reservation is conservatively treated as ambiguous.
+        # Never automatically replay a plan that may have changed world state.
+        mark_unknown_without_masking_original_error()
+        raise
 
 
 @router.post("/reset")
