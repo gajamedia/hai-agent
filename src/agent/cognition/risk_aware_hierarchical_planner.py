@@ -297,6 +297,7 @@ class RiskAwareHierarchicalPlanner:
         goal: Goal,
         world_state: Dict[str, Any],
         strategies: Optional[List[Strategy]] = None,
+        episodic_memory: Any = None,
     ) -> List[Action]:
 
         active_strategies = [
@@ -335,11 +336,14 @@ class RiskAwareHierarchicalPlanner:
         if not matching_strategies:
             return fallback_plan
 
-        for strategy, _score in (
-            self.risk_strategy_selector.rank(
-                matching_strategies
-            )
-        ):
+        ranked_strategies = self._rank_with_episodic_memory(
+            strategies=matching_strategies,
+            goal=goal,
+            world_state=world_state,
+            episodic_memory=episodic_memory,
+        )
+
+        for strategy, _score in ranked_strategies:
             actions = self._strategy_to_actions(
                 strategy=strategy,
             )
@@ -364,6 +368,104 @@ class RiskAwareHierarchicalPlanner:
             return actions
 
         return fallback_plan
+
+    def _rank_with_episodic_memory(
+        self,
+        strategies: List[Strategy],
+        goal: Goal,
+        world_state: Dict[str, Any],
+        episodic_memory: Any = None,
+    ) -> List[tuple[Strategy, float]]:
+        """Rank strategies using the normal risk score plus bounded
+        evidence from relevant past episodes.
+
+        Episodic retrieval scores indicate relevance/evidence quality, not
+        outcome probability. Only episodes whose action matches a strategy
+        step and whose result explicitly contains a boolean ``success`` are
+        used. Missing memory, malformed episodes, or retrieval errors leave
+        the original selector ranking unchanged.
+        """
+        base_ranked = self.risk_strategy_selector.rank(strategies)
+        retrieve = getattr(episodic_memory, "retrieve", None)
+        if not callable(retrieve):
+            return base_ranked
+
+        adjusted = []
+        for strategy, base_score in base_ranked:
+            evidence: list[tuple[bool, float]] = []
+
+            for step in getattr(strategy, "steps", []) or []:
+                try:
+                    episodes = retrieve(
+                        goal=getattr(goal, "description", None),
+                        action=step,
+                        context=world_state,
+                        limit=20,
+                        min_score=0.0,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    # A non-conforming or unavailable memory backend must
+                    # not break planning.
+                    continue
+                except Exception:
+                    continue
+
+                for episode in episodes or []:
+                    episode_action = getattr(episode, "action", None)
+                    if episode_action != step:
+                        continue
+
+                    episode_goal = getattr(episode, "goal", None)
+                    if (
+                        episode_goal
+                        and getattr(goal, "description", None)
+                        and episode_goal != goal.description
+                    ):
+                        continue
+
+                    result = getattr(episode, "result", None)
+                    if not isinstance(result, dict):
+                        continue
+                    outcome = result.get("success")
+                    if not isinstance(outcome, bool):
+                        continue
+
+                    # Relevance scores are intentionally not treated as
+                    # success probabilities. Evidence is bounded by a
+                    # conservative per-step prior and sample count.
+                    evidence.append((outcome, 1.0))
+
+            if not evidence:
+                adjusted.append((strategy, base_score))
+                continue
+
+            successes = sum(1 for success, _ in evidence if success)
+            failures = len(evidence) - successes
+
+            # Beta(1, 1) smoothing prevents one observation from causing
+            # an extreme ranking change.
+            success_rate = (successes + 1.0) / (
+                successes + failures + 2.0
+            )
+            confidence = len(evidence) / (len(evidence) + 4.0)
+
+            # Maximum absolute adjustment is 0.10. Existing risk,
+            # uncertainty, cost, reflection and progress terms remain
+            # authoritative.
+            memory_adjustment = 0.20 * (
+                success_rate - 0.5
+            ) * confidence
+            adjusted.append(
+                (strategy, round(base_score + memory_adjustment, 6))
+            )
+
+        # Stable sorting preserves the selector's order on equal adjusted
+        # scores, so legacy ranking remains the tie-breaker.
+        return sorted(
+            adjusted,
+            key=lambda item: item[1],
+            reverse=True,
+        )
 
     def _filter_goal_strategies(
         self,

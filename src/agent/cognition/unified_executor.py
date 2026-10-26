@@ -174,6 +174,7 @@ class UnifiedDecisionExecutor:
         if decision.mode == DecisionMode.EXPLOIT:
             return self._execute_exploitation(
                 decision=decision,
+                agent=agent,
                 goal=goal,
                 world_state=world_state,
                 strategies=strategies,
@@ -383,6 +384,7 @@ class UnifiedDecisionExecutor:
         goal: Optional[Goal],
         world_state: Optional[Dict[str, Any]],
         strategies: Optional[List[Strategy]],
+        agent=None,
     ) -> UnifiedExecutionResult:
         if self.hierarchical_planner is None:
             raise RuntimeError(
@@ -399,13 +401,22 @@ class UnifiedDecisionExecutor:
                 "world_state is required for exploitation."
             )
 
-        plan = self.hierarchical_planner.plan(
-            goal=goal,
-            world_state=world_state,
-            strategies=(
+        planner_kwargs = {
+            "goal": goal,
+            "world_state": world_state,
+            "strategies": (
                 strategies if strategies is not None else []
             ),
-        )
+        }
+
+        # Pass episodic memory only when the agent exposes it. Omitting the
+        # keyword for legacy agents/test doubles preserves their old planner
+        # call contract.
+        episodic_memory = getattr(agent, "episodic_memory", None)
+        if episodic_memory is not None:
+            planner_kwargs["episodic_memory"] = episodic_memory
+
+        plan = self.hierarchical_planner.plan(**planner_kwargs)
 
         return UnifiedExecutionResult(
             decision=decision,
