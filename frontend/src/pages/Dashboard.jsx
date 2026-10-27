@@ -1,5 +1,5 @@
 import "./execution.css";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   Activity,
@@ -899,6 +899,7 @@ export default function Dashboard() {
   const [targetStateText, setTargetStateText] = useState(
     pretty({ box: "open" }),
   );
+  const planRunRetryRef = useRef(null);
 
   const [activeHash, setActiveHash] = useState(
     window.location.hash || "#top",
@@ -1140,10 +1141,90 @@ export default function Dashboard() {
     }
   }
 
+  // async function runCognitivePlanGoal(targetState) {
+  //   setExecutionError("");
+  //   setExecutionResult(null);
+  //   setExecutionBusy(true);
+
+  //   try {
+  //     const observation = executionState?.state;
+
+  //     if (!observation || typeof observation !== "object") {
+  //       throw new Error(
+  //         "State simulasi belum tersedia. Refresh execution state lalu coba lagi.",
+  //       );
+  //     }
+
+  //     if (!goalDescription.trim()) {
+  //       throw new Error("Goal description wajib diisi.");
+  //     }
+
+  //     if (!Array.isArray(selectedActions) || selectedActions.length === 0) {
+  //       throw new Error("Pilih minimal satu action simulasi sebelum menjalankan goal.");
+  //     }
+
+  //     const data = await runCognitivePlan({
+  //       observation,
+  //       goal_description: goalDescription.trim(),
+  //       target_state: targetState,
+  //       actions: selectedActions,
+  //     });
+
+  //     setExecutionResult(data);
+
+  //     await Promise.all([
+  //       refreshExecutionState(),
+  //       refreshTelemetry(),
+  //       refreshStrategies(),
+  //     ]);
+  //   } catch (exception) {
+  //     const errorBody = exception.body || {};
+  //     const detail = errorBody.detail || {};
+  //     const assessment = detail.assessment || {};
+
+  //     setExecutionError(
+  //       `HTTP ${exception.status || "ERROR"}: ${exception.message}\n${pretty(errorBody)}`,
+  //     );
+
+  //     setExecutionResult({
+  //       mode: "cognitive_plan_execution",
+  //       status: "error",
+  //       error: detail.error || "execution_error",
+  //       reason: detail.message || exception.message,
+  //       http_status: exception.status || null,
+  //       execution_started: detail.execution_started ?? false,
+  //       goal: {
+  //         description: goalDescription.trim(),
+  //         satisfied: false,
+  //       },
+  //       plan: {
+  //         steps: assessment.action_sequence || [],
+  //       },
+  //       execution: {
+  //         success: false,
+  //         steps: [],
+  //       },
+  //       feasibility: assessment,
+  //       raw_response: errorBody,
+  //     });
+
+  //     await Promise.all([
+  //       refreshExecutionState(undefined, true),
+  //       refreshTelemetry(),
+  //       refreshStrategies(),
+  //     ]);
+  //   } finally {
+  //     setExecutionBusy(false);
+  //   }
+  // }
   async function runCognitivePlanGoal(targetState) {
+    if (executionBusy) return;
+
     setExecutionError("");
     setExecutionResult(null);
     setExecutionBusy(true);
+
+    let payload;
 
     try {
       const observation = executionState?.state;
@@ -1162,13 +1243,31 @@ export default function Dashboard() {
         throw new Error("Pilih minimal satu action simulasi sebelum menjalankan goal.");
       }
 
-      const data = await runCognitivePlan({
+      payload = {
         observation,
         goal_description: goalDescription.trim(),
         target_state: targetState,
         actions: selectedActions,
-      });
+      };
 
+      const fingerprint = JSON.stringify(payload);
+      let idempotencyKey = planRunRetryRef.current?.fingerprint === fingerprint
+        ? planRunRetryRef.current.key
+        : null;
+
+      if (!idempotencyKey) {
+        idempotencyKey = crypto.randomUUID();
+        planRunRetryRef.current = { fingerprint, key: idempotencyKey };
+      }
+
+      const data = await runCognitivePlan(
+        payload,
+        undefined,
+        idempotencyKey,
+      );
+
+      // Respons diterima: jangan gunakan key ini untuk permintaan baru.
+      planRunRetryRef.current = null;
       setExecutionResult(data);
 
       await Promise.all([
@@ -1181,17 +1280,32 @@ export default function Dashboard() {
       const detail = errorBody.detail || {};
       const assessment = detail.assessment || {};
 
-      setExecutionError(
-        `HTTP ${exception.status || "ERROR"}: ${exception.message}\n${pretty(errorBody)}`,
-      );
+      const reconciliationRequired =
+        detail.reconciliation_required === true ||
+        detail.error === "idempotency_outcome_unknown";
+
+      const executionStarted = detail.execution_started ?? null;
+
+      const errorMessage = reconciliationRequired
+        ? [
+            "Status eksekusi belum dapat dipastikan.",
+            "Jangan jalankan ulang dengan key baru.",
+            "Periksa dan rekonsiliasi state simulasi terlebih dahulu.",
+            pretty(errorBody),
+          ].join("\n")
+        : `HTTP ${exception.status || "ERROR"}: ${exception.message}\n${pretty(errorBody)}`;
+
+      setExecutionError(errorMessage);
 
       setExecutionResult({
         mode: "cognitive_plan_execution",
         status: "error",
         error: detail.error || "execution_error",
-        reason: detail.message || exception.message,
+        reason: reconciliationRequired
+          ? "Status eksekusi belum pasti; rekonsiliasi diperlukan."
+          : detail.message || exception.message,
         http_status: exception.status || null,
-        execution_started: detail.execution_started ?? false,
+        execution_started: executionStarted,
         goal: {
           description: goalDescription.trim(),
           satisfied: false,

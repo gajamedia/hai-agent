@@ -84,14 +84,35 @@ export async function runExecution(payload, signal) {
   });
 }
 
-export async function runCognitivePlan(payload, signal) {
+// export async function runCognitivePlan(payload, signal) {
+//   return request("/api/v1/execution/plan-run", {
+//     method: "POST",
+//     headers: { "Content-Type": "application/json" },
+//     body: JSON.stringify(payload),
+//     signal,
+//   });
+// }
+export async function runCognitivePlan(
+  payload,
+  signal,
+  idempotencyKey,
+) {
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (idempotencyKey) {
+    headers["Idempotency-Key"] = idempotencyKey;
+  }
+
   return request("/api/v1/execution/plan-run", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
     signal,
   });
 }
+
 export async function resetExecution(signal) {
   return request("/api/v1/execution/reset", {
     method: "POST",
