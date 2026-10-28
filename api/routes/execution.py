@@ -35,6 +35,8 @@ from agent.llm.agent_execution_boundary import AgentExecutionRequest
 from agent.llm.llm_plan_agent_experience_integration import (
     LLMPlanAgentExperienceIntegrator,
 )
+from api.adaptive_plan_execution import execute_adaptive_plan
+from agent.llm.llm_plan_adaptive_runtime import LLMPlanAdaptiveRuntimeReplanningError
 from agent.llm.llm_plan_live_runtime import LLMPlanLiveRuntimeExecutor
 from agent.llm.llm_plan_runtime_execution import (
     LLMPlanRuntimeExecutionError,
@@ -60,7 +62,7 @@ from api.plan_run_idempotency import (
     PlanRunIdempotencyInProgress,
     PlanRunIdempotencyStore,
 )
-
+from agent.llm.plan_validation import LLMPlanValidator
 
 router = APIRouter(prefix="/execution", tags=["execution"])
 logger = logging.getLogger(__name__)
@@ -526,6 +528,32 @@ def run_execution(
         ) from exc
 
 
+class _AdaptiveAPIPlanValidator:
+    """Combine standard plan validation with API-specific constraints."""
+
+    def __init__(self, goal_description: str) -> None:
+        self._goal_description = goal_description
+        self._validator = LLMPlanValidator()
+
+    def validate(
+        self,
+        plan,
+        *,
+        goal=None,
+        available_actions=None,
+    ):
+        _reject_plan_that_violates_explicit_constraints(
+            self._goal_description,
+            getattr(plan, "steps", ()),
+        )
+
+        return self._validator.validate(
+            plan,
+            goal=goal or self._goal_description,
+            available_actions=available_actions,
+        )
+
+
 def _run_cognitive_plan_impl(
     request: Request,
     payload: dict[str, Any],
@@ -795,30 +823,132 @@ def _run_cognitive_plan_impl(
             )
             live_runtime = LLMPlanLiveRuntimeExecutor(runtime_executor)
 
-            experience_integrator = LLMPlanAgentExperienceIntegrator(
-                execution_runtime.agent,
-                live_runtime,
-                experience_observer=learning_bridge.observe_experience,
-                project_agent_action=True,
-                project_agent_observation=True,
-                advance_agent_cycle=False,
-            )
+            adaptive_enabled = payload.get("adaptive_replanning", False) is True
+            adaptive_result = None
+            if adaptive_enabled:
+                raw_max_replans = payload.get("max_replans", 1)
+                if isinstance(raw_max_replans, bool) or not isinstance(raw_max_replans, int):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_adaptive_replanning_config",
+                            "message": "max_replans must be an integer between 0 and 3.",
+                            "execution_started": False,
+                        },
+                    )
+                if raw_max_replans < 0 or raw_max_replans > 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "invalid_adaptive_replanning_config",
+                            "message": "max_replans must be between 0 and 3.",
+                            "execution_started": False,
+                        },
+                    )
 
-            # Plan execution, experience recording and feedback consumption
-            # happen synchronously in the same runtime event sequence.
-            integration_result = experience_integrator.execute(
-                plan,
-                goal=goal_description,
-                world_state=state_before,
-                environment=execution_runtime.environment,
-                available_actions=execution_runtime.agent.actions,
-                metadata={
-                    "source": "execution_plan_run",
-                    "execution_mode": "isolated_simulation",
-                },
-            )
+                planner = getattr(
+                    getattr(cognitive_runtime, "orchestrator", None),
+                    "planner",
+                    None,
+                )
+                if planner is None or not callable(getattr(planner, "plan", None)):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "adaptive_planner_unavailable",
+                            "message": (
+                                "Adaptive replanning requires the existing cognitive "
+                                "runtime orchestrator planner."
+                            ),
+                            "execution_started": False,
+                        },
+                    )
 
-            report = integration_result.runtime_result.report
+                adaptive_result = execute_adaptive_plan(
+                    agent=execution_runtime.agent,
+                    live_runtime=live_runtime,
+                    environment=execution_runtime.environment,
+                    planner=planner,
+                    feedback_bridge=learning_bridge,
+                    plan=plan,
+                    goal=goal_description,
+                    world_state=state_before,
+                    available_actions=execution_runtime.agent.actions,
+                    metadata={
+                        "source": "execution_plan_run",
+                        "execution_mode": "isolated_simulation",
+                    },
+                    # validator=lambda replacement_plan: (
+                    #     _reject_plan_that_violates_explicit_constraints(
+                    #         goal_description,
+                    #         replacement_plan.steps,
+                    #     )
+                    # ),
+                    validator=_AdaptiveAPIPlanValidator(goal_description),
+                    experience_integrator_options={
+                        "project_agent_action": True,
+                        "project_agent_observation": True,
+                        "advance_agent_cycle": False,
+                    },
+                    max_replans=raw_max_replans,
+                )
+                integration_result = adaptive_result.integration
+                report = adaptive_result.adaptive_report
+                final_plan = report.final_plan
+                segment_reports = [
+                    getattr(segment_result, "report", segment_result)
+                    for segment_result in report.segment_reports
+                ]
+                records = [
+                    record
+                    for segment_report in segment_reports
+                    for record in getattr(segment_report, "records", ())
+                ]
+                executed_step_indices = tuple(
+                    record.step.index for record in records if not record.skipped
+                )
+                planned_step_count = sum(
+                    len(getattr(segment_report, "plan", final_plan).steps)
+                    for segment_report in segment_reports
+                )
+                execution_success = bool(report.success)
+                execution_completed = bool(report.completed)
+                execution_stopped = bool(report.stopped)
+                execution_stop_reason = report.stop_reason
+            else:
+                # Legacy single-plan path remains unchanged unless the caller
+                # explicitly opts into adaptive replanning.
+                experience_integrator = LLMPlanAgentExperienceIntegrator(
+                    execution_runtime.agent,
+                    live_runtime,
+                    experience_observer=learning_bridge.observe_experience,
+                    project_agent_action=True,
+                    project_agent_observation=True,
+                    advance_agent_cycle=False,
+                )
+                integration_result = experience_integrator.execute(
+                    plan,
+                    goal=goal_description,
+                    world_state=state_before,
+                    environment=execution_runtime.environment,
+                    available_actions=execution_runtime.agent.actions,
+                    metadata={
+                        "source": "execution_plan_run",
+                        "execution_mode": "isolated_simulation",
+                    },
+                )
+                report = integration_result.runtime_result.report
+                final_plan = plan
+                records = list(report.records)
+                executed_step_indices = report.executed_step_indices
+                planned_step_count = len(plan.steps)
+                execution_success = bool(report.records) and all(
+                    record.success and not record.skipped for record in report.records
+                )
+                execution_completed = report.completed
+                execution_stopped = report.stopped
+                execution_stop_reason = report.stop_reason
+
             state_after = dict(execution_runtime.environment.observe())
             goal_achieved = _goal_satisfied(state_after, target_state)
 
@@ -830,9 +960,9 @@ def _run_cognitive_plan_impl(
             if callable(telemetry):
                 telemetry(
                     "execution",
-                    bool(report.records) and all(
+                    bool(records) and all(
                         record.success and not record.skipped
-                        for record in report.records
+                        for record in records
                     ),
                     source="cognitive_plan_execution_api",
                 )
@@ -873,21 +1003,18 @@ def _run_cognitive_plan_impl(
             return {
                 "status": "ok",
                 "mode": "cognitive_plan_execution",
-                "plan": plan.to_dict(),
+                "plan": final_plan.to_dict(),
                 "plan_source": plan_source,
                 "execution": {
                     # Keep action execution status distinct from goal
                     # achievement. A plan can execute its attempted actions
                     # successfully while the requested target remains unmet.
-                    "success": bool(report.records) and all(
-                        record.success and not record.skipped
-                        for record in report.records
-                    ),
-                    "completed": report.completed,
-                    "stopped": report.stopped,
-                    "stop_reason": report.stop_reason,
-                    "planned_step_count": len(plan.steps),
-                    "executed_step_count": len(report.executed_step_indices),
+                    "success": execution_success,
+                    "completed": execution_completed,
+                    "stopped": execution_stopped,
+                    "stop_reason": execution_stop_reason,
+                    "planned_step_count": planned_step_count,
+                    "executed_step_count": len(executed_step_indices),
                     "steps": [
                         {
                             "index": record.step.index,
@@ -898,7 +1025,7 @@ def _run_cognitive_plan_impl(
                             "error": record.error,
                             "observation": record.observation,
                         }
-                        for record in report.records
+                        for record in records
                     ],
                 },
                 "experience": {
@@ -927,11 +1054,37 @@ def _run_cognitive_plan_impl(
                 "state_before": state_before,
                 "state_after": state_after,
                 "success": bool(report.success and goal_achieved),
+                "adaptive_replanning": (
+                    {
+                        "enabled": True,
+                        "replanned": report.replanned,
+                        "generation_count": report.generation_count,
+                        "segment_count": report.segment_count,
+                        "max_replans": payload.get("max_replans", 1),
+                        "replans": [
+                            {
+                                "generation": getattr(item, "generation", None),
+                                "failed_step_index": getattr(item, "failed_step_index", None),
+                                "next_step_index": getattr(item, "next_step_index", None),
+                                "reason": getattr(item, "reason", None),
+                                "replacement_plan": (
+                                    item.replacement_plan.to_dict()
+                                    if getattr(item, "replacement_plan", None) is not None
+                                    else None
+                                ),
+                            }
+                            for item in report.replans
+                        ],
+                    }
+                    if adaptive_result is not None
+                    else {"enabled": False, "replanned": False, "generation_count": 1, "segment_count": 1, "replans": []}
+                ),
                 "audit": {
                     "source": "execution_plan_run",
                     "execution_mode": "isolated_simulation",
                     "plan_source": plan_source,
-                    "actions": list(plan.actions),
+                    "actions": list(final_plan.actions),
+                    "adaptive_replanning_enabled": adaptive_result is not None,
                     "experience_count": len(experiences),
                     "feedback_count": len(feedback),
                 },
@@ -951,6 +1104,16 @@ def _run_cognitive_plan_impl(
             detail={
                 "error": "plan_execution_rejected",
                 "message": str(exc),
+            },
+        ) from exc
+    except LLMPlanAdaptiveRuntimeReplanningError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "adaptive_replanning_failed",
+                "message": str(exc),
+                "execution_started": True,
+                "reconciliation_required": True,
             },
         ) from exc
     except (TypeError, ValueError) as exc:
@@ -1158,4 +1321,3 @@ def reset_execution(request: Request) -> dict[str, Any]:
         ),
         "state": runtime.reset(),
     }
-
