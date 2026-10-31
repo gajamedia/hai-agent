@@ -640,6 +640,11 @@ class Agent:
             Planner
         ] = None
 
+        # Optional application-layer hook for synchronizing trusted
+        # capability lifecycle state into a newly configured planner.
+        # Agent core remains independent of the capability registry.
+        self._planner_sync_hook = None
+
         self.adaptive_planner: Optional[
             AdaptivePlanner
         ] = None
@@ -2030,56 +2035,105 @@ class Agent:
     # Planner configuration
     # =====================================================
 
+    def set_planner_sync_hook(self, hook) -> None:
+        """
+        Install one application-owned callback invoked after planner rebuild.
+
+        The callback may synchronize planner metadata, but must not execute
+        actions or replace the canonical execution path.
+        """
+        if not callable(hook):
+            raise TypeError("Planner synchronization hook must be callable.")
+
+        current = self._planner_sync_hook
+        if current is not None and current is not hook:
+            raise RuntimeError("A planner synchronization hook is already installed.")
+
+        self._planner_sync_hook = hook
+
+    def clear_planner_sync_hook(self, hook=None) -> bool:
+        """Remove the installed hook, optionally requiring identity ownership."""
+        current = self._planner_sync_hook
+        if current is None:
+            return False
+        if hook is not None and current is not hook:
+            return False
+        self._planner_sync_hook = None
+        return True
+
     def configure_planner(
         self,
     ) -> None:
-
-        self.planner = Planner(
-            actions=list(
-                self.actions.values()
-            )
+        # Preserve the last valid graph if construction or the optional
+        # application-layer synchronization callback fails.
+        attribute_names = (
+            "planner",
+            "adaptive_planner",
+            "hierarchical_planner",
+            "risk_aware_hierarchical_planner",
+            "unified_executor",
         )
+        previous = {
+            name: getattr(self, name, None)
+            for name in attribute_names
+        }
 
-        self.adaptive_planner = (
-            AdaptivePlanner(
-                planner=self.planner,
-                strategy_selector=(
-                    self.strategy_selector
-                ),
-                risk_strategy_selector=(
-                    self.risk_strategy_selector
-                ),
+        try:
+            self.planner = Planner(
+                actions=list(
+                    self.actions.values()
+                )
             )
-        )
 
-        self.hierarchical_planner = (
-            HierarchicalPlanner(
-                planner=self.planner,
-                decomposer=self.goal_decomposer,
-                procedural_store=(
-                    self.procedural_memory
-                ),
-                causal_store=(
-                    self.causal_memory
-                ),
+            self.adaptive_planner = (
+                AdaptivePlanner(
+                    planner=self.planner,
+                    strategy_selector=(
+                        self.strategy_selector
+                    ),
+                    risk_strategy_selector=(
+                        self.risk_strategy_selector
+                    ),
+                )
             )
-        )
 
-        self.risk_aware_hierarchical_planner = (
-            RiskAwareHierarchicalPlanner(
-                self.hierarchical_planner,
-                self.risk_strategy_selector,
+            self.hierarchical_planner = (
+                HierarchicalPlanner(
+                    planner=self.planner,
+                    decomposer=self.goal_decomposer,
+                    procedural_store=(
+                        self.procedural_memory
+                    ),
+                    causal_store=(
+                        self.causal_memory
+                    ),
+                )
             )
-        )
 
-        self.unified_executor = (
-            UnifiedDecisionExecutor(
-                explorer=self.active_explorer,
-                hierarchical_planner=(
-                    self.risk_aware_hierarchical_planner
-                ),
+            self.risk_aware_hierarchical_planner = (
+                RiskAwareHierarchicalPlanner(
+                    self.hierarchical_planner,
+                    self.risk_strategy_selector,
+                )
             )
-        )
+
+            self.unified_executor = (
+                UnifiedDecisionExecutor(
+                    explorer=self.active_explorer,
+                    hierarchical_planner=(
+                        self.risk_aware_hierarchical_planner
+                    ),
+                )
+            )
+
+            hook = self._planner_sync_hook
+            if hook is not None:
+                hook()
+
+        except BaseException:
+            for name, value in previous.items():
+                setattr(self, name, value)
+            raise
 
     # =====================================================
     # Existing planning API
