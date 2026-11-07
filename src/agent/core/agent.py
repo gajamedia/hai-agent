@@ -1562,6 +1562,8 @@ class Agent:
     ) -> None:
 
         self.active_strategy = strategy
+        # An explicit choice is never treated as auto-attributed.
+        self._auto_attributed_strategy = None
 
         if strategy is not None:
             self.strategy_store.add(
@@ -1603,6 +1605,24 @@ class Agent:
 
         # Explicit strategy takes precedence only while active.
         if self.active_strategy is not None:
+            # An active strategy that was only auto-attributed from an earlier
+            # experience must not absorb a later experience that executed a
+            # different action sequence; that would merge distinct routes into
+            # one set of statistics and hide which route actually fails.
+            auto_attributed = getattr(
+                self, "_auto_attributed_strategy", None
+            )
+            if (
+                self.active_strategy is auto_attributed
+                and not self.strategy_attributor.matches(
+                    self.active_strategy,
+                    experience,
+                )
+            ):
+                self.active_strategy = None
+                self._auto_attributed_strategy = None
+
+        if self.active_strategy is not None:
             if self.active_strategy.is_active:
                 return StrategyAttributionResult(
                     strategy=self.active_strategy,
@@ -1621,6 +1641,7 @@ class Agent:
         if result.matched and result.strategy is not None:
             if result.strategy.is_active:
                 self.active_strategy = result.strategy
+                self._auto_attributed_strategy = result.strategy
             else:
                 # Defensive guard: never activate an ineligible result.
                 return StrategyAttributionResult(
@@ -2094,6 +2115,7 @@ class Agent:
                     risk_strategy_selector=(
                         self.risk_strategy_selector
                     ),
+                    avoid_unreliable_routes=True,
                 )
             )
 

@@ -26,3 +26,16 @@ data/*.db-shm
 artifacts/**/*.sqlite
 artifacts/**/*.sqlite3
 artifacts/**/*.jsonl
+
+# Local editor/script backups and one-off audit output
+*.bak*
+*.back*
+*backup*
+*-bak.*
+*,bak*
+audit_reports/
+artifacts/phase0_*/
+frontend/test-results/
+demo03_plan_run_error.json
+data/e2e/
+data/execution_traces.jsonl*
