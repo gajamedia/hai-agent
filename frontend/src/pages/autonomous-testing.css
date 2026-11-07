@@ -73,3 +73,10 @@
 .at-footer{max-width:1600px;margin:18px auto 0;padding-top:14px;border-top:1px solid #1e2b40;color:#60728a;font:9px 'DM Mono',monospace}
 @media(max-width:1000px){.at-layout{grid-template-columns:1fr}.at-form{display:grid;grid-template-columns:1fr 1fr}.at-form>.at-config-summary,.at-form>.at-button{grid-column:1/-1}}
 @media(max-width:620px){.at-shell{padding:20px 13px}.at-header{flex-direction:column}.at-header>.at-button{width:100%}.at-form{display:flex}.at-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.at-run-actions{align-items:stretch;flex-direction:column}.at-run-actions .at-button{width:100%}.at-detail-grid,.at-json-grid{grid-template-columns:1fr}}
+
+/* Text fields on every page that uses this stylesheet: dark background, readable text (also outside .at-form) */
+.at-page textarea,.at-page input:not([type=checkbox]):not([type=radio]),.at-page select{width:100%;box-sizing:border-box;padding:10px 11px;border:1px solid #2a3b53;border-radius:7px;outline:none;color:#dce7f5;background:#0a1220;font:13px 'DM Sans',sans-serif}
+.at-page textarea{resize:vertical;min-height:84px;line-height:1.45}
+.at-page textarea::placeholder,.at-page input::placeholder{color:#6b7d95}
+.at-page textarea:focus,.at-page input:focus,.at-page select:focus{border-color:#3d8c89;box-shadow:0 0 0 2px #5eead433}
+.at-page code{color:#5eead4}
