@@ -198,7 +198,45 @@ def test_prompt_lists_filterable_columns_and_the_range_limitation():
     planner.plan("x")
     system = provider.requests[0].messages[0].content
     assert '"filterable_columns": ["region", "product"]' in system
-    assert "EQUALITY" in system and "date ranges" in system
+    assert "CONDITIONS" in system and "30 ribu" in system and "Today is 2026-" in system
+
+
+def _with(**extra):
+    base = json.loads(GOOD)
+    base.update(extra)
+    return json.dumps(base)
+
+
+def _cond(column, operator, value=None):
+    c = {"column": column, "operator": operator}
+    if value is not None:
+        c["value"] = value
+    return _with(conditions=[c])
+
+
+def test_conditions_become_request_conditions():
+    planner, _ = _planner(_with(conditions=[
+        {"column": "region", "operator": "in", "value": ["east", "west"]},
+        {"column": "region", "operator": "is_not_null"}]))
+    req = planner.plan("x").request
+    assert req.conditions == (("region", "in", ("east", "west")), ("region", "is_not_null", None))
+
+
+@pytest.mark.parametrize("answer,needle", [
+    (_cond("amount", "lt", 5), "Cannot filter on"),            # not a filterable column
+    (_cond("region", "lt", "a"), "cannot be used"),            # text is not ordered
+    (_cond("region", "like", "a"), "not allowed"),
+    (_cond("region", "contains", 5), "text"),
+    (_cond("region", "in", []), "'in' needs"),
+    (_cond("region", "is_null", "x"), "takes no value"),
+    (_with(conditions="x"), "list"),
+    (_with(conditions=[{"column": "region", "operator": "eq", "value": "a", "sql": "1"}]), "Each condition"),
+    (_with(conditions=[{"column": "region", "operator": "eq", "value": "a"}] * 6), "at most"),
+])
+def test_bad_conditions_are_rejected(answer, needle):
+    planner, _ = _planner(answer, answer)
+    result = planner.plan("x")
+    assert not result.ok and needle in result.errors[-1]
 
 
 def test_catalog_derived_from_table_spec_cannot_drift():

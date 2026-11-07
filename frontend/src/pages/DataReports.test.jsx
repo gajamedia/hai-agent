@@ -365,6 +365,34 @@ describe("DataReports", () => {
     expect(card).not.toMatch(/Kelompokkan per|Hitung:/);
   });
 
+  it("shows comparison conditions in plain Indonesian before anything runs", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue({
+      status: "planned", plan_id: "p10", database: "sales",
+      plan: {
+        kind: "list", table: "sales", group_by: [], metrics: [], filters: {}, format: "json",
+        columns: ["id"], limit: 100, order_by: [],
+        conditions: [
+          { column: "harga_beli", operator: "lt", value: 30000 },
+          { column: "tanggal", operator: "between", value: ["2026-03-01", "2026-03-31"] },
+          { column: "nama", operator: "contains", value: "gula" },
+          { column: "kode", operator: "is_null", value: null },
+        ],
+      },
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "murah");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    const card = (await screen.findByLabelText("Rencana laporan")).textContent;
+    expect(card).toMatch(/harga_beli < 30000/);
+    expect(card).toMatch(/tanggal antara 2026-03-01 dan 2026-03-31/);
+    expect(card).toMatch(/nama mengandung "gula"/);
+    expect(card).toMatch(/kode kosong/);
+  });
+
   it("says plainly when a listing was cut off, and how many rows the file holds", async () => {
     const user = userEvent.setup();
     api.listDatabaseConnections.mockResolvedValue({

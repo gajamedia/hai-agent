@@ -61,6 +61,9 @@ class TableReportService:
             "kind": req.kind, "table": req.table, "group_by": list(req.group_by),
             "metrics": [{"output": o, "operation": op, "column": c} for o, op, c in req.metrics],
             "filters": dict(req.filters), "format": req.report_format,
+            "conditions": [{"column": c, "operator": op,
+                            "value": list(v) if isinstance(v, (tuple, list)) else v}
+                           for c, op, v in req.conditions],
         }
         if req.kind == "list":
             summary.update(columns=list(req.select_columns), limit=req.limit,

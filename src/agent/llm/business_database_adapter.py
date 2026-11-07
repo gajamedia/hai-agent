@@ -18,7 +18,39 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # How each SQL family limits rows: LIMIT n (SQLite/PostgreSQL/MySQL), SELECT TOP (n)
 # (SQL Server) and FETCH FIRST n ROWS ONLY (Oracle 12c+).
 _DIALECTS = frozenset({"limit", "top", "fetch_first"})
-_ALLOWED_ARGUMENTS = frozenset({"table", "columns", "filters", "order_by", "limit"})
+_ALLOWED_ARGUMENTS = frozenset({"table", "columns", "filters", "conditions", "order_by", "limit"})
+
+# Structured comparisons. The caller never supplies SQL: only a column (which must be allowlisted
+# as filterable), an operator from this closed set, and a value that is always sent as a bound
+# parameter.
+CONDITION_OPERATORS = frozenset({
+    "eq", "ne", "gt", "gte", "lt", "lte", "between", "in",
+    "contains", "starts_with", "ends_with", "is_null", "is_not_null",
+})
+MAX_CONDITIONS = 5
+MAX_IN_VALUES = 20
+MAX_CONDITION_TEXT = 200
+_COMPARISON_SQL = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+# "!" is the LIKE escape character because it means nothing special in any dialect's string
+# literals, unlike a backslash (an escape in MySQL, a plain character elsewhere).
+_LIKE_ESCAPE = "!"
+
+
+def _like_pattern(text: str, *, before: bool, after: bool) -> str:
+    escaped = (text.replace("!", "!!").replace("%", "!%").replace("_", "!_").replace("[", "!["))
+    return f"{'%' if before else ''}{escaped}{'%' if after else ''}"
+
+
+def _condition_scalar(value: Any, column: str) -> Any:
+    if value is None or isinstance(value, (dict, list, tuple, set, bytes)):
+        raise CapabilityRequestValidationError(f"Condition value for '{column}' must be a single value.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise CapabilityRequestValidationError(f"Condition value for '{column}' must be finite.")
+    if isinstance(value, str) and (not value.strip() or len(value) > MAX_CONDITION_TEXT):
+        raise CapabilityRequestValidationError(f"Condition text for '{column}' is empty or too long.")
+    if not isinstance(value, (str, int, float, bool)):
+        raise CapabilityRequestValidationError(f"Condition value for '{column}' has an unsupported type.")
+    return value
 
 
 def _json_safe(value: Any) -> Any:
@@ -220,6 +252,33 @@ class BusinessDatabaseAdapter:
                     "Read-only business database resource cleanup failed."
                 ) from cleanup_error
 
+    def _condition_sql(self, item: Mapping[str, Any], bind: Callable[[Any], str]) -> str:
+        column, operator, value = item["column"], item["operator"], item.get("value")
+        quoted = self._q(column)
+        if operator in {"is_null", "is_not_null"}:
+            if value is not None:
+                raise CapabilityRequestValidationError(f"'{operator}' takes no value.")
+            return f"{quoted} IS {'NOT ' if operator == 'is_not_null' else ''}NULL"
+        if operator in _COMPARISON_SQL:
+            return f"{quoted} {_COMPARISON_SQL[operator]} {bind(_condition_scalar(value, column))}"
+        if operator == "between":
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise CapabilityRequestValidationError("'between' needs [low, high].")
+            low, high = (_condition_scalar(v, column) for v in value)
+            return f"{quoted} BETWEEN {bind(low)} AND {bind(high)}"
+        if operator == "in":
+            if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= MAX_IN_VALUES:
+                raise CapabilityRequestValidationError(f"'in' needs 1-{MAX_IN_VALUES} values.")
+            placeholders = ", ".join(bind(_condition_scalar(v, column)) for v in value)
+            return f"{quoted} IN ({placeholders})"
+        # contains / starts_with / ends_with
+        if not isinstance(value, str):
+            raise CapabilityRequestValidationError(f"'{operator}' needs text.")
+        _condition_scalar(value, column)
+        pattern = _like_pattern(value, before=operator in {"contains", "ends_with"},
+                                after=operator in {"contains", "starts_with"})
+        return f"{quoted} LIKE {bind(pattern)} ESCAPE '{_LIKE_ESCAPE}'"
+
     def _build_select(
         self,
         arguments: Mapping[str, Any],
@@ -271,6 +330,21 @@ class BusinessDatabaseAdapter:
                 "A filter column is not allowlisted."
             )
 
+        conditions = arguments.get("conditions", [])
+        if not isinstance(conditions, (list, tuple)) or len(conditions) > MAX_CONDITIONS:
+            raise CapabilityRequestValidationError(
+                f"conditions must be a list of at most {MAX_CONDITIONS} items."
+            )
+        for item in conditions:
+            if not isinstance(item, Mapping) or set(item) - {"column", "operator", "value"}:
+                raise CapabilityRequestValidationError(
+                    "Each condition must be {column, operator, value}."
+                )
+            if not isinstance(item.get("column"), str) or item["column"] not in spec.filterable_columns:
+                raise CapabilityRequestValidationError("A filter column is not allowlisted.")
+            if item.get("operator") not in CONDITION_OPERATORS:
+                raise CapabilityRequestValidationError("A condition operator is not supported.")
+
         order_by = arguments.get("order_by", [])
         if not isinstance(order_by, (list, tuple)):
             raise CapabilityRequestValidationError(
@@ -313,17 +387,19 @@ class BusinessDatabaseAdapter:
         top = f"TOP ({bind(limit)}) " if self._dialect == "top" else ""
         sql = (f"SELECT {top}{', '.join(self._q(c) for c in requested_columns)} "
                f"FROM {self._q(table)}")
-        if filters:
-            where_fragments: list[str] = []
-            for column, value in filters.items():
-                if value is None:
-                    where_fragments.append(f"{self._q(column)} IS NULL")
-                else:
-                    if isinstance(value, (dict, list, tuple, set)):
-                        raise CapabilityRequestValidationError(
-                            f"Filter value for '{column}' must be a scalar."
-                        )
-                    where_fragments.append(f"{self._q(column)} = {bind(value)}")
+        where_fragments: list[str] = []
+        for column, value in filters.items():
+            if value is None:
+                where_fragments.append(f"{self._q(column)} IS NULL")
+            else:
+                if isinstance(value, (dict, list, tuple, set)):
+                    raise CapabilityRequestValidationError(
+                        f"Filter value for '{column}' must be a scalar."
+                    )
+                where_fragments.append(f"{self._q(column)} = {bind(value)}")
+        for item in conditions:
+            where_fragments.append(self._condition_sql(item, bind))
+        if where_fragments:
             sql += " WHERE " + " AND ".join(where_fragments)
         if order_fragments:
             sql += " ORDER BY " + ", ".join(order_fragments)

@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from agent.llm.business_database_adapter import CONDITION_OPERATORS, MAX_CONDITIONS, MAX_IN_VALUES
 from agent.workflow.analytics import ANALYTICAL_TASK_TYPE, analytical_column_order, order_columns
 from agent.workflow.contracts import TaskStatus, WorkflowStatus
 from agent.workflow.invocation import TRUSTED_CAPABILITY_TASK_TYPE
@@ -59,6 +60,9 @@ class TableReportRequest:
     select_columns: tuple[str, ...] = ()
     order_by: tuple[tuple[str, str], ...] = ()  # (column, "asc" | "desc")
     limit: int = DEFAULT_LIST_LIMIT
+    # Comparisons beyond equality: (column, operator, value). value is a scalar, a (low, high) or
+    # list for between/in, and None for is_null / is_not_null. All are ANDed with the filters.
+    conditions: tuple[tuple[str, str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.table.strip() or not self.columns:
@@ -84,6 +88,17 @@ class TableReportRequest:
         referenced |= set(self.required_non_null_columns) | set(self.unique_key_columns)
         referenced |= set(self.numeric_columns) | set(self.categorical_columns)
         referenced |= set(self.select_columns) | {item[0] for item in self.order_by}
+        if len(self.conditions) > MAX_CONDITIONS:
+            raise ValueError(f"at most {MAX_CONDITIONS} conditions are allowed")
+        for item in self.conditions:
+            if not isinstance(item, tuple) or len(item) != 3 or item[1] not in CONDITION_OPERATORS:
+                raise ValueError("each condition must be (column, operator, value) with a known operator")
+            if item[1] == "between" and not (isinstance(item[2], (tuple, list)) and len(item[2]) == 2):
+                raise ValueError("'between' needs (low, high)")
+            if item[1] == "in" and not (isinstance(item[2], (tuple, list)) and 1 <= len(item[2]) <= MAX_IN_VALUES):
+                raise ValueError(f"'in' needs 1-{MAX_IN_VALUES} values")
+            if item[1] in {"is_null", "is_not_null"} and item[2] is not None:
+                raise ValueError(f"'{item[1]}' takes no value")
         unknown = referenced - set(self.columns)
         if unknown:
             raise ValueError(f"columns not declared: {sorted(unknown)}")
@@ -101,6 +116,38 @@ class TableReportRequest:
                 raise ValueError(f"filter value for {column!r} is too long")
 
 
+_SYMBOLS = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+
+
+def describe_condition(column: str, operator: str, value: Any) -> str:
+    """A short, plain-text statement of one condition (used in report titles and logs)."""
+    if operator in _SYMBOLS:
+        return f"{column} {_SYMBOLS[operator]} {value}"
+    if operator == "between":
+        return f"{column} between {value[0]} and {value[1]}"
+    if operator == "in":
+        return f"{column} in ({', '.join(str(v) for v in value)})"
+    if operator in {"contains", "starts_with", "ends_with"}:
+        return f"{column} {operator.replace('_', ' ')} {value}"
+    return f"{column} is {'empty' if operator == 'is_null' else 'not empty'}"
+
+
+def _apply_scope(request: TableReportRequest, read_arguments: dict[str, Any]) -> str:
+    """Put the filters and conditions into the read, and make the scope visible on the report itself
+    so a total or a listing is not mistaken for the whole table."""
+    parts = [f"{k}={v}" for k, v in request.filters.items()]
+    parts += [describe_condition(*c) for c in request.conditions]
+    if request.filters:
+        read_arguments["filters"] = dict(request.filters)
+    if request.conditions:
+        read_arguments["conditions"] = [
+            {"column": c, "operator": op, **({} if v is None else {"value": list(v) if isinstance(v, tuple) else v})}
+            for c, op, v in request.conditions]
+    if not parts:
+        return request.title
+    return f"{request.title} [filter: {', '.join(parts)}]"[:200]
+
+
 def _build_list_task_specs(request: TableReportRequest) -> list[TaskSpec]:
     """Show rows: read ``limit + 1`` (so "more exist" is detectable), keep ``limit``, write the report.
 
@@ -115,11 +162,7 @@ def _build_list_task_specs(request: TableReportRequest) -> list[TaskSpec]:
     if request.order_by:
         read_arguments["order_by"] = [("-" if direction == "desc" else "") + column
                                       for column, direction in request.order_by]
-    title = request.title
-    if request.filters:
-        read_arguments["filters"] = dict(request.filters)
-        shown = ", ".join(f"{k}={v}" for k, v in request.filters.items())
-        title = f"{title} [filter: {shown}]"[:200]
+    title = _apply_scope(request, read_arguments)
     analytical = {
         "source_task_key": "read",
         "dataset_schema": {
@@ -184,13 +227,7 @@ def build_task_specs(request: TableReportRequest) -> list[TaskSpec]:
         "columns": list(request.columns),
         "limit": request.row_limit,
     }
-    title = request.title
-    if request.filters:
-        read_arguments["filters"] = dict(request.filters)
-        # Make the scope visible on the report itself so totals are not mistaken
-        # for whole-table figures.
-        shown = ", ".join(f"{k}={v}" for k, v in request.filters.items())
-        title = f"{title} [filter: {shown}]"[:200]
+    title = _apply_scope(request, read_arguments)
     return [
         TaskSpec(
             "read", TRUSTED_CAPABILITY_TASK_TYPE, f"Read table {request.table}",

@@ -159,6 +159,18 @@ const STATUS_TEXT = (c) =>
         ? `tidak tersedia${c.reason ? `: ${c.reason}` : ""}`
         : "menunggu persetujuan";
 
+const OPERATOR_SYMBOL = { eq: "=", ne: "≠", gt: ">", gte: "≥", lt: "<", lte: "≤" };
+
+function describeCondition({ column, operator, value }) {
+  if (OPERATOR_SYMBOL[operator]) return `${column} ${OPERATOR_SYMBOL[operator]} ${value}`;
+  if (operator === "between") return `${column} antara ${value[0]} dan ${value[1]}`;
+  if (operator === "in") return `${column} salah satu dari (${value.join(", ")})`;
+  if (operator === "contains") return `${column} mengandung "${value}"`;
+  if (operator === "starts_with") return `${column} diawali "${value}"`;
+  if (operator === "ends_with") return `${column} diakhiri "${value}"`;
+  return `${column} ${operator === "is_null" ? "kosong" : "tidak kosong"}`;
+}
+
 export default function DataReports() {
   const [connections, setConnections] = useState([]);
   const [selected, setSelected] = useState("");
@@ -524,9 +536,13 @@ export default function DataReports() {
                     </>
                   )}
                   <span>
-                    Filter: {Object.keys(plan.plan.filters).length
-                      ? Object.entries(plan.plan.filters).map(([k, v]) => `${k} = ${v}`).join(", ")
-                      : "tidak ada"}
+                    Filter: {(() => {
+                      const parts = [
+                        ...Object.entries(plan.plan.filters).map(([k, v]) => `${k} = ${v}`),
+                        ...(plan.plan.conditions || []).map(describeCondition),
+                      ];
+                      return parts.length ? parts.join(", ") : "tidak ada";
+                    })()}
                   </span>
                   <div className="at-form-row">
                     <button type="button" className="at-button at-button-primary" disabled={busy} onClick={runPlan}>

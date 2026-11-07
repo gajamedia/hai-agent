@@ -12,7 +12,8 @@ platform promises users, independent of the database product:
 6. an approved connection survives a restart and answers again;
 7. tables/columns named with reserved words or mixed case can be reported;
 8. a "show the rows" listing returns the rows in the requested order and stops at its limit;
-9. listings and sorting work on reserved-word names, with two sort keys.
+9. listings and sorting work on reserved-word names, with two sort keys;
+10. comparison conditions (<, between, in, contains) return what an independent query returns.
 
 To add an engine, write a fixture that creates the standard dataset (see the
 ``Harness`` contract below) and subclass ``ConformanceSuite``:
@@ -173,3 +174,23 @@ class ConformanceSuite:
         got = [(r["id"], r["group"], r["user"]) for r in outcome.rows]
         assert got == [tuple(row) for row in expected] and len(got) == 6
 
+
+    def test_10_conditions_return_what_an_independent_query_returns(self, harness):
+        answer = json.dumps({
+            "supported": True, "kind": "list", "table": "sales", "columns": ["id", "region", "amount"],
+            "order_by": [{"column": "id", "direction": "asc"}], "limit": 100,
+            "conditions": [{"column": "amount", "operator": "lt", "value": 40},
+                           {"column": "id", "operator": "between", "value": [2, 30]},
+                           {"column": "region", "operator": "in", "value": ["west", "east"]},
+                           {"column": "product", "operator": "contains", "value": "get"}]})
+        reg = harness.registry(answer)
+        reg.connect("conf", engine=harness.engine, source=harness.reader, actor_id="alice")
+        selection = {"sales": {**SALES_SELECTION["sales"],
+                               "filterable_columns": ["region", "product", "amount", "id"]}}
+        reg.activate("conf", selection, actor_id="bob")
+        outcome = reg.service("conf").ask("cheap west/east widgets", execution_context=_context())
+        assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
+        expected = harness.sql(
+            f"SELECT id FROM {harness.q_sales} WHERE amount < 40 AND id BETWEEN 2 AND 30 "
+            f"AND region IN ('west', 'east') AND product LIKE '%get%' ORDER BY id")
+        assert expected and [r["id"] for r in outcome.rows] == [row[0] for row in expected]

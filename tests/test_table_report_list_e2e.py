@@ -18,6 +18,9 @@ from tests.test_table_report_job_e2e import COLUMNS, _context, _make_db, _sample
 LIST_SPEC = ReadOnlyTableSpec(
     table="sales", columns=tuple(COLUMNS), filterable_columns=("region", "product"),
     sortable_columns=tuple(COLUMNS), max_limit=101)
+COND_SPEC = ReadOnlyTableSpec(
+    table="sales", columns=tuple(COLUMNS), filterable_columns=("region", "product", "amount", "id"),
+    sortable_columns=tuple(COLUMNS), max_limit=101)
 
 
 @pytest.fixture
@@ -279,3 +282,49 @@ def test_the_pdf_header_follows_the_requested_order(lenv):
                            ).pages[0].extract_text()
     header = next(line for line in text.splitlines() if "region" in line and "id" in line)
     assert header.index("region") < header.index("id")
+
+
+# ------------------------------------------------------------------ comparisons beyond equality
+@pytest.fixture
+def cenv(monkeypatch, env):  # noqa: F811
+    monkeypatch.setattr(base, "SALES_SPEC", COND_SPEC)
+    return env
+
+
+@pytest.mark.parametrize("condition,sql,params", [
+    (("amount", "lt", 30), "amount < ?", (30,)),
+    (("amount", "gte", 40), "amount >= ?", (40,)),
+    (("amount", "between", (20, 25)), "amount BETWEEN ? AND ?", (20, 25)),
+    (("id", "in", (1, 5, 9)), "id IN (?, ?, ?)", (1, 5, 9)),
+    (("region", "contains", "or"), "region LIKE ?", ("%or%",)),          # north
+    (("region", "starts_with", "w"), "region LIKE ?", ("w%",)),
+    (("region", "ne", "west"), "region <> ?", ("west",)),
+])
+def test_conditions_match_independent_sql(cenv, condition, sql, params):
+    e = cenv(_sample_rows(40))
+    out = _run(e, _list(conditions=(condition,), order_by=(("id", "asc"),)))
+    assert out.succeeded, (out.error_code, out.message)
+    expected = _sql(e.db_path, f"SELECT id, region, amount FROM sales WHERE {sql} ORDER BY id", *params)
+    assert expected and _tuples(out, ("id", "region", "amount")) == expected
+
+
+def test_conditions_combine_with_equality_filters_and_show_in_the_title(cenv):
+    e = cenv(_sample_rows(40))
+    out = _run(e, _list(filters={"region": "west"}, conditions=(("amount", "lt", 30),)))
+    expected = _sql(e.db_path, "SELECT id FROM sales WHERE region = 'west' AND amount < 30")
+    assert sorted(r["id"] for r in out.rows) == sorted(r[0] for r in expected)
+    assert out.rows and all(r["region"] == "west" and r["amount"] < 30 for r in out.rows)
+
+
+def test_like_wildcards_in_the_value_are_literal(cenv):
+    e = cenv(_sample_rows(10))
+    with sqlite3.connect(e.db_path) as db:
+        db.execute("UPDATE sales SET region = '100%_sure' WHERE id = 1")
+    out = _run(e, _list(conditions=(("region", "contains", "%_"),)))
+    assert [r["id"] for r in out.rows] == [1]
+
+
+def test_condition_on_a_column_that_was_not_approved_as_filterable_is_refused(env):  # noqa: F811
+    e = env(_sample_rows(10))                    # SALES_SPEC: only region/product are filterable
+    out = _run(e, _list(conditions=(("amount", "lt", 30),)))
+    assert not out.succeeded

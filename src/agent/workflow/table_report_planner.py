@@ -19,8 +19,9 @@ import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
+from agent.llm.business_database_adapter import CONDITION_OPERATORS, MAX_CONDITIONS, MAX_IN_VALUES
 from agent.llm.contracts import LLMMessage
 from agent.workflow.dataset import SUPPORTED_DATA_TYPES
 from agent.workflow.table_report_job import (
@@ -31,6 +32,14 @@ from agent.workflow.table_report_job import (
     MAX_ORDER_BY,
     TableReportRequest,
 )
+
+_COMPARABLE = frozenset({"eq", "ne", "gt", "gte", "lt", "lte", "between", "in", "is_null", "is_not_null"})
+_TEXT = frozenset({"eq", "ne", "in", "contains", "starts_with", "ends_with", "is_null", "is_not_null"})
+_FLAG = frozenset({"eq", "ne", "is_null", "is_not_null"})
+# which operators make sense for which kind of column (a text column is not "greater than" anything)
+OPERATORS_BY_TYPE = {"integer": _COMPARABLE, "number": _COMPARABLE, "date": _COMPARABLE,
+                     "datetime": _COMPARABLE, "string": _TEXT, "boolean": _FLAG,
+                     "any": frozenset({"eq", "ne", "in", "is_null", "is_not_null"})}
 
 ALLOWED_OPERATIONS = ("count", "count_distinct", "sum", "avg", "min", "max")
 NUMERIC_TYPES = frozenset({"integer", "number"})
@@ -121,7 +130,8 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 class TableReportPlanner:
     def __init__(self, llm_service: Any, catalog: Sequence[TableCatalogEntry],
-                 *, max_attempts: int = 2, experience: Any = None) -> None:
+                 *, max_attempts: int = 2, experience: Any = None,
+                 today: Callable[[], date] = date.today) -> None:
         if not catalog:
             raise ValueError("catalog must not be empty")
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
@@ -133,6 +143,7 @@ class TableReportPlanner:
         self.max_attempts = max_attempts
         # Optional ConnectionExperience: verified filter values and past plans.
         self.experience = experience
+        self._today = today
 
     def _apply_experience(self, request: TableReportRequest) -> TableReportRequest:
         """Correct string filter values to their verified spelling (case/space only)."""
@@ -235,9 +246,10 @@ class TableReportPlanner:
             "grouping by 1-3 columns and computing 1-5 metrics over one table, "
             "optionally with up to 3 EQUALITY filters (column = value) on that table's "
             "filterable_columns only. Use the filter value exactly as the user wrote it.\n"
-            "NOT supported: ranges or comparisons (>, <, between, date ranges), OR conditions, "
-            "'contains', filters on columns not in filterable_columns, joins, several tables, "
-            "raw SQL (you never write SQL), forecasts.\n"
+            "NOT supported: OR conditions, filters or conditions on columns not in filterable_columns, "
+            "joins, several tables, raw SQL (you never write SQL), calculations inside a condition, "
+            "forecasts, anything that changes data.\n"
+            f"Today is {self._today().isoformat()}.\n"
             "If the question needs anything unsupported, answer "
             '{"supported": false, "reason": "<short reason, in the question\'s language>"}.\n'
             "Otherwise answer ONLY with this JSON (no markdown):\n"
@@ -256,8 +268,82 @@ class TableReportPlanner:
             'columns: the columns the user asks for, or "all" for every column. order_by is optional '
             '(at most 3 items, direction asc or desc). limit is the number of rows: 100 unless the user '
             "asks for another number, and never more than the table's list_limit_max. "
-            "Use kind aggregate for totals, counts and averages."
+            "Use kind aggregate for totals, counts and averages.\n"
+            'CONDITIONS go beyond equality, for both kinds: "conditions": [{"column": "filterable_col", '
+            '"operator": "lt", "value": 30000}]. Operators: eq, ne, gt, gte, lt, lte (numbers and dates), '
+            'between (value [low, high], inclusive), in (value: a list of up to 20), contains, starts_with, '
+            "ends_with (text columns), is_null, is_not_null (no value). Only on filterable_columns; at most "
+            f"{MAX_CONDITIONS} conditions, all combined with AND. Dates are ISO yyyy-mm-dd. Give numbers as "
+            'plain numbers: "30 ribu" is 30000, "2 juta" is 2000000, "1,5 juta" is 1500000. For a month or a '
+            "year use between its first and last day (use today's date to resolve \"this month\" or "
+            '"last year"). Plain equality can stay in "filters".'
         )
+
+    @staticmethod
+    def _condition_scalar(kind: str, column: str, value: Any) -> Any:
+        """One value of a condition, checked against the column's type."""
+        if kind in {"integer", "number"}:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise PlanValidationError(
+                    f"A condition on {column!r} ({kind}) needs a plain number, got {value!r}. "
+                    'Convert "30 ribu" to 30000.')
+            return value
+        if kind in {"date", "datetime"}:
+            if not isinstance(value, str):
+                raise PlanValidationError(f"A condition on {column!r} ({kind}) needs an ISO date string.")
+            try:
+                (date if kind == "date" else datetime).fromisoformat(value)
+            except ValueError as exc:
+                raise PlanValidationError(f"Value {value!r} for {column!r} must be an ISO {kind}.") from exc
+            return value
+        if kind == "boolean":
+            if not isinstance(value, bool):
+                raise PlanValidationError(f"A condition on {column!r} (boolean) needs true or false.")
+            return value
+        if not isinstance(value, str) or not value.strip() or len(value) > MAX_FILTER_VALUE_LENGTH:
+            raise PlanValidationError(f"A condition on {column!r} needs non-empty text (max {MAX_FILTER_VALUE_LENGTH} characters).")
+        return value
+
+    def _validate_conditions(self, entry: TableCatalogEntry, raw: Any) -> tuple[tuple[str, str, Any], ...]:
+        """Comparisons beyond equality: a closed set of operators on approved, filterable columns."""
+        if raw is None or raw == []:
+            return ()
+        if not isinstance(raw, list) or len(raw) > MAX_CONDITIONS:
+            raise PlanValidationError(f"conditions must be a list of at most {MAX_CONDITIONS} items.")
+        result: list[tuple[str, str, Any]] = []
+        for item in raw:
+            if not isinstance(item, Mapping) or set(item) - {"column", "operator", "value"}:
+                raise PlanValidationError('Each condition must be {"column": ..., "operator": ..., "value": ...}.')
+            column, operator, value = item.get("column"), item.get("operator"), item.get("value")
+            if not isinstance(column, str) or column not in entry.filterable_columns:
+                raise PlanValidationError(
+                    f"Cannot filter on {column!r}; filterable columns: {list(entry.filterable_columns)}.")
+            if operator not in CONDITION_OPERATORS:
+                raise PlanValidationError(
+                    f"Operator {operator!r} is not allowed; use one of {sorted(CONDITION_OPERATORS)}.")
+            kind = entry.columns[column]
+            allowed = OPERATORS_BY_TYPE.get(kind, OPERATORS_BY_TYPE["any"])
+            if operator not in allowed:
+                raise PlanValidationError(
+                    f"{operator!r} cannot be used on {column!r} ({kind}); allowed: {sorted(allowed)}.")
+            if operator in {"is_null", "is_not_null"}:
+                if value is not None:
+                    raise PlanValidationError(f"{operator!r} takes no value.")
+                result.append((column, operator, None))
+            elif operator == "between":
+                if not isinstance(value, list) or len(value) != 2:
+                    raise PlanValidationError("'between' needs a value like [low, high].")
+                low, high = (self._condition_scalar(kind, column, v) for v in value)
+                if low > high:
+                    raise PlanValidationError(f"'between' on {column!r}: low {low!r} is greater than high {high!r}.")
+                result.append((column, operator, (low, high)))
+            elif operator == "in":
+                if not isinstance(value, list) or not 1 <= len(value) <= MAX_IN_VALUES:
+                    raise PlanValidationError(f"'in' needs a list of 1-{MAX_IN_VALUES} values.")
+                result.append((column, operator, tuple(self._condition_scalar(kind, column, v) for v in value)))
+            else:
+                result.append((column, operator, self._condition_scalar(kind, column, value)))
+        return tuple(result)
 
     def _validate_list(self, entry: TableCatalogEntry, data: Mapping[str, Any]) -> TableReportRequest:
         """A "show the rows" plan: columns, optional equality filters, order and a row limit."""
@@ -302,6 +388,7 @@ class TableReportPlanner:
                 f"limit must be a whole number between 1 and {maximum} (list_limit_max of this table).")
 
         filters = self._validate_filters(entry, data.get("filters"))
+        conditions = self._validate_conditions(entry, data.get("conditions"))
         fmt = data.get("format", "json")
         if fmt not in REPORT_FORMATS:
             raise PlanValidationError(f"format must be one of {list(REPORT_FORMATS)}.")
@@ -313,7 +400,7 @@ class TableReportPlanner:
             return TableReportRequest(
                 table=entry.table, columns={n: columns[n] for n in columns if n in used},
                 group_by=(), metrics=(), title=title, report_format=fmt, row_limit=entry.row_limit,
-                filters=filters, kind="list", select_columns=tuple(selected),
+                filters=filters, conditions=conditions, kind="list", select_columns=tuple(selected),
                 order_by=tuple(order), limit=limit)
         except ValueError as exc:
             raise PlanValidationError(str(exc)) from exc
@@ -369,6 +456,7 @@ class TableReportPlanner:
             metrics.append((output, operation, column))
 
         filters = self._validate_filters(entry, data.get("filters"))
+        conditions = self._validate_conditions(entry, data.get("conditions"))
 
         fmt = data.get("format", "json")
         if fmt not in REPORT_FORMATS:
@@ -393,7 +481,7 @@ class TableReportPlanner:
                 unique_key_columns=(entry.key_column,) if entry.key_column else (),
                 numeric_columns=numeric,
                 categorical_columns=tuple(c for c in group_by if columns[c] == "string"),
-                filters=filters,
+                filters=filters, conditions=conditions,
             )
         except ValueError as exc:
             raise PlanValidationError(str(exc)) from exc

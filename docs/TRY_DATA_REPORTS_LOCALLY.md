@@ -84,9 +84,16 @@ For a list: 100 rows unless you ask for another number, at most 1000. If more ro
 page and the file say so ("Dibatasi N baris pertama"). The page shows the first 200 rows; the downloaded
 Excel, PDF, CSV or HTML file holds all of them. Columns appear in the order you asked for.
 
-Not supported yet, and refused with a reason instead of being silently ignored: comparisons and ranges
-("di atas 100", "bulan Maret"), OR, "contains", several tables or joins, anything that changes data.
-Only columns you approved can be shown, sorted by or filtered on.
+Both kinds accept **conditions** beyond equality, on columns you ticked *boleh difilter*: `<`, `<=`, `>`, `>=`,
+`!=`, between (dates and numbers, inclusive), in (up to 20 values), contains / starts with / ends with (text),
+and empty / not empty. Up to 5, all combined with AND. Examples: *"tampilkan bahan yang harga belinya kurang dari
+30 ribu"*, *"order bulan Maret 2026"*, *"nama mengandung gula"*. "30 ribu" is turned into 30000 and a month into
+its first and last day. A condition on a column that is not filterable is refused with a reason, so tick
+*boleh difilter* for the price/date columns you want to compare.
+
+Not supported, and refused with a reason instead of being silently ignored: OR, several tables or joins,
+calculations inside a condition, anything that changes data. Only approved columns can be shown, sorted by or
+filtered on. The agent still never writes SQL: free-form SQL from an LLM is deliberately not accepted.
 
 ## 5. Use your own MySQL instead of the sample file
 
