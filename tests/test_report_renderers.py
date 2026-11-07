@@ -162,3 +162,11 @@ def test_pdf_right_aligns_numbers():
 
 def test_empty_row_pages_do_not_crash_for_a_single_row():
     assert render_pdf(title="t", fieldnames=["a"], rows=[{"a": 1}], generated_at=WHEN).startswith(b"%PDF")
+
+
+def test_opening_the_workbook_raises_no_reader_warnings():
+    openpyxl = pytest.importorskip("openpyxl")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # e.g. "Workbook contains no default style"
+        openpyxl.load_workbook(io.BytesIO(_xlsx()))
