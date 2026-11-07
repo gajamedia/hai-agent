@@ -10,7 +10,9 @@ vi.mock("../api/client", () => ({
   connectDatabase: vi.fn(),
   approveDatabaseTables: vi.fn(),
   disconnectDatabase: vi.fn(),
-  askTableReport: vi.fn(),
+  createReportPlan: vi.fn(),
+  runReportPlan: vi.fn(),
+  cancelReportPlan: vi.fn(),
   getDatabaseSchema: vi.fn(),
   listDatabaseProfiles: vi.fn(),
   listEngineRequests: vi.fn(),
@@ -28,6 +30,18 @@ const SCHEMA = {
       ],
     },
   ],
+};
+
+const PLAN = {
+  status: "planned",
+  plan_id: "p1",
+  database: "sales",
+  plan: {
+    table: "sales",
+    group_by: ["region"],
+    metrics: [{ output: "revenue", operation: "sum", column: "amount" }],
+    filters: { region: "west" },
+  },
 };
 
 const renderPage = () =>
@@ -51,11 +65,6 @@ describe("DataReports", () => {
     const user = userEvent.setup();
     api.connectDatabase.mockResolvedValue({ name: "sales", schema: SCHEMA });
     api.approveDatabaseTables.mockResolvedValue({});
-    api.askTableReport.mockResolvedValue({
-      status: "succeeded",
-      plan: { table: "sales", group_by: ["region"], filters: { region: "west" } },
-      rows: [{ region: "west", revenue: 217 }],
-    });
     renderPage();
 
     await user.type(screen.getByLabelText(/Nama koneksi/), "sales");
@@ -79,15 +88,20 @@ describe("DataReports", () => {
     api.listDatabaseConnections.mockResolvedValue({
       connections: [{ name: "sales", status: "active", tables: ["sales"] }],
     });
-    api.askTableReport.mockResolvedValueOnce({ status: "unsupported", reason: "no date filters" });
+    api.createReportPlan.mockResolvedValueOnce({
+      status: "unsupported", reason: "no date filters", plan_id: null,
+    });
     renderPage();
     await user.type(await screen.findByLabelText(/Pertanyaan/), "bulan lalu");
-    await user.click(screen.getByRole("button", { name: /Buat laporan/ }));
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
     expect(await screen.findByText("no date filters")).toBeTruthy();
     expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Jalankan" })).toBeNull();
 
-    api.askTableReport.mockResolvedValueOnce({ status: "failed", error_code: "no_matching_rows" });
-    await user.click(screen.getByRole("button", { name: /Buat laporan/ }));
+    api.createReportPlan.mockResolvedValueOnce(PLAN);
+    api.runReportPlan.mockResolvedValueOnce({ status: "failed", error_code: "no_matching_rows" });
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await user.click(await screen.findByRole("button", { name: "Jalankan" }));
     expect(await screen.findByText(/no_matching_rows/)).toBeTruthy();
   });
 
@@ -106,17 +120,50 @@ describe("DataReports", () => {
     api.listDatabaseConnections.mockResolvedValue({
       connections: [{ name: "sales", status: "active", tables: ["sales"] }],
     });
-    api.askTableReport.mockResolvedValue({
+    api.createReportPlan.mockResolvedValue(PLAN);
+    api.runReportPlan.mockResolvedValue({
       status: "succeeded",
-      plan: { table: "sales", group_by: ["region"], filters: {} },
+      plan: PLAN.plan,
       rows: [{ region: "west", revenue: 217 }, { region: "east", revenue: 90 }],
     });
     renderPage();
     await user.type(await screen.findByLabelText(/Pertanyaan/), "total per wilayah");
-    await user.click(screen.getByRole("button", { name: /Buat laporan/ }));
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+
+    // The plan is shown for review before anything runs.
+    const card = await screen.findByLabelText("Rencana laporan");
+    expect(card.textContent).toMatch(/belum ada data yang dibaca/);
+    expect(card.textContent).toMatch(/Tabel: sales/);
+    expect(card.textContent).toMatch(/sum\(amount\)/);
+    expect(card.textContent).toMatch(/region = west/);
+    expect(api.runReportPlan).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    expect(api.runReportPlan).toHaveBeenCalledTimes(1);
+    const [planId, idempotencyKey] = api.runReportPlan.mock.calls[0];
+    expect(planId).toBe("p1");
+    expect(typeof idempotencyKey).toBe("string");
+    expect(idempotencyKey.length).toBeGreaterThan(8);
     const table = await screen.findByRole("table", { name: "Hasil laporan" });
     expect(table.textContent).toContain("217");
     expect(table.querySelectorAll("tbody tr")).toHaveLength(2);
+    expect(screen.queryByLabelText("Rencana laporan")).toBeNull();
+  });
+
+  it("lets the user cancel a plan without running it", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue(PLAN);
+    api.cancelReportPlan.mockResolvedValue({ status: "cancelled" });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "x");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await user.click(await screen.findByRole("button", { name: "Batal" }));
+    expect(api.cancelReportPlan).toHaveBeenCalledWith("p1");
+    expect(api.runReportPlan).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Rencana laporan")).toBeNull();
   });
 
   it("flags a restored connection that needs re-approval and lets the user review it", async () => {

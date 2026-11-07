@@ -3,14 +3,16 @@ import { AlertCircle, ArrowLeft, Database, LoaderCircle, Plug, Send, Unplug } fr
 import { Link } from "react-router-dom";
 import {
   approveDatabaseTables,
-  askTableReport,
+  cancelReportPlan,
   createEngineRequest,
+  createReportPlan,
   connectDatabase,
   disconnectDatabase,
   getDatabaseSchema,
   listDatabaseConnections,
   listDatabaseProfiles,
   listEngineRequests,
+  runReportPlan,
 } from "../api/client.js";
 import "./autonomous-testing.css";
 
@@ -166,6 +168,7 @@ export default function DataReports() {
   const [wantedReason, setWantedReason] = useState("");
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState(null);
+  const [plan, setPlan] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -249,12 +252,33 @@ export default function DataReports() {
     });
   };
 
-  const ask = (event) => {
+  const makePlan = (event) => {
     event.preventDefault();
     return guarded(async () => {
-      setResult(await askTableReport({ question: question.trim(), database: selected || undefined }));
+      setResult(null);
+      setPlan(null);
+      const data = await createReportPlan({
+        question: question.trim(),
+        database: selected || undefined,
+      });
+      if (data.status === "planned") setPlan(data);
+      else setResult(data);
     });
   };
+
+  const runPlan = () =>
+    guarded(async () => {
+      // One key per click: a retried request replays the stored result instead of running twice.
+      const key = globalThis.crypto?.randomUUID?.() ?? `run-${Date.now()}`;
+      setResult(await runReportPlan(plan.plan_id, key));
+      setPlan(null);
+    });
+
+  const dropPlan = () =>
+    guarded(async () => {
+      await cancelReportPlan(plan.plan_id);
+      setPlan(null);
+    });
 
   const active = connections.filter((c) => c.status === "active");
   const filters = result?.plan?.filters || {};
@@ -366,7 +390,7 @@ export default function DataReports() {
           ) : (
             <>
               <div className="at-section-heading"><Send size={18} /><h2>Tanya laporan</h2></div>
-              <form className="at-form" onSubmit={ask} aria-label="Tanya laporan">
+              <form className="at-form" onSubmit={makePlan} aria-label="Tanya laporan">
                 <label>
                   Database
                   <select value={selected} onChange={(e) => setSelected(e.target.value)}>
@@ -388,9 +412,32 @@ export default function DataReports() {
                   className="at-button at-button-primary"
                   disabled={busy || !question.trim() || !active.length}
                 >
-                  {busy ? <LoaderCircle size={14} /> : <Send size={14} />} Buat laporan
+                  {busy ? <LoaderCircle size={14} /> : <Send size={14} />} Buat rencana
                 </button>
               </form>
+              {plan && (
+                <div className="at-config-summary" style={{ marginTop: 16 }} aria-label="Rencana laporan">
+                  <b>Rencana (belum ada data yang dibaca)</b>
+                  <span>Tabel: {plan.plan.table}</span>
+                  <span>Kelompokkan per: {plan.plan.group_by.join(", ")}</span>
+                  <span>
+                    Hitung: {plan.plan.metrics.map((m) => `${m.operation}(${m.column || "*"})`).join(", ")}
+                  </span>
+                  <span>
+                    Filter: {Object.keys(plan.plan.filters).length
+                      ? Object.entries(plan.plan.filters).map(([k, v]) => `${k} = ${v}`).join(", ")
+                      : "tidak ada"}
+                  </span>
+                  <div className="at-form-row">
+                    <button type="button" className="at-button at-button-primary" disabled={busy} onClick={runPlan}>
+                      Jalankan
+                    </button>
+                    <button type="button" className="at-button" disabled={busy} onClick={dropPlan}>
+                      Batal
+                    </button>
+                  </div>
+                </div>
+              )}
               {result && (
                 <div style={{ marginTop: 16 }} aria-live="polite">
                   {result.status === "succeeded" && (

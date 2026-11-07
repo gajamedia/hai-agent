@@ -200,10 +200,10 @@ export async function getAutonomousTestBatchResults(batchId, signal) {
 }
 
 const API_V1 = "/api/v1";
-const jsonPost = (path, payload, signal) =>
+const jsonPost = (path, payload, signal, extraHeaders = {}) =>
   request(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: JSON.stringify(payload),
     signal,
   });
@@ -249,4 +249,25 @@ export async function listEngineRequests(signal) {
 
 export async function createEngineRequest(payload, signal) {
   return jsonPost(`${API_V1}/database-engine-requests`, payload, signal);
+}
+
+// Two-phase reports: generate a plan for review (reads no data), then run exactly that plan.
+export async function createReportPlan(payload, signal) {
+  return jsonPost(`${API_V1}/table-reports/plans`, payload, signal);
+}
+
+export async function runReportPlan(planId, idempotencyKey, signal) {
+  return jsonPost(
+    `${API_V1}/table-reports/plans/${encodeURIComponent(planId)}/run`,
+    {},
+    signal,
+    idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+  );
+}
+
+export async function cancelReportPlan(planId, signal) {
+  return request(`${API_V1}/table-reports/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+    signal,
+  });
 }

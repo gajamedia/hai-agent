@@ -434,6 +434,17 @@ class DatabaseRuntimeRegistry:
                 raise RegistryError(f"connection '{name}' has no approved tables yet")
             return conn.service
 
+    def resolve_name(self, name: str | None) -> str:
+        """Name of the connection ``service(name)`` would use, so callers can pin it."""
+        with self._lock:
+            if name is None:
+                active = [c.name for c in self._connections.values() if c.service]
+                if len(active) != 1:
+                    raise RegistryError("specify 'database'; " + (
+                        "none is active" if not active else "several are active"))
+                return active[0]
+            return self._get(name).name
+
     def disconnect(self, name: str) -> None:
         with self._lock:
             self._experience.bind(name).forget()  # learned values may be business data

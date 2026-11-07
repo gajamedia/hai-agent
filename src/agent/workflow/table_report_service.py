@@ -36,20 +36,33 @@ class TableReportService:
         self.runner = runner
         self.experience = experience  # optional ConnectionExperience (best effort)
 
-    def ask(self, question: str, *, execution_context: Any) -> AskOutcome:
+    def plan(self, question: str) -> Any:
+        """Phase 1: turn a question into a validated plan. Reads no data."""
         question = (question or "").strip()
         if not question or len(question) > MAX_QUESTION_LENGTH:
             raise ValueError(f"question must be 1-{MAX_QUESTION_LENGTH} characters")
-        plan = self.planner.plan(question)
-        if not plan.ok:
-            return AskOutcome("unsupported", question, reason=plan.reason,
-                              provider=plan.provider, attempts=plan.attempts)
-        req = plan.request
-        summary = {
+        return self.planner.plan(question)
+
+    @staticmethod
+    def summarize(req: Any) -> dict[str, Any]:
+        return {
             "table": req.table, "group_by": list(req.group_by),
             "metrics": [{"output": o, "operation": op, "column": c} for o, op, c in req.metrics],
             "filters": dict(req.filters), "format": req.report_format,
         }
+
+    def ask(self, question: str, *, execution_context: Any) -> AskOutcome:
+        """Plan and run in one call."""
+        plan = self.plan(question)
+        return self.run_plan(plan.question, plan, execution_context=execution_context)
+
+    def run_plan(self, question: str, plan: Any, *, execution_context: Any) -> AskOutcome:
+        """Phase 2: execute exactly the plan produced by :meth:`plan`."""
+        if not plan.ok:
+            return AskOutcome("unsupported", question, reason=plan.reason,
+                              provider=plan.provider, attempts=plan.attempts)
+        req = plan.request
+        summary = self.summarize(req)
         outcome = self.runner.run(
             goal=question, idempotency_key=f"ask-{uuid.uuid4().hex}",
             request=req, execution_context=execution_context)
