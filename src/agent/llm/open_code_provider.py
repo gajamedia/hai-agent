@@ -14,6 +14,7 @@ from agent.llm.contracts import (
 )
 import logging
 import time
+from agent.llm.process_runner import run_cli, sanitized_environment
 
 
 DEFAULT_EXECUTABLE = "opencode"
@@ -527,10 +528,8 @@ class OpenCodeProvider:
                 self.environment,
             )
 
-        environment = None
-        if self.environment is not None:
-            environment = dict(os.environ)
-            environment.update(self.environment)
+        # No application secrets in the child's environment (see process_runner).
+        environment = sanitized_environment(os.environ, self.environment)
 
         command_to_run = list(command)
 
@@ -585,17 +584,9 @@ class OpenCodeProvider:
                         *command_to_run[1:],
                     ]
 
-        return subprocess.run(
-            command_to_run,
-            cwd=self.cwd,
-            env=environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=self.timeout,
-            check=False,
-        )
+        # stdin is closed (a CLI that asks a question must fail, not wait for a keyboard that does
+        # not exist) and the whole process tree is killed on timeout.
+        return run_cli(command_to_run, cwd=self.cwd, env=environment, timeout=self.timeout)
 
 
     @staticmethod

@@ -176,3 +176,19 @@ hyphen) are hidden, and the page tells you how many. Reserved words such as `ord
 | 503 `table_report_failed` | No LLM available | Run `python scripts\check_llm_provider.py`; check `OPENCODE_*` in `.env`, or install/log in to the Claude Code CLI |
 
 Stop everything with `Ctrl+C` in each terminal.
+
+## Which LLM answers (OpenCode, Claude Code)
+
+Planning a report sends the question and the approved table catalog (never rows) to an LLM.
+
+- `HAI_LLM_PROVIDER=auto` (default): OpenCode first, Claude Code only if OpenCode fails. A provider that
+  *hangs* only fails when its timeout ends, so the first provider is capped at `HAI_LLM_FAILOVER_SECONDS`
+  (default 60, never more than `OPENCODE_TIMEOUT`). Worst case before the second answers: about one minute.
+- `HAI_LLM_PROVIDER=claude-code` or `opencode`: use one provider only.
+- If OpenCode never answers, check its model: with `OPENCODE_MODEL` empty it uses its built-in free model,
+  which can stall. List the models you can use with `opencode models`, put one in `OPENCODE_MODEL`
+  (for example `opencode/<name>`), and test with `python scripts\check_llm_provider.py --provider opencode`.
+  Some models are paid; choose deliberately. Claude Code answers in roughly 5 seconds when it is logged in.
+- The agent command line tools are started without this server's secrets in their environment (no
+  `HAI_*`, `KC_*`, `*_PASSWORD`, `*_SECRET` variables), with no keyboard attached, and are killed together
+  with everything they started when the timeout ends.

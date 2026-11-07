@@ -40,13 +40,18 @@ def create_llm_provider():
     if mode not in {"auto", "opencode", "claude-code"}:
         raise RuntimeError("HAI_LLM_PROVIDER must be 'auto', 'opencode' or 'claude-code'")
 
-    def opencode():
+    def opencode(*, first_of_two: bool = False):
+        timeout = _positive_timeout("OPENCODE_TIMEOUT", "120")
+        if first_of_two:
+            # A provider that hangs only fails when its timeout ends, and only then does the next
+            # one get a turn. Cap the first one so a stuck OpenCode costs seconds, not minutes.
+            timeout = min(timeout, _positive_timeout("HAI_LLM_FAILOVER_SECONDS", "60"))
         return OpenCodeProvider(
             executable=os.getenv("OPENCODE_EXECUTABLE") or None,
             model=os.getenv("OPENCODE_MODEL") or None,
             agent=os.getenv("OPENCODE_AGENT") or None,
             cwd=os.getenv("OPENCODE_CWD") or None,
-            timeout=_positive_timeout("OPENCODE_TIMEOUT", "120"),
+            timeout=timeout,
             auto_approve=False,
         )
 
@@ -62,7 +67,7 @@ def create_llm_provider():
         return claude()
     if discover_claude_executable() is None:
         return opencode()
-    return FallbackLLMProvider([opencode(), claude()])
+    return FallbackLLMProvider([opencode(first_of_two=True), claude()])
 
 
 def create_runtime() -> AgentCognitiveRuntime:

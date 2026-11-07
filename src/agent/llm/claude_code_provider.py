@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from agent.llm.contracts import LLMMessage, LLMRequest, LLMResponse
+from agent.llm.process_runner import run_cli, sanitized_environment
 
 DEFAULT_PROVIDER_NAME = "claude-code"
 
@@ -172,15 +173,10 @@ class ClaudeCodeProvider:
     def _run(self, command: Sequence[str], stdin_text: str) -> "subprocess.CompletedProcess[str]":
         if self._runner is not None:
             return self._runner(command, self.cwd, self.timeout, self.environment, stdin_text)
-        environment = None
-        if self.environment is not None:
-            environment = dict(os.environ)
-            environment.update(self.environment)
-        return subprocess.run(
-            list(command), input=stdin_text, cwd=self.cwd, env=environment,
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=self.timeout, check=False,
-        )
+        # No application secrets in the child's environment, no inherited stdin, and the whole
+        # process tree is killed on timeout (see process_runner).
+        return run_cli(list(command), cwd=self.cwd, timeout=self.timeout, stdin_text=stdin_text,
+                       env=sanitized_environment(os.environ, self.environment))
 
     @staticmethod
     def _split_messages(messages: Sequence[LLMMessage]) -> tuple[str | None, str]:
