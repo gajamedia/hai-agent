@@ -63,7 +63,9 @@ GOOD = {"supported": True, "database": "hai_toko", "title": "Toko", "tables": [
     ({"database": "HAI_TOKO"}, "must start with"),
     ({"database": None}, "must start with"),
     ({"tables": "x"}, "list"),
-    ({"tables": [{"name": "t", "columns": []}]}, "1 to"),
+    ({"tables": [{"name": "t", "columns": []}]}, "no columns"),
+    ({"tables": [{"name": "t", "columns": [{"name": f"c{i}", "type": "long_text"} for i in range(501)]}]}, "limit is 500"),
+    ({"tables": [{"name": "t", "columns": [{"name": f"c{i}", "type": "text"} for i in range(70)]}]}, "too wide"),
     ({"tables": [{"name": "t; x", "columns": [{"name": "a", "type": "text"}]}]}, "table name"),
     ({"tables": [{"name": "t", "columns": [{"name": "id", "type": "integer"}]}]}, "repeats"),
     ({"tables": [{"name": "t", "columns": [{"name": "a", "type": "blob"}]}]}, "not allowed"),
@@ -76,6 +78,12 @@ GOOD = {"supported": True, "database": "hai_toko", "title": "Toko", "tables": [
 def test_bad_designs_are_refused(change, needle):
     with pytest.raises(ValueError, match=needle):
         _designer().validate({**GOOD, **change})
+
+
+def test_a_wide_table_of_hundreds_of_columns_is_allowed_when_it_fits_a_mysql_row():
+    cols = [{"name": f"c{i}", "type": "integer" if i % 2 else "long_text"} for i in range(500)]
+    design = _designer().validate({**GOOD, "tables": [{"name": "t", "columns": cols}]})
+    assert len(design.tables[0].columns) == 500
 
 
 def test_a_design_with_only_a_database_is_allowed():

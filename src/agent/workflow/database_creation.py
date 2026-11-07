@@ -20,7 +20,11 @@ from agent.llm.contracts import LLMMessage
 from agent.workflow.table_report_planner import PlanValidationError, _extract_json
 
 MAX_TABLES = 20
-MAX_COLUMNS = 50
+MAX_COLUMNS = 500
+# MySQL counts every column in the row size limit (65,535 bytes). utf8mb4 VARCHAR(255) = 1,022 bytes,
+# TEXT only a pointer. Checked here so a too-wide design is refused with a clear message, not a DDL error.
+_ROW_BYTES = {"integer": 4, "decimal": 8, "text": 1022, "long_text": 12, "date": 3, "datetime": 8, "boolean": 1}
+_ROW_LIMIT = 65000
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 # Closed set of column types -> MySQL types. Nothing else can be requested.
 COLUMN_TYPES = {
@@ -77,7 +81,10 @@ class DatabaseDesigner:
             '{"name": "tb_x", "columns": [{"name": "col", "type": "text", "nullable": true}]}]}\n'
             f"Column types, only these: {sorted(COLUMN_TYPES)}. Do NOT add an id column: a numeric primary "
             f"key named id is added automatically. At most {MAX_TABLES} tables and {MAX_COLUMNS} columns "
-            "per table; table and column names are lowercase letters, digits and underscores. A database "
+            "per table (a table needs at least one column; if the user names a kind of system such as HRIS, "
+            "choose the usual columns yourself). Use text only for short values; use long_text for notes, "
+            "because a row can hold about 65 short text columns. Table and column names are lowercase "
+            "letters, digits and underscores. A database "
             "with no tables is allowed if the user asks for only the database. If the user only wants "
             "more tables in a database that exists, list just the new tables.\n"
             'If the request cannot be done: {"supported": false, "reason": "..."}.'
@@ -124,8 +131,12 @@ class DatabaseDesigner:
                 raise PlanValidationError(f"Invalid or repeated table name {name!r}.")
             seen.add(name)
             columns_raw = raw.get("columns")
-            if not isinstance(columns_raw, list) or not 1 <= len(columns_raw) <= MAX_COLUMNS:
-                raise PlanValidationError(f"Table {name!r} needs 1 to {MAX_COLUMNS} columns.")
+            if not isinstance(columns_raw, list) or not columns_raw:
+                raise PlanValidationError(
+                    f"Table {name!r} has no columns. List every column yourself (for a request such as "
+                    "'the usual fields of an HRIS', choose the usual fields).")
+            if len(columns_raw) > MAX_COLUMNS:
+                raise PlanValidationError(f"Table {name!r} has {len(columns_raw)} columns; the limit is {MAX_COLUMNS}.")
             columns, names = [], {"id"}
             for col in columns_raw:
                 if not isinstance(col, Mapping) or set(col) - {"name", "type", "nullable"}:
@@ -143,6 +154,11 @@ class DatabaseDesigner:
                     raise PlanValidationError("nullable must be true or false.")
                 names.add(cname)
                 columns.append(ColumnDef(cname, ctype, nullable))
+            row_bytes = 4 + sum(_ROW_BYTES[c.type] for c in columns)
+            if row_bytes > _ROW_LIMIT:
+                raise PlanValidationError(
+                    f"Table {name!r} is too wide for MySQL (a row may hold about 65,000 bytes and each short text "
+                    "column takes about 1,000). Use long_text for descriptions and notes, or split the table in two.")
             tables.append(TableDef(name, tuple(columns)))
         title = data.get("title")
         title = title.strip()[:200] if isinstance(title, str) and title.strip() else f"Create {database}"
