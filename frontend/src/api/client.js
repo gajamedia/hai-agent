@@ -27,11 +27,15 @@ async function parseResponse(response) {
 
   if (!response.ok) {
     const detail = body?.detail;
-    const message =
+    let message =
       (typeof detail === "object" ? detail?.message : detail) ||
       body?.message ||
       body?.error ||
       `HTTP ${response.status}`;
+    // A 403 names the permission it needed; showing it tells the user which role to ask for.
+    if (response.status === 403 && typeof detail === "object" && typeof detail?.permission === "string") {
+      message = `${message} (izin yang dibutuhkan: ${detail.permission})`;
+    }
 
     const error = new Error(message);
     error.status = response.status;

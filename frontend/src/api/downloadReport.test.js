@@ -48,3 +48,28 @@ describe("downloadReport", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("403 messages", () => {
+  it("name the permission the server required", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ detail: { error: "permission_denied", message: "Not allowed.", permission: "database:connection:manage" } }),
+          { status: 403 },
+        ),
+      ),
+    );
+    await expect(downloadReport("/x")).rejects.toThrow(
+      "Not allowed. (izin yang dibutuhkan: database:connection:manage)",
+    );
+  });
+
+  it("do not invent a permission when the server sent none", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: { message: "Nope." } }), { status: 403 })),
+    );
+    await expect(downloadReport("/x")).rejects.toThrow(/^Nope\.$/);
+  });
+});
