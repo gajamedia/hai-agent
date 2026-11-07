@@ -270,3 +270,19 @@ def test_a_profiles_file_without_a_bom_still_loads(tmp_path):
     path = tmp_path / "profiles.json"
     path.write_text(json.dumps({"crm": GOOD}), encoding="utf-8")
     assert load_profiles(path)["crm"].host == "h"
+
+
+def test_a_missing_profiles_file_says_what_to_do(tmp_path):
+    from api.database_engines import load_profiles
+    with pytest.raises(EngineError) as info:
+        load_profiles(tmp_path / "profiles.json")
+    text = str(info.value)
+    assert "not found" in text and "HAI_DATABASE_PROFILES" in text and "TRY_DATA_REPORTS_LOCALLY" in text
+
+
+def test_a_missing_data_folder_says_how_to_create_it(tmp_path):
+    with pytest.raises(RegistryError) as info:
+        DatabaseRuntimeRegistry(data_root=tmp_path / "nope", work_dir=tmp_path / "w",
+                                authorization_policy=AuthorizationPolicy(),
+                                llm_provider_factory=lambda: None)
+    assert "make_sample_sales_db.py" in str(info.value) and "HAI_DATABASE_ROOT" in str(info.value)

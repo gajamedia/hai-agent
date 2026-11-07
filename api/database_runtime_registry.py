@@ -109,7 +109,10 @@ class DatabaseRuntimeRegistry:
                  engines: Mapping[str, Any] | None = None) -> None:
         self.data_root = Path(data_root).expanduser()
         if not self.data_root.is_dir():
-            raise RegistryError(f"data_root is not a directory: {self.data_root}")
+            raise RegistryError(
+                f"data_root is not a directory: {self.data_root}. Create the folder first "
+                "(for example: python scripts/make_sample_sales_db.py <folder>), "
+                "or fix HAI_DATABASE_ROOT in .env.")
         self.work_dir = Path(work_dir).expanduser()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.authorization_policy = authorization_policy

@@ -185,6 +185,10 @@ def parse_profiles(data: Any) -> dict[str, Any]:
 def load_profiles(path: str | Path) -> dict[str, Any]:
     try:
         return parse_profiles(json.loads(Path(path).expanduser().read_text(encoding="utf-8-sig")))
+    except FileNotFoundError as exc:
+        raise EngineError(
+            f"profiles file not found: {path}. Create it (docs/TRY_DATA_REPORTS_LOCALLY.md, section 5) "
+            "or remove HAI_DATABASE_PROFILES from .env.") from exc
     except (OSError, ValueError) as exc:
         if isinstance(exc, EngineError):
             raise
