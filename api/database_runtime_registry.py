@@ -47,6 +47,7 @@ from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
+from agent.workflow.database_creation import DatabaseCreationService, DatabaseDesigner
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
@@ -136,6 +137,7 @@ class DatabaseRuntimeRegistry:
         if engines:
             self._engines.update(engines)
         self._connections: dict[str, _Connection] = {}
+        self._creators: dict[str, DatabaseCreationService] = {}
         self._lock = threading.RLock()
         self._store = SQLiteWorkflowStore(self.work_dir / "workflow.sqlite3")
         self._llm: Any = None
@@ -463,6 +465,44 @@ class DatabaseRuntimeRegistry:
             planner=DataChangePlanner(self._llm, tables), connect=factory, quote=impl.quote,
             paramstyle=impl.paramstyle, lock_clause=getattr(impl, "lock_clause", " FOR UPDATE"),
             audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl")
+
+    # --------------------------------------------------- creating databases
+    def creatable_profiles(self) -> list[dict[str, str]]:
+        """Profiles whose server definition has a creator account (names and prefix only)."""
+        out = []
+        for engine in self._engines.values():
+            for pname, profile in getattr(engine, "profiles", {}).items():
+                if getattr(engine, "has_creator", lambda _n: False)(pname):
+                    out.append({"name": pname, "prefix": profile.creator_prefix})
+        return sorted(out, key=lambda item: item["name"])
+
+    def database_creator(self, profile: Any = None) -> DatabaseCreationService:
+        with self._lock:
+            able = self.creatable_profiles()
+            names = [p["name"] for p in able]
+            if profile is None:
+                if len(names) != 1:
+                    raise RegistryError("name the server profile" if names
+                                        else "no server profile can create databases")
+                profile = names[0]
+            if profile not in names:
+                raise RegistryNotFound(f"profile '{profile}' cannot create databases")
+            cached = self._creators.get(profile)
+            if cached is not None:
+                return cached
+            impl = self._engines["mysql"]
+            try:
+                factory = impl.open_creator(profile)
+            except EngineError as exc:
+                raise RegistryError(f"cannot use the creator account: {exc}") from exc
+            if self._llm is None:
+                self._llm = LLMService(self.llm_provider_factory())
+            prefix = impl.profiles[profile].creator_prefix
+            service = DatabaseCreationService(
+                designer=DatabaseDesigner(self._llm, prefix=prefix), connect=factory, profile=profile,
+                audit_path=self.work_dir / "audit" / f"creations-{profile}.jsonl")
+            self._creators[profile] = service
+            return service
 
     def data_changes(self, name: Any) -> DataChangeService:
         with self._lock:

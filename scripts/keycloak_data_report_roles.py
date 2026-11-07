@@ -33,6 +33,7 @@ KNOWN_ROLES = {
     "database-engine-reviewer": "Review requests for new database engines.",
     "data-writer": "Plan and execute data changes (insert, update, delete) after re-confirming identity.",
     "data-change-approver": "Approve data changes made by someone else (second pair of eyes).",
+    "data-schema-creator": "Create new databases and tables (names with the server's prefix only).",
 }
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 

@@ -68,6 +68,12 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("POST", r"^/api/v1/data-changes/plans/[^/]+/run$", "data:change:execute"),
     ("GET", r"^/api/v1/data-changes/approvals$", "data:change:approve"),
     ("POST", r"^/api/v1/data-changes/approvals/[^/]+/(?:approve|reject)$", "data:change:approve"),
+    # Creating databases: one permission for planning and running; a fresh login is checked by the handler.
+    ("GET", r"^/api/v1/database-creation/config$", "database:create:manage"),
+    ("POST", r"^/api/v1/database-creation/plans$", "database:create:manage"),
+    ("GET", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
+    ("DELETE", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
+    ("POST", r"^/api/v1/database-creation/plans/[^/]+/run$", "database:create:manage"),
     # Engine requests: anyone who may ask can list (the handler narrows it to their own
     # unless they are a reviewer); only reviewers can change a request.
     ("POST", r"^/api/v1/database-engine-requests$", "database:engine:request"),

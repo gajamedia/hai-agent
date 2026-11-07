@@ -1,0 +1,105 @@
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
+import DatabaseCreation from "./DatabaseCreation";
+import * as api from "../api/client";
+import * as keycloak from "../auth/keycloak";
+
+vi.mock("../api/client", () => ({
+  cancelDatabasePlan: vi.fn(),
+  connectDatabase: vi.fn(),
+  createDatabasePlan: vi.fn(),
+  getDatabaseCreationConfig: vi.fn(),
+  getDatabasePlan: vi.fn(),
+  runDatabasePlan: vi.fn(),
+}));
+vi.mock("../auth/keycloak", () => ({ signInAgain: vi.fn() }));
+
+const PLAN = {
+  status: "planned", plan_id: "d1", profile: "local_mysql", confirm_phrase: "BUAT DATABASE hai_toko",
+  statements: ["CREATE DATABASE hai_toko"],
+  plan: { database: "hai_toko", tables: [{ name: "tb_bahan", columns: [
+    { name: "id", type: "integer (otomatis)", nullable: false },
+    { name: "nama", type: "text", nullable: false }] }] },
+};
+
+const renderPage = () => render(<MemoryRouter><DatabaseCreation /></MemoryRouter>);
+
+async function planIt(user) {
+  await user.type(await screen.findByLabelText(/Perintah/), "buat toko");
+  await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+  return screen.findByLabelText("Rencana database");
+}
+
+afterEach(cleanup);
+
+describe("DatabaseCreation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [{ name: "local_mysql", prefix: "hai_" }] });
+    api.createDatabasePlan.mockResolvedValue(PLAN);
+  });
+
+  it("explains how to enable it when no server can create databases", async () => {
+    api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [] });
+    renderPage();
+    expect(await screen.findByText(/Belum ada server yang boleh membuat database/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Buat rencana/ })).toBeNull();
+  });
+
+  it("shows the design and the required name prefix, and nothing is created yet", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    expect((await screen.findByText(/diawali/)).textContent).toMatch(/hai_/);
+    const card = (await planIt(user)).textContent;
+    expect(card).toMatch(/Database baru: hai_toko/);
+    expect(card).toMatch(/Tabel tb_bahan: id \(integer \(otomatis\), wajib\), nama \(text, wajib\)/);
+    expect(api.runDatabasePlan).not.toHaveBeenCalled();
+  });
+
+  it("runs only with the exact phrase, then offers to connect the new database", async () => {
+    const user = userEvent.setup();
+    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+    api.connectDatabase.mockResolvedValue({});
+    renderPage();
+    await planIt(user);
+    const run = screen.getByRole("button", { name: "Jalankan" });
+    expect(run.disabled).toBe(true);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "BUAT DATABASE hai_toko");
+    await user.click(run);
+    expect(api.runDatabasePlan).toHaveBeenCalledWith("d1", "BUAT DATABASE hai_toko", "d1");
+    await user.click(await screen.findByRole("button", { name: /Hubungkan database ini/ }));
+    expect(api.connectDatabase).toHaveBeenCalledWith({ name: "hai_toko", profile: "local_mysql", database: "hai_toko" });
+    expect(await screen.findByText(/Terhubung/)).toBeTruthy();
+  });
+
+  it("signs in again when asked, and shows the plan again without running it", async () => {
+    const user = userEvent.setup();
+    api.runDatabasePlan.mockRejectedValue(Object.assign(new Error("403"), {
+      status: 403, body: { detail: { error: "step_up_required", message: "again" } } }));
+    renderPage();
+    await planIt(user);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "BUAT DATABASE hai_toko");
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    await waitFor(() => expect(keycloak.signInAgain).toHaveBeenCalledTimes(1));
+    expect(sessionStorage.getItem("hai.databaseCreation.pending")).toBe("d1");
+
+    cleanup();
+    api.getDatabasePlan.mockResolvedValue(PLAN);
+    renderPage();
+    expect(await screen.findByText(/Anda sudah login ulang/)).toBeTruthy();
+    expect(api.runDatabasePlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a refusal (name already taken) instead of a plan", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlan.mockResolvedValue({ status: "refused", reason: "A database named 'hai_toko' already exists", plan_id: null });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Perintah/), "buat toko");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText(/already exists/)).toBeTruthy();
+    expect(screen.queryByLabelText("Rencana database")).toBeNull();
+  });
+});

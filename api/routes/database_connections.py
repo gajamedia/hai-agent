@@ -55,7 +55,7 @@ def _call(fn, *args, **kwargs):
 def connect_database(request: Request, payload: dict[str, Any]):
     """Step 1: connect a SQLite file (by name in the data folder) or a named profile."""
     principal, registry = _guard(request)
-    if set(payload) - {"name", "filename", "profile", "type"}:
+    if set(payload) - {"name", "filename", "profile", "type", "database"}:
         raise _err(422, "invalid_request",
                    "Only name, filename (sqlite) or profile (server-defined) and type are accepted.")
     has_file, has_profile = "filename" in payload, "profile" in payload
@@ -67,8 +67,15 @@ def connect_database(request: Request, payload: dict[str, Any]):
     if payload.get("type", engine) != engine:
         raise _err(422, "unsupported_database_type",
                    f"'{payload.get('type')}' does not match the source you provided ({engine}).")
-    return _call(registry.connect, payload.get("name"), engine=engine,
-                 source=payload.get("filename" if has_file else "profile"),
+    source = payload.get("filename" if has_file else "profile")
+    database = payload.get("database")
+    if database is not None:
+        # A database made by this application (name starts with the profile's prefix); the engine
+        # refuses any other name, so this can never point a profile at an unrelated database.
+        if has_file or not isinstance(database, str) or "/" in database or not isinstance(source, str):
+            raise _err(422, "invalid_request", "database can only accompany a profile, as a plain name.")
+        source = f"{source}/{database}"
+    return _call(registry.connect, payload.get("name"), engine=engine, source=source,
                  actor_id=principal.actor_id)
 
 

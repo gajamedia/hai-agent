@@ -336,3 +336,32 @@ export async function decideDataChange(planId, decision, signal) {
     signal,
   );
 }
+
+// Creating a new database (and tables): preview, fresh login, exact phrase.
+export async function getDatabaseCreationConfig(signal) {
+  return request(`${API_V1}/database-creation/config`, { signal });
+}
+
+export async function createDatabasePlan(payload, signal) {
+  return jsonPost(`${API_V1}/database-creation/plans`, payload, signal);
+}
+
+export async function getDatabasePlan(planId, signal) {
+  return request(`${API_V1}/database-creation/plans/${encodeURIComponent(planId)}`, { signal });
+}
+
+export async function runDatabasePlan(planId, confirm, idempotencyKey, signal) {
+  return jsonPost(
+    `${API_V1}/database-creation/plans/${encodeURIComponent(planId)}/run`,
+    { confirm },
+    signal,
+    idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+  );
+}
+
+export async function cancelDatabasePlan(planId, signal) {
+  return request(`${API_V1}/database-creation/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+    signal,
+  });
+}

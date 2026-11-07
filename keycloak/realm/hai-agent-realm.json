@@ -112,6 +112,10 @@
         {
           "name": "data-change-approver",
           "description": "Approve data changes made by someone else (second pair of eyes)."
+        },
+        {
+          "name": "data-schema-creator",
+          "description": "Create new databases and tables (names with the server's prefix only)."
         }
       ]
     }

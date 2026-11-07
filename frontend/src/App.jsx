@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Dashboard from "./pages/Dashboard.jsx";
 import AutonomousTesting from "./pages/AutonomousTesting.jsx";
 import DataChanges from "./pages/DataChanges.jsx";
+import DatabaseCreation from "./pages/DatabaseCreation.jsx";
 import DataReports from "./pages/DataReports.jsx";
 import { AuthProvider, useAuth } from "./auth/AuthProvider.jsx";
 
@@ -50,6 +51,7 @@ function AuthenticatedApplication() {
         <Route path="/autonomous-testing" element={<AutonomousTesting />} />
         <Route path="/data-reports" element={<DataReports />} />
         <Route path="/data-changes" element={<DataChanges />} />
+        <Route path="/database-creation" element={<DatabaseCreation />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </>
