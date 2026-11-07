@@ -172,6 +172,7 @@ hyphen) are hidden, and the page tells you how many. Reserved words such as `ord
 | 503 `database_connections_unavailable` | Backend started without `HAI_DATABASE_ROOT` | Set it (step 2) and restart |
 | 422 "database file not found" | File is not inside `HAI_DATABASE_ROOT` | Put it in that folder; use only its name |
 | Report fails `no_matching_rows` | The filter value matched nothing (case matters) | Rephrase; the agent learns the right spelling after one success |
-| 503 `table_report_failed` | No LLM available | Check `OPENCODE_*` in `.env`, or install/log in to the Claude Code CLI |
+| "Agent sedang menyusun rencana..." for minutes | The first LLM provider (OpenCode with `HAI_LLM_PROVIDER=auto`) is stuck; the page waits for its whole `OPENCODE_TIMEOUT` before trying Claude | Run `python scripts\check_llm_provider.py`: it times each provider and says which one is slow. Then set `HAI_LLM_PROVIDER=claude-code` (or lower `OPENCODE_TIMEOUT`) in `.env` and restart the backend. The **Batalkan** button stops the wait. |
+| 503 `table_report_failed` | No LLM available | Run `python scripts\check_llm_provider.py`; check `OPENCODE_*` in `.env`, or install/log in to the Claude Code CLI |
 
 Stop everything with `Ctrl+C` in each terminal.

@@ -159,3 +159,16 @@ def test_live_claude_code_roundtrip():
     r = ClaudeCodeProvider(timeout=120).complete(
         _request(LLMMessage("user", "Reply with exactly: pong")))
     assert "pong" in r.content.lower()
+
+
+def test_a_fallback_is_logged_with_how_long_the_failed_provider_took(caplog, monkeypatch):
+    """Operators watching the server terminal can see that the first provider is the slow one."""
+    import itertools
+    # the failing provider "took" 95 seconds; afterwards the clock keeps returning the last value
+    clock = itertools.chain([100.0, 195.0], itertools.repeat(195.0))
+    monkeypatch.setattr("agent.llm.fallback_provider.time.monotonic", lambda: next(clock))
+    primary = _Stub("opencode", error=ClaudeCodeTimeoutError("timed out"))
+    backup = _Stub("claude-code", result="ok")
+    with caplog.at_level("WARNING", logger="agent.llm.fallback_provider"):
+        FallbackLLMProvider([primary, backup]).complete(_request())
+    assert "opencode failed after 95 s" in caplog.text and "ClaudeCodeTimeoutError" in caplog.text

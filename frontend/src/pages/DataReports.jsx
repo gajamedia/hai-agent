@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, ArrowLeft, Database, LoaderCircle, Plug, Send, Unplug } from "lucide-react";
 import { Link } from "react-router-dom";
 import {
@@ -146,6 +146,10 @@ function ResultTable({ rows }) {
   );
 }
 
+// The agent may wait on a slow or stuck LLM provider before switching to the next one, so the page
+// must say what is happening, count the seconds, and let the user stop waiting.
+export const PLAN_TIMEOUT_MS = 4 * 60 * 1000;
+
 const STATUS_TEXT = (c) =>
   c.status === "active"
     ? `aktif (${c.tables.join(", ")})`
@@ -171,6 +175,19 @@ export default function DataReports() {
   const [result, setResult] = useState(null);
   const [plan, setPlan] = useState(null);
   const [format, setFormat] = useState("");
+  const [planningSince, setPlanningSince] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const planAbort = useRef(null);
+  const cancelledByUser = useRef(false);
+
+  useEffect(() => {
+    if (planningSince === null) {
+      setElapsed(0);
+      return undefined;
+    }
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - planningSince) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [planningSince]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -254,19 +271,46 @@ export default function DataReports() {
     });
   };
 
-  const makePlan = (event) => {
+  const makePlan = async (event) => {
     event.preventDefault();
-    return guarded(async () => {
-      setResult(null);
-      setPlan(null);
-      const data = await createReportPlan({
-        question: question.trim(),
-        database: selected || undefined,
-        format: format || undefined,
-      });
+    setBusy(true);
+    setError("");
+    setResult(null);
+    setPlan(null);
+    const controller = new AbortController();
+    planAbort.current = controller;
+    cancelledByUser.current = false;
+    const timeout = setTimeout(() => controller.abort(), PLAN_TIMEOUT_MS);
+    setPlanningSince(Date.now());
+    try {
+      const data = await createReportPlan(
+        { question: question.trim(), database: selected || undefined, format: format || undefined },
+        controller.signal,
+      );
       if (data.status === "planned") setPlan(data);
       else setResult(data);
-    });
+    } catch (err) {
+      if (controller.signal.aborted) {
+        setError(
+          cancelledByUser.current
+            ? "Pembuatan rencana dibatalkan."
+            : "Agent terlalu lama menjawab (lebih dari 4 menit). Periksa penyedia LLM di server dengan: "
+                + "python scripts/check_llm_provider.py",
+        );
+      } else {
+        setError(err.message);
+      }
+    } finally {
+      clearTimeout(timeout);
+      planAbort.current = null;
+      setPlanningSince(null);
+      setBusy(false);
+    }
+  };
+
+  const cancelPlanning = () => {
+    cancelledByUser.current = true;
+    planAbort.current?.abort();
   };
 
   const runPlan = () =>
@@ -438,9 +482,21 @@ export default function DataReports() {
                   className="at-button at-button-primary"
                   disabled={busy || !question.trim() || !active.length}
                 >
-                  {busy ? <LoaderCircle size={14} /> : <Send size={14} />} Buat rencana
+                  {busy ? <LoaderCircle size={14} className="spin" /> : <Send size={14} />} Buat rencana
                 </button>
               </form>
+              {planningSince !== null && (
+                <div className="at-notice" role="status" aria-live="polite" style={{ marginTop: 14 }}>
+                  <LoaderCircle size={16} className="spin" />
+                  <span>
+                    Agent sedang menyusun rencana... <b>{elapsed} detik</b>. Biasanya 10 sampai 60 detik; bisa
+                    lebih lama bila penyedia LLM pertama macet dan harus beralih ke yang kedua.
+                  </span>
+                  <button type="button" className="at-button at-button-secondary" onClick={cancelPlanning}>
+                    Batalkan
+                  </button>
+                </div>
+              )}
               {plan && (
                 <div className="at-config-summary" style={{ marginTop: 16 }} aria-label="Rencana laporan">
                   <b>Rencana (belum ada data yang dibaca)</b>

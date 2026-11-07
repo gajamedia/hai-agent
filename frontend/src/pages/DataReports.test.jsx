@@ -1,8 +1,8 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import DataReports from "./DataReports";
+import DataReports, { PLAN_TIMEOUT_MS } from "./DataReports";
 import * as api from "../api/client";
 
 vi.mock("../api/client", () => ({
@@ -236,6 +236,7 @@ describe("DataReports", () => {
       await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
       expect(api.createReportPlan).toHaveBeenCalledWith(
         expect.objectContaining({ question: "total", format: "xlsx" }),
+        expect.any(AbortSignal),
       );
       expect((await screen.findByLabelText("Rencana laporan")).textContent).toMatch(/File: XLSX/);
       await user.click(screen.getByRole("button", { name: "Jalankan" }));
@@ -263,5 +264,80 @@ describe("DataReports", () => {
     await user.click(await screen.findByRole("button", { name: "Jalankan" }));
     await screen.findByRole("table", { name: "Hasil laporan" });
     expect(screen.queryByRole("button", { name: /Unduh/ })).toBeNull();
+  });
+
+  it("shows a spinning indicator, counts the seconds and lets the user stop waiting", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    let seenSignal;
+    api.createReportPlan.mockImplementation(
+      (_payload, signal) =>
+        new Promise((_resolve, reject) => {
+          seenSignal = signal;
+          signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        }),
+    );
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toMatch(/Agent sedang menyusun rencana/);
+    expect(status.textContent).toMatch(/0 detik/);
+    expect(status.querySelector("svg.spin")).not.toBeNull();                 // it really animates
+    expect(screen.getByRole("button", { name: /Buat rencana/ }).querySelector("svg.spin")).not.toBeNull();
+    expect(screen.getByRole("button", { name: /Buat rencana/ }).disabled).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "Batalkan" }));
+    expect(seenSignal.aborted).toBe(true);
+    expect(await screen.findByText("Pembuatan rencana dibatalkan.")).toBeTruthy();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: /Buat rencana/ }).disabled).toBe(false);   // can try again
+  });
+
+  it("counts elapsed seconds and gives up after four minutes with a pointer to the check tool", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      api.listDatabaseConnections.mockResolvedValue({
+        connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+      });
+      api.createReportPlan.mockImplementation(
+        (_payload, signal) =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          }),
+      );
+      renderPage();
+      await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+      await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+      await screen.findByRole("status");
+
+      await act(async () => { vi.advanceTimersByTime(7000); });
+      expect(screen.getByRole("status").textContent).toMatch(/[67] detik/);
+
+      await act(async () => { vi.advanceTimersByTime(PLAN_TIMEOUT_MS); });
+      expect(await screen.findByText(/lebih dari 4 menit/)).toBeTruthy();
+      expect(screen.getByRole("alert").textContent).toMatch(/check_llm_provider\.py/);
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.getByRole("button", { name: /Buat rencana/ }).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not leave the waiting notice behind after a normal answer", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue(PLAN);
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await screen.findByLabelText("Rencana laporan");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

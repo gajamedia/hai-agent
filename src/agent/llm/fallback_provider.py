@@ -12,6 +12,7 @@ providers you are willing to send that data to.
 """
 
 import logging
+import time
 from typing import Sequence
 
 from agent.llm.contracts import LLMProvider, LLMRequest, LLMResponse
@@ -54,11 +55,13 @@ class FallbackLLMProvider:
     def complete(self, request: LLMRequest) -> LLMResponse:
         failures: list[tuple[str, Exception]] = []
         for provider in self.providers:
+            started = time.monotonic()
             try:
                 response = provider.complete(request)
             except self.fallback_on as exc:
                 failures.append((str(provider.name), exc))
-                logger.warning("LLM provider %s failed (%s); trying next.", provider.name, exc)
+                logger.warning("LLM provider %s failed after %.0f s (%s: %s); trying next.",
+                               provider.name, time.monotonic() - started, type(exc).__name__, exc)
                 continue
             self.last_used_provider = str(provider.name)
             self.last_failures = tuple(failures)
