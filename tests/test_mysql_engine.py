@@ -286,3 +286,25 @@ def test_a_missing_data_folder_says_how_to_create_it(tmp_path):
                                 authorization_policy=AuthorizationPolicy(),
                                 llm_provider_factory=lambda: None)
     assert "make_sample_sales_db.py" in str(info.value) and "HAI_DATABASE_ROOT" in str(info.value)
+
+
+def test_the_real_connection_error_goes_to_the_server_log_but_not_to_the_browser(tmp_path, caplog):
+    """The operator can read why a connection failed; the HTTP caller only sees a generic message."""
+    class Failing:
+        paramstyle, quote, map_type = "format", "`", staticmethod(lambda t: "string")
+
+        def open(self, manager, name, source, auth_ref):
+            raise Exception(1045, "Access denied for user 'hai_reader'@'172.17.0.1' (using password: YES)")
+
+    (tmp_path / "d").mkdir()
+    registry = DatabaseRuntimeRegistry(
+        data_root=tmp_path / "d", work_dir=tmp_path / "w", authorization_policy=AuthorizationPolicy(),
+        llm_provider_factory=lambda: None, engines={"mysql": Failing()})
+    with caplog.at_level("WARNING", logger="hai_agent.database_registry"):
+        with pytest.raises(RegistryError) as info:
+            registry.connect("shop", engine="mysql", source="local_mysql", actor_id="alice")
+    assert str(info.value) == "cannot open database: connection failed"
+    assert "1045" not in str(info.value) and "172.17" not in str(info.value)
+    log = caplog.text
+    assert "Access denied for user 'hai_reader'@'172.17.0.1'" in log
+    assert "local_mysql" in log and "check_database_profile.py" in log

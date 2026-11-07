@@ -19,6 +19,7 @@ role must be SELECT-only). See ``api.database_engines``.
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -51,6 +52,7 @@ from api.database_engines import (
     map_sqlite_type,
 )
 
+logger = logging.getLogger("hai_agent.database_registry")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 MAX_TABLES = 20
@@ -252,7 +254,14 @@ class DatabaseRuntimeRegistry:
             manager.shutdown()
             if isinstance(exc, RegistryError):
                 raise
-            # Driver errors can echo host names or users; keep only our own messages.
+            # Driver errors can echo host names or users, so the browser only gets our own
+            # messages. The operator still needs the real cause: it goes to the server log
+            # (which never holds the password) and to scripts/check_database_profile.py.
+            if not isinstance(exc, EngineError):
+                logger.warning(
+                    "Could not open %s source %r for connection %r: %s: %s "
+                    "(run scripts/check_database_profile.py for a step by step check)",
+                    engine, source, name, type(exc).__name__, exc)
             detail = str(exc) if isinstance(exc, EngineError) else "connection failed"
             raise RegistryError(f"cannot open database: {detail}") from exc
         return _Connection(name=name, filename=source.strip(), engine=engine,
