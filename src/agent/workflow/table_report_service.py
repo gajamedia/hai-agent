@@ -29,6 +29,9 @@ class AskOutcome:
     provider: str | None = None
     attempts: int = 0
     rows: tuple[Mapping[str, Any], ...] = ()
+    kind: str = "aggregate"
+    row_count: int | None = None
+    limit_reached: bool = False
 
 
 class TableReportService:
@@ -54,11 +57,15 @@ class TableReportService:
 
     @staticmethod
     def summarize(req: Any) -> dict[str, Any]:
-        return {
-            "table": req.table, "group_by": list(req.group_by),
+        summary = {
+            "kind": req.kind, "table": req.table, "group_by": list(req.group_by),
             "metrics": [{"output": o, "operation": op, "column": c} for o, op, c in req.metrics],
             "filters": dict(req.filters), "format": req.report_format,
         }
+        if req.kind == "list":
+            summary.update(columns=list(req.select_columns), limit=req.limit,
+                           order_by=[{"column": c, "direction": d} for c, d in req.order_by])
+        return summary
 
     def ask(self, question: str, *, execution_context: Any,
             report_format: str | None = None) -> AskOutcome:
@@ -83,7 +90,8 @@ class TableReportService:
             reason=outcome.message, workflow_id=outcome.workflow_id,
             error_code=outcome.error_code, failed_task_key=outcome.failed_task_key,
             artifact=outcome.artifact, plan=summary, provider=plan.provider,
-            attempts=plan.attempts, rows=outcome.rows)
+            attempts=plan.attempts, rows=outcome.rows, kind=outcome.kind,
+            row_count=outcome.row_count, limit_reached=outcome.limit_reached)
 
     def _remember(self, question: str, plan: Mapping[str, Any], status: str,
                   error_code: str | None) -> None:

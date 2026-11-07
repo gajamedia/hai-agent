@@ -70,6 +70,24 @@ Open http://localhost:5173, sign in, and choose **Data Reports** in the sidebar.
 5. Open the downloaded file in Excel or Acrobat. Check that the number columns are right-aligned
    (real numbers), the header is bold, and there is no "file is corrupt" message.
 
+### What you can ask
+
+The agent never writes SQL. It picks one of two plan kinds from the tables and columns you approved, and
+our own code builds the (parameterized, read-only) query from that plan. You always see the plan first.
+
+| You say | Plan kind | What you get |
+|---|---|---|
+| "total penjualan per wilayah", "jumlah order per produk" | **aggregate** | a summary: totals, counts, averages per group |
+| "tampilkan data penjualan", "tampilkan 10 penjualan terbesar", "daftar order di wilayah west urut dari id terkecil", "show the first 20 widget sales with region and amount" | **list** | the rows themselves: the columns you ask for (or all), equality filters, up to 3 sort keys, and a row limit |
+
+For a list: 100 rows unless you ask for another number, at most 1000. If more rows exist than the limit, the
+page and the file say so ("Dibatasi N baris pertama"). The page shows the first 200 rows; the downloaded
+Excel, PDF, CSV or HTML file holds all of them. Columns appear in the order you asked for.
+
+Not supported yet, and refused with a reason instead of being silently ignored: comparisons and ranges
+("di atas 100", "bulan Maret"), OR, "contains", several tables or joins, anything that changes data.
+Only columns you approved can be shown, sorted by or filtered on.
+
 ## 5. Use your own MySQL instead of the sample file
 
 MySQL is chosen **by profile name**, never by typing a host or password into the page: those live on the

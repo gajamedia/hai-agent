@@ -502,10 +502,27 @@ export default function DataReports() {
                   <b>Rencana (belum ada data yang dibaca)</b>
                   <span>Tabel: {plan.plan.table}</span>
                   <span>File: {String(plan.plan.format || "json").toUpperCase()}</span>
-                  <span>Kelompokkan per: {plan.plan.group_by.join(", ")}</span>
-                  <span>
-                    Hitung: {plan.plan.metrics.map((m) => `${m.operation}(${m.column || "*"})`).join(", ")}
-                  </span>
+                  {plan.plan.kind === "list" ? (
+                    <>
+                      <span>Jenis: daftar baris (data apa adanya, tanpa ringkasan)</span>
+                      <span>Kolom: {plan.plan.columns.join(", ")}</span>
+                      <span>
+                        Urutan: {plan.plan.order_by?.length
+                          ? plan.plan.order_by
+                              .map((o) => `${o.column} ${o.direction === "desc" ? "menurun" : "menaik"}`)
+                              .join(", ")
+                          : "bawaan database"}
+                      </span>
+                      <span>Maksimal: {plan.plan.limit} baris</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Kelompokkan per: {plan.plan.group_by.join(", ")}</span>
+                      <span>
+                        Hitung: {plan.plan.metrics.map((m) => `${m.operation}(${m.column || "*"})`).join(", ")}
+                      </span>
+                    </>
+                  )}
                   <span>
                     Filter: {Object.keys(plan.plan.filters).length
                       ? Object.entries(plan.plan.filters).map(([k, v]) => `${k} = ${v}`).join(", ")
@@ -525,10 +542,35 @@ export default function DataReports() {
                 <div style={{ marginTop: 16 }} aria-live="polite">
                   {result.status === "succeeded" && (
                     <>
-                      <p>
-                        Laporan selesai: {result.plan?.table} per {result.plan?.group_by?.join(", ")}
-                        {Object.keys(filters).length ? `, filter ${JSON.stringify(filters)}` : ""}.
-                      </p>
+                      {result.kind === "list" ? (
+                        <>
+                          <p>
+                            Daftar baris dari {result.plan?.table}
+                            {Object.keys(filters).length ? `, filter ${JSON.stringify(filters)}` : ""}:
+                            menampilkan {result.rows?.length} dari {result.row_count} baris.
+                          </p>
+                          {result.limit_reached && (
+                            <div className="at-warning">
+                              <AlertCircle size={16} />
+                              <div>
+                                <b>Dibatasi {result.plan?.limit} baris pertama.</b>
+                                <p>Masih ada baris lain di database. Persempit dengan filter, atau minta jumlah baris lebih besar.</p>
+                              </div>
+                            </div>
+                          )}
+                          {result.row_count > (result.rows?.length || 0) && (
+                            <p className="muted">
+                              Layar menampilkan {result.rows.length} baris pertama. File yang diunduh memuat semua{" "}
+                              {result.row_count} baris.
+                            </p>
+                          )}
+                        </>
+                      ) : (
+                        <p>
+                          Laporan selesai: {result.plan?.table} per {result.plan?.group_by?.join(", ")}
+                          {Object.keys(filters).length ? `, filter ${JSON.stringify(filters)}` : ""}.
+                        </p>
+                      )}
                       <ResultTable rows={result.rows} />
                       {result.download && (
                         <button

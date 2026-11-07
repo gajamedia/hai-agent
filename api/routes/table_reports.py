@@ -101,6 +101,8 @@ def _body(request: Request, outcome, principal=None, database: str | None = None
         "failed_task": outcome.failed_task_key, "artifact": outcome.artifact,
         "plan": outcome.plan, "provider": outcome.provider,
         "rows": jsonable_encoder(list(outcome.rows)),
+        "kind": outcome.kind, "row_count": outcome.row_count,
+        "limit_reached": outcome.limit_reached,
     }
 
 

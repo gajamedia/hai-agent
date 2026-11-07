@@ -10,7 +10,9 @@ platform promises users, independent of the database product:
 4. privileged (superuser/all-privileges) and write-capable accounts are refused;
 5. connection errors never leak host, user, database or password;
 6. an approved connection survives a restart and answers again;
-7. tables/columns named with reserved words or mixed case can be reported.
+7. tables/columns named with reserved words or mixed case can be reported;
+8. a "show the rows" listing returns the rows in the requested order and stops at its limit;
+9. listings and sorting work on reserved-word names, with two sort keys.
 
 To add an engine, write a fixture that creates the standard dataset (see the
 ``Harness`` contract below) and subclass ``ConformanceSuite``:
@@ -138,3 +140,36 @@ class ConformanceSuite:
                            f"WHERE {u} = 'u1' GROUP BY {g}")
         expected = {k: float(v) for k, v in rows}
         assert {r["group"]: float(r["revenue"]) for r in outcome.rows} == pytest.approx(expected)
+
+    def test_8_a_listing_returns_the_rows_in_the_requested_order_and_stops_at_its_limit(self, harness):
+        answer = json.dumps({
+            "supported": True, "kind": "list", "table": "sales", "columns": ["id", "region", "amount"],
+            "order_by": [{"column": "id", "direction": "desc"}], "limit": 5, "format": "csv"})
+        reg = harness.registry(answer)
+        reg.connect("conf", engine=harness.engine, source=harness.reader, actor_id="alice")
+        reg.activate("conf", SALES_SELECTION, actor_id="bob")
+        outcome = reg.service("conf").ask("show five sales", execution_context=_context())
+        assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
+        assert outcome.kind == "list" and outcome.row_count == 5 and outcome.limit_reached is True
+        expected = harness.sql(f"SELECT id, region, amount FROM {harness.q_sales} ORDER BY id DESC")[:5]
+        got = [(r["id"], r["region"], float(r["amount"])) for r in outcome.rows]
+        assert got == [(i, region, float(amount)) for i, region, amount in expected]
+        assert list(outcome.rows[0]) == ["id", "region", "amount"]            # the requested column order
+
+    def test_9_listings_and_sorting_work_on_reserved_word_names_with_two_sort_keys(self, harness):
+        answer = json.dumps({
+            "supported": True, "kind": "list", "table": harness.order_name, "columns": ["id", "group", "user"],
+            "order_by": [{"column": "group", "direction": "desc"}, {"column": "id", "direction": "asc"}],
+            "limit": 6})
+        reg = harness.registry(answer)
+        reg.connect("conf", engine=harness.engine, source=harness.reader, actor_id="alice")
+        reg.activate("conf", {harness.order_name: {
+            "columns": ["id", "group", "user", "amount"], "filterable_columns": ["user"],
+            "key_column": "id"}}, actor_id="bob")
+        outcome = reg.service("conf").ask("show the orders", execution_context=_context())
+        assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
+        g, u = harness.quote("group"), harness.quote("user")
+        expected = harness.sql(f"SELECT id, {g}, {u} FROM {harness.q_order} ORDER BY {g} DESC, id ASC")[:6]
+        got = [(r["id"], r["group"], r["user"]) for r in outcome.rows]
+        assert got == [tuple(row) for row in expected] and len(got) == 6
+

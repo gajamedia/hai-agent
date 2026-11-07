@@ -29,6 +29,7 @@ _ALLOWED_INPUT_FIELDS = frozenset({
     "quality_rules",
     "aggregation",
     "descriptive_statistics",
+    "detail",
 })
 
 
@@ -161,6 +162,49 @@ def _build_quality_rules(raw: Any) -> DataQualityRules:
     )
 
 
+def analytical_column_order(input_data: Mapping[str, Any]) -> tuple[str, ...]:
+    """The order of the result columns as the task was configured.
+
+    Task results are stored as JSON with alphabetically sorted keys, so the order a user asked
+    for ("id, region, amount") or the natural order of a summary (group columns, then metrics)
+    would otherwise be lost between the analysis and the report.
+    """
+    detail = input_data.get("detail")
+    if isinstance(detail, Mapping) and isinstance(detail.get("columns"), (list, tuple)):
+        return tuple(str(c) for c in detail["columns"])
+    aggregation = input_data.get("aggregation")
+    if isinstance(aggregation, Mapping):
+        group_by = [str(c) for c in aggregation.get("group_by", ())]
+        outputs = [str(a.get("output_column")) for a in aggregation.get("aggregations", ())
+                   if isinstance(a, Mapping) and a.get("output_column") is not None]
+        return tuple(group_by + outputs)
+    return ()
+
+
+def order_columns(rows: Sequence[Mapping[str, Any]], order: Sequence[str]) -> list[dict[str, Any]]:
+    """Rows with their keys in ``order`` (unknown extra keys are kept, after the ordered ones)."""
+    if not order:
+        return [dict(row) for row in rows]
+    wanted = list(order)
+    return [{**{c: row[c] for c in wanted if c in row},
+             **{k: v for k, v in row.items() if k not in wanted}} for row in rows]
+
+
+def _build_detail(raw: Any) -> tuple[tuple[str, ...], int] | None:
+    """Pass-through "show the rows" mode: (columns, limit). Rows are validated, never summarized."""
+    if raw is None:
+        return None
+    value = _require_mapping(raw, "detail")
+    _reject_unknown_fields(value, frozenset({"columns", "limit"}), "detail")
+    columns = _string_tuple(value.get("columns"), "detail.columns")
+    if not columns or len(set(columns)) != len(columns):
+        raise ValueError("detail.columns must be a non-empty list of distinct column names")
+    limit = value.get("limit")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100_000:
+        raise ValueError("detail.limit must be an integer between 1 and 100000")
+    return columns, limit
+
+
 def _build_aggregation(raw: Any) -> tuple[tuple[str, ...], tuple[AggregationSpec, ...]] | None:
     if raw is None:
         return None
@@ -234,8 +278,11 @@ def _parse_task_configuration(task: WorkflowTask) -> dict[str, Any]:
         describe_dataset(
             [], numeric_columns=descriptive[0], categorical_columns=descriptive[1]
         )
-    if aggregation is None and descriptive is None:
-        raise ValueError("at least one of aggregation or descriptive_statistics is required")
+    detail = _build_detail(payload.get("detail"))
+    if detail is not None and aggregation is not None:
+        raise ValueError("detail and aggregation are mutually exclusive")
+    if aggregation is None and descriptive is None and detail is None:
+        raise ValueError("at least one of aggregation, descriptive_statistics or detail is required")
 
     return {
         "source_task_key": source_task_key.strip(),
@@ -243,6 +290,7 @@ def _parse_task_configuration(task: WorkflowTask) -> dict[str, Any]:
         "quality_rules": rules,
         "aggregation": aggregation,
         "descriptive_statistics": descriptive,
+        "detail": detail,
     }
 
 
@@ -503,6 +551,20 @@ class WorkflowAnalyticalTaskExecutor:
                     rows, group_by=group_by, aggregations=specs
                 ).to_dict()
 
+            if config["detail"] is not None:
+                columns, limit = config["detail"]
+                # The source read limit + 1 rows so that "there is more" can be told apart from
+                # "that is all": only the first `limit` rows are kept.
+                kept = rows[:limit]
+                aggregation_result = {
+                    "kind": "detail",
+                    "columns": list(columns),
+                    "rows": [{name: row.get(name) for name in columns} for row in kept],
+                    "row_count": len(kept),
+                    "truncated": len(rows) > limit,
+                    "limit": limit,
+                }
+
             descriptive_result = None
             if config["descriptive_statistics"] is not None:
                 numeric_columns, categorical_columns = config["descriptive_statistics"]
@@ -553,7 +615,7 @@ class WorkflowAnalyticalTaskExecutor:
                     "source_row_count": len(rows),
                     "aggregation_group_count": (
                         None if aggregation_result is None
-                        else aggregation_result["group_count"]
+                        else aggregation_result.get("group_count", aggregation_result.get("row_count"))
                     ),
                 },
             )

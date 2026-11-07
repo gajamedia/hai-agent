@@ -24,8 +24,11 @@ from typing import Any, Mapping, Sequence
 from agent.llm.contracts import LLMMessage
 from agent.workflow.dataset import SUPPORTED_DATA_TYPES
 from agent.workflow.table_report_job import (
+    DEFAULT_LIST_LIMIT,
     MAX_FILTER_VALUE_LENGTH,
     MAX_FILTERS,
+    MAX_LIST_COLUMNS,
+    MAX_ORDER_BY,
     TableReportRequest,
 )
 
@@ -217,22 +220,24 @@ class TableReportPlanner:
         catalog = [
             {"table": e.table, "description": e.description,
              "columns": dict(e.columns), "key_column": e.key_column,
-             "filterable_columns": list(e.filterable_columns)}
+             "filterable_columns": list(e.filterable_columns),
+             "list_limit_max": e.row_limit - 1}
             for e in self.catalog.values()
         ]
         return (
-            "You plan a single-table aggregation report. Choose ONLY from this catalog; "
+            "You plan a single-table report. Choose ONLY from this catalog; "
             "never invent tables or columns.\n"
             f"CATALOG:\n{json.dumps(catalog, ensure_ascii=False)}\n\n"
             f"Allowed operations: {', '.join(ALLOWED_OPERATIONS)} "
             "(sum and avg need an integer/number column). "
             f"Allowed formats: {', '.join(REPORT_FORMATS)} (default json).\n"
-            "Supported: grouping by 1-3 columns and computing 1-5 metrics over one table, "
+            "There are two kinds of report. kind \"aggregate\" (the default) summarizes: "
+            "grouping by 1-3 columns and computing 1-5 metrics over one table, "
             "optionally with up to 3 EQUALITY filters (column = value) on that table's "
             "filterable_columns only. Use the filter value exactly as the user wrote it.\n"
             "NOT supported: ranges or comparisons (>, <, between, date ranges), OR conditions, "
             "'contains', filters on columns not in filterable_columns, joins, several tables, "
-            "raw SQL, forecasts.\n"
+            "raw SQL (you never write SQL), forecasts.\n"
             "If the question needs anything unsupported, answer "
             '{"supported": false, "reason": "<short reason, in the question\'s language>"}.\n'
             "Otherwise answer ONLY with this JSON (no markdown):\n"
@@ -241,8 +246,77 @@ class TableReportPlanner:
             '"filters": {"filterable_col": "value"}, '
             '"title": "short title", "format": "json"}\n'
             'Omit "filters" when the question has no condition. '
-            'For a row count use operation "count" and omit "column".'
+            'For a row count use operation "count" and omit "column".\n'
+            'kind "list" SHOWS THE ROWS THEMSELVES: use it for requests such as "tampilkan", '
+            '"daftar", "lihat data", "show", "list", "display". Answer ONLY with this JSON:\n'
+            '{"supported": true, "kind": "list", "table": "...", "columns": ["col1", "col2"], '
+            '"filters": {"filterable_col": "value"}, '
+            '"order_by": [{"column": "col", "direction": "desc"}], "limit": 100, '
+            '"title": "short title", "format": "json"}\n'
+            'columns: the columns the user asks for, or "all" for every column. order_by is optional '
+            '(at most 3 items, direction asc or desc). limit is the number of rows: 100 unless the user '
+            "asks for another number, and never more than the table's list_limit_max. "
+            "Use kind aggregate for totals, counts and averages."
         )
+
+    def _validate_list(self, entry: TableCatalogEntry, data: Mapping[str, Any]) -> TableReportRequest:
+        """A "show the rows" plan: columns, optional equality filters, order and a row limit."""
+        columns = entry.columns
+        raw_columns = data.get("columns")
+        if raw_columns == "all" or raw_columns == ["*"]:
+            selected = list(columns)[:MAX_LIST_COLUMNS]
+        else:
+            if (not isinstance(raw_columns, list) or not raw_columns
+                    or len(raw_columns) > MAX_LIST_COLUMNS
+                    or any(not isinstance(c, str) for c in raw_columns)
+                    or len(set(raw_columns)) != len(raw_columns)):
+                raise PlanValidationError(
+                    f"columns must be 1-{MAX_LIST_COLUMNS} distinct column names, or \"all\".")
+            unknown = [c for c in raw_columns if c not in columns]
+            if unknown:
+                raise PlanValidationError(f"Unknown columns {unknown}; columns: {sorted(columns)}.")
+            selected = list(raw_columns)
+
+        raw_order = data.get("order_by", [])
+        if raw_order is None:
+            raw_order = []
+        if not isinstance(raw_order, list) or len(raw_order) > MAX_ORDER_BY:
+            raise PlanValidationError(f"order_by must be a list of at most {MAX_ORDER_BY} items.")
+        order: list[tuple[str, str]] = []
+        for item in raw_order:
+            if not isinstance(item, Mapping):
+                raise PlanValidationError('Each order_by item must be {"column": ..., "direction": "asc"|"desc"}.')
+            column, direction = item.get("column"), str(item.get("direction", "asc")).lower()
+            if not isinstance(column, str) or column not in columns:
+                raise PlanValidationError(f"Unknown order_by column {column!r}; columns: {sorted(columns)}.")
+            if direction not in {"asc", "desc"}:
+                raise PlanValidationError("order_by direction must be asc or desc.")
+            if any(column == existing for existing, _ in order):
+                raise PlanValidationError(f"order_by lists {column!r} twice.")
+            order.append((column, direction))
+
+        maximum = entry.row_limit - 1
+        limit = data.get("limit", min(DEFAULT_LIST_LIMIT, maximum))
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
+            raise PlanValidationError(
+                f"limit must be a whole number between 1 and {maximum} (list_limit_max of this table).")
+
+        filters = self._validate_filters(entry, data.get("filters"))
+        fmt = data.get("format", "json")
+        if fmt not in REPORT_FORMATS:
+            raise PlanValidationError(f"format must be one of {list(REPORT_FORMATS)}.")
+        title = data.get("title")
+        title = title.strip()[:200] if isinstance(title, str) and title.strip() else f"Rows: {entry.table}"
+
+        used = set(selected) | {c for c, _ in order}
+        try:
+            return TableReportRequest(
+                table=entry.table, columns={n: columns[n] for n in columns if n in used},
+                group_by=(), metrics=(), title=title, report_format=fmt, row_limit=entry.row_limit,
+                filters=filters, kind="list", select_columns=tuple(selected),
+                order_by=tuple(order), limit=limit)
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
 
     def _validate(self, data: Mapping[str, Any]) -> TableReportRequest:
         table = data.get("table")
@@ -251,6 +325,11 @@ class TableReportPlanner:
             raise PlanValidationError(
                 f"Unknown table {table!r}. Choose one of: {sorted(self.catalog)}.")
         columns = entry.columns
+        kind = data.get("kind", "aggregate")
+        if kind == "list":
+            return self._validate_list(entry, data)
+        if kind != "aggregate":
+            raise PlanValidationError(f"kind must be 'aggregate' or 'list', got {kind!r}.")
 
         group_by = data.get("group_by")
         if (not isinstance(group_by, list) or not group_by or len(group_by) > MAX_GROUP_BY

@@ -23,6 +23,7 @@ from agent.workflow.contracts import TaskStatus, WorkflowStatus, WorkflowTask
 from agent.workflow.analytics import ANALYTICAL_TASK_TYPE
 
 
+from agent.workflow.analytics import analytical_column_order, order_columns
 from agent.workflow.report_renderers import render_pdf, render_xlsx
 
 REPORT_TASK_TYPE = "report.generate"
@@ -294,6 +295,16 @@ class WorkflowReportTaskExecutor:
         if analytical["dataset_validation"].get("valid") is not True or analytical["data_quality"].get("valid") is not True:
             raise WorkflowReportGenerationError("Analytical validation did not pass.", task=task, error_code="analytical_result_not_verified")
 
+        aggregation = analytical["aggregation"]
+        order = analytical_column_order(dict(source.input_data or {}))
+        if order and isinstance(aggregation, Mapping) and isinstance(aggregation.get("rows"), list):
+            # Stored results have alphabetical keys; restore the configured column order for every format.
+            aggregation = {**aggregation, "rows": order_columns(aggregation["rows"], order)}
+        detail = aggregation if isinstance(aggregation, Mapping) else {}
+        if detail.get("kind") == "detail" and detail.get("truncated"):
+            # A cut-off listing must say so in every format, including the file itself.
+            title = f"{title.strip()} (first {detail.get('limit')} rows)"[:200]
+
         if output_format == "json":
             report = {
                 "report_version": 1,
@@ -309,23 +320,23 @@ class WorkflowReportTaskExecutor:
                 },
                 "validation": analytical["dataset_validation"],
                 "data_quality": analytical["data_quality"],
-                "aggregation": analytical["aggregation"],
+                "aggregation": aggregation,
                 "descriptive_statistics": analytical["descriptive_statistics"],
             }
             content = _json_bytes(report)
             filename, media_type = "report.json", "application/json; charset=utf-8"
         elif output_format == "csv":
-            content = _csv_bytes(analytical["aggregation"])
+            content = _csv_bytes(aggregation)
             filename, media_type = "report.csv", "text/csv; charset=utf-8"
         elif output_format == "html":
-            content = _html_bytes(title=title.strip(), aggregation=analytical["aggregation"])
+            content = _html_bytes(title=title.strip(), aggregation=aggregation)
             filename, media_type = "report.html", "text/html; charset=utf-8"
         elif output_format == "xlsx":
-            content = _xlsx_bytes(title=title.strip(), aggregation=analytical["aggregation"])
+            content = _xlsx_bytes(title=title.strip(), aggregation=aggregation)
             filename = "report.xlsx"
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         else:
-            content = _pdf_bytes(title=title.strip(), aggregation=analytical["aggregation"])
+            content = _pdf_bytes(title=title.strip(), aggregation=aggregation)
             filename, media_type = "report.pdf", "application/pdf"
 
         if len(content) > self.max_report_bytes:

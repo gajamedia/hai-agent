@@ -340,4 +340,95 @@ describe("DataReports", () => {
     await screen.findByLabelText("Rencana laporan");
     expect(screen.queryByRole("status")).toBeNull();
   });
+
+  it("shows a listing plan as columns, order and a row limit instead of group and metrics", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue({
+      status: "planned", plan_id: "p9", database: "sales",
+      plan: {
+        kind: "list", table: "sales", group_by: [], metrics: [], filters: { region: "west" }, format: "pdf",
+        columns: ["id", "region", "amount"], limit: 50, order_by: [{ column: "amount", direction: "desc" }],
+      },
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "tampilkan data");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    const card = (await screen.findByLabelText("Rencana laporan")).textContent;
+    expect(card).toMatch(/daftar baris/);
+    expect(card).toMatch(/Kolom: id, region, amount/);
+    expect(card).toMatch(/Urutan: amount menurun/);
+    expect(card).toMatch(/Maksimal: 50 baris/);
+    expect(card).toMatch(/region = west/);
+    expect(card).not.toMatch(/Kelompokkan per|Hitung:/);
+  });
+
+  it("says plainly when a listing was cut off, and how many rows the file holds", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    const plan = { kind: "list", table: "sales", group_by: [], metrics: [], filters: {}, format: "xlsx",
+                   columns: ["id"], limit: 1000, order_by: [] };
+    api.createReportPlan.mockResolvedValue({ status: "planned", plan_id: "p9", database: "sales", plan });
+    api.runReportPlan.mockResolvedValue({
+      status: "succeeded", kind: "list", plan, row_count: 1000, limit_reached: true,
+      rows: Array.from({ length: 200 }, (_, i) => ({ id: i + 1 })),
+      download: { url: "/x", filename: "report.xlsx" },
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "tampilkan semua");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await user.click(await screen.findByRole("button", { name: "Jalankan" }));
+    await screen.findByRole("table", { name: "Hasil laporan" });
+    const page = document.body.textContent;
+    expect(page).toMatch(/menampilkan 200 dari 1000 baris/);
+    expect(page).toMatch(/Dibatasi 1000 baris pertama/);
+    expect(page).toMatch(/Masih ada baris lain di database/);
+    expect(page).toMatch(/Layar menampilkan 200 baris pertama\. File yang diunduh memuat semua 1000 baris/);
+    expect(screen.getByRole("table", { name: "Hasil laporan" }).querySelectorAll("tbody tr")).toHaveLength(200);
+  });
+
+  it("does not warn about a cut-off when the whole listing fits", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    const plan = { kind: "list", table: "sales", group_by: [], metrics: [], filters: {}, format: "json",
+                   columns: ["id"], limit: 100, order_by: [] };
+    api.createReportPlan.mockResolvedValue({ status: "planned", plan_id: "p9", database: "sales", plan });
+    api.runReportPlan.mockResolvedValue({
+      status: "succeeded", kind: "list", plan, row_count: 3, limit_reached: false,
+      rows: [{ id: 1 }, { id: 2 }, { id: 3 }], download: null,
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "tampilkan");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await user.click(await screen.findByRole("button", { name: "Jalankan" }));
+    await screen.findByRole("table", { name: "Hasil laporan" });
+    expect(document.body.textContent).toMatch(/menampilkan 3 dari 3 baris/);
+    expect(document.body.textContent).not.toMatch(/Dibatasi|Layar menampilkan/);
+  });
+
+  it("keeps the summary wording for an aggregate report", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue(PLAN);
+    api.runReportPlan.mockResolvedValue({
+      status: "succeeded", kind: "aggregate", plan: PLAN.plan, row_count: 1, limit_reached: false,
+      rows: [{ region: "west", revenue: 217 }],
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect((await screen.findByLabelText("Rencana laporan")).textContent).toMatch(/Kelompokkan per: region/);
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    await screen.findByRole("table", { name: "Hasil laporan" });
+    expect(document.body.textContent).toMatch(/Laporan selesai: sales per region/);
+    expect(document.body.textContent).not.toMatch(/Daftar baris dari/);
+  });
 });

@@ -225,3 +225,93 @@ def test_filtered_question_to_report_end_to_end(env):  # noqa: F811
         (revenue,) = db.execute("SELECT SUM(amount) FROM sales WHERE region='west'").fetchone()
     assert report["aggregation"]["rows"][0]["revenue"] == pytest.approx(revenue)
     assert "[filter: region=west]" in report["title"]
+
+
+# ------------------------------------------------------------------ kind "list"
+def _list_answer(**fields):
+    body = {"supported": True, "kind": "list", "table": "sales", "columns": ["id", "region", "amount"]}
+    body.update(fields)
+    return json.dumps(body)
+
+
+def test_a_list_plan_becomes_a_list_request_with_catalog_owned_limits():
+    planner, _ = _planner(_list_answer(order_by=[{"column": "amount", "direction": "DESC"}], limit=25,
+                                       filters={"region": "west"}, format="pdf", title="Top sales"))
+    result = planner.plan("tampilkan 25 penjualan terbesar di west")
+    assert result.ok and result.attempts == 1
+    req = result.request
+    assert req.kind == "list" and req.select_columns == ("id", "region", "amount")
+    assert req.order_by == (("amount", "desc"), ) and req.limit == 25      # direction is normalized
+    assert dict(req.filters) == {"region": "west"} and req.report_format == "pdf"
+    assert req.row_limit == 500 and req.group_by == () and req.metrics == ()
+    assert req.columns["amount"] == "number"                               # types come from the catalog
+
+
+def test_the_limit_defaults_to_one_hundred_and_all_columns_can_be_asked_for():
+    planner, _ = _planner(_list_answer(columns="all"))
+    req = planner.plan("tampilkan data").request
+    assert req.select_columns == tuple(COLUMNS) and req.limit == 100 and req.order_by == ()
+    planner, _ = _planner(_list_answer(columns=["*"]))
+    assert planner.plan("x").request.select_columns == tuple(COLUMNS)
+
+
+def test_a_missing_kind_still_means_an_aggregate_report():
+    planner, _ = _planner(GOOD)                         # the answer from before lists existed
+    req = planner.plan("x").request
+    assert req.kind == "aggregate" and req.group_by == ("region",)
+
+
+@pytest.mark.parametrize("fields,needle", [
+    ({"columns": ["nope"]}, "Unknown columns"), ({"columns": []}, "columns must be"),
+    ({"columns": ["id", "id"]}, "distinct"), ({"columns": [5]}, "columns must be"),
+    ({"limit": 0}, "limit must be"), ({"limit": 500}, "between 1 and 499"),
+    ({"limit": True}, "limit must be"), ({"limit": "10"}, "limit must be"), ({"limit": 2.5}, "limit must be"),
+    ({"order_by": "amount"}, "list of at most"),
+    ({"order_by": [{"column": "nope"}]}, "Unknown order_by"),
+    ({"order_by": [{"column": "amount", "direction": "up"}]}, "asc or desc"),
+    ({"order_by": ["amount"]}, "Each order_by item"),
+    ({"order_by": [{"column": "id"}, {"column": "id", "direction": "desc"}]}, "twice"),
+    ({"order_by": [{"column": c} for c in ("id", "region", "product", "amount")]}, "at most"),
+    ({"filters": {"amount": 1}}, "Cannot filter"),
+    ({"format": "docx"}, "format must be"),
+])
+def test_invalid_list_plans_are_rejected_with_a_specific_reason(fields, needle):
+    answer = _list_answer(**fields)
+    planner, _ = _planner(answer, answer)
+    result = planner.plan("x")
+    assert not result.ok and needle in result.errors[-1]
+
+
+def test_an_unknown_kind_is_rejected():
+    answer = json.dumps({"supported": True, "kind": "pivot", "table": "sales"})
+    planner, _ = _planner(answer, answer)
+    assert "kind must be" in planner.plan("x").errors[-1]
+
+
+def test_a_list_plan_cannot_smuggle_sql():
+    answer = _list_answer(columns=["id; DROP TABLE sales"], order_by=[{"column": "amount; --"}])
+    planner, _ = _planner(answer, answer)
+    result = planner.plan("x")
+    assert not result.ok and "Unknown columns" in result.errors[-1]
+
+
+def test_the_invalid_list_answer_is_retried_once_with_the_exact_error():
+    planner, provider = _planner(_list_answer(limit=9999), _list_answer(limit=10))
+    result = planner.plan("x")
+    assert result.ok and result.attempts == 2 and result.request.limit == 10
+    assert "between 1 and 499" in provider.requests[1].messages[-1].content
+
+
+def test_the_prompt_teaches_both_kinds_and_states_the_row_limit_but_never_asks_for_sql():
+    planner, provider = _planner(GOOD)
+    planner.plan("x")
+    system = provider.requests[0].messages[0].content
+    assert 'kind "list"' in system and "tampilkan" in system and '"list_limit_max": 499' in system
+    assert "order_by" in system and 'kind "aggregate"' in system
+    assert "you never write SQL" in system
+
+
+def test_list_and_aggregate_requests_share_the_catalog_columns_but_not_the_rules():
+    planner, _ = _planner(_list_answer(columns=["region"]))
+    req = planner.plan("x").request
+    assert req.required_non_null_columns == () and req.unique_key_columns == ()    # a listing shows data as it is

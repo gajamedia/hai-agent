@@ -56,6 +56,7 @@ logger = logging.getLogger("hai_agent.database_registry")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 MAX_TABLES = 20
+LIST_READ_LIMIT = 1001
 MAX_COLUMNS_PER_TABLE = 100
 
 
@@ -385,8 +386,11 @@ class DatabaseRuntimeRegistry:
                 if not isinstance(filterable, list) or not isinstance(required, list):
                     raise RegistryError(f"'{table}': filterable/required must be lists")
                 try:
+                    # Every approved column may be used to sort. max_limit 1001 lets a listing
+                    # hold 1000 rows plus the one extra row that shows "there is more".
                     spec = ReadOnlyTableSpec(
-                        table=table, columns=tuple(columns), filterable_columns=tuple(filterable))
+                        table=table, columns=tuple(columns), filterable_columns=tuple(filterable),
+                        sortable_columns=tuple(columns), max_limit=LIST_READ_LIMIT)
                     unknown_cols = [c for c in columns if c not in types]
                     if unknown_cols:
                         raise RegistryError(f"'{table}': unknown columns {unknown_cols}")
