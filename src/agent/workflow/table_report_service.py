@@ -9,10 +9,11 @@ with or replay another run's workflow.
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 MAX_QUESTION_LENGTH = 1000
+REPORT_FORMATS = ("json", "csv", "html", "xlsx", "pdf")
 
 
 @dataclass(frozen=True)
@@ -36,12 +37,20 @@ class TableReportService:
         self.runner = runner
         self.experience = experience  # optional ConnectionExperience (best effort)
 
-    def plan(self, question: str) -> Any:
-        """Phase 1: turn a question into a validated plan. Reads no data."""
+    def plan(self, question: str, report_format: str | None = None) -> Any:
+        """Phase 1: turn a question into a validated plan. Reads no data.
+
+        ``report_format`` (chosen by the user) overrides whatever format the LLM picked.
+        """
         question = (question or "").strip()
         if not question or len(question) > MAX_QUESTION_LENGTH:
             raise ValueError(f"question must be 1-{MAX_QUESTION_LENGTH} characters")
-        return self.planner.plan(question)
+        if report_format is not None and report_format not in REPORT_FORMATS:
+            raise ValueError(f"format must be one of {', '.join(REPORT_FORMATS)}")
+        plan = self.planner.plan(question)
+        if plan.ok and report_format is not None:
+            plan = replace(plan, request=replace(plan.request, report_format=report_format))
+        return plan
 
     @staticmethod
     def summarize(req: Any) -> dict[str, Any]:
@@ -51,9 +60,10 @@ class TableReportService:
             "filters": dict(req.filters), "format": req.report_format,
         }
 
-    def ask(self, question: str, *, execution_context: Any) -> AskOutcome:
+    def ask(self, question: str, *, execution_context: Any,
+            report_format: str | None = None) -> AskOutcome:
         """Plan and run in one call."""
-        plan = self.plan(question)
+        plan = self.plan(question, report_format)
         return self.run_plan(plan.question, plan, execution_context=execution_context)
 
     def run_plan(self, question: str, plan: Any, *, execution_context: Any) -> AskOutcome:

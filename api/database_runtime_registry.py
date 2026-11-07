@@ -154,6 +154,11 @@ class DatabaseRuntimeRegistry:
                     "name TEXT PRIMARY KEY, filename TEXT NOT NULL, connected_by TEXT NOT NULL,"
                     "connected_at TEXT NOT NULL, approved_by TEXT NOT NULL, approved_at TEXT NOT NULL,"
                     "selection_json TEXT NOT NULL, fingerprint TEXT NOT NULL)")
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS reports (workflow_id TEXT PRIMARY KEY, "
+                    "owner TEXT NOT NULL, database_name TEXT NOT NULL, relative_path TEXT NOT NULL, "
+                    "filename TEXT NOT NULL, media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, "
+                    "created_at TEXT NOT NULL)")
                 have = {r[1] for r in db.execute("PRAGMA table_info(connections)")}
                 if "engine" not in have:
                     db.execute("ALTER TABLE connections ADD COLUMN engine TEXT NOT NULL "
@@ -250,6 +255,41 @@ class DatabaseRuntimeRegistry:
         return _Connection(name=name, filename=source.strip(), engine=engine,
                            approved_by=actor_id, approved_at=approved_at, manager=manager,
                            schema=schema, warnings=tuple(warnings))
+
+    # ------------------------------------------------------------- reports
+    def record_report(self, *, owner: str, database: str, workflow_id: str,
+                      artifact: Mapping[str, Any]) -> None:
+        """Remember who produced a report file so only they can download it."""
+        db = self._persist_conn()
+        try:
+            with db:
+                db.execute(
+                    "INSERT OR REPLACE INTO reports VALUES (?,?,?,?,?,?,?,?)",
+                    (workflow_id, owner, database, str(artifact["relative_path"]),
+                     str(artifact["filename"]), str(artifact["media_type"]),
+                     int(artifact["size_bytes"]), datetime.now(timezone.utc).isoformat()))
+        finally:
+            db.close()
+
+    def find_report(self, owner: str, workflow_id: str) -> dict[str, Any] | None:
+        """The report's metadata and a verified path, or None (unknown or not the owner's)."""
+        db = self._persist_conn()
+        try:
+            row = db.execute("SELECT * FROM reports WHERE workflow_id = ? AND owner = ?",
+                             (workflow_id, owner)).fetchone()
+        finally:
+            db.close()
+        if row is None:
+            return None
+        root = (self.work_dir / "artifacts" / row["database_name"]).resolve()
+        path = (root / row["relative_path"]).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return None  # a tampered index row must never reach outside the artifacts folder
+        if not path.is_file():
+            return None
+        return {**dict(row), "path": path}
 
     def supported_engine_names(self) -> list[str]:
         """Product names users might type when asking for an engine (already supported ones)."""

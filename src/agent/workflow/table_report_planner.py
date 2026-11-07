@@ -31,7 +31,7 @@ from agent.workflow.table_report_job import (
 
 ALLOWED_OPERATIONS = ("count", "count_distinct", "sum", "avg", "min", "max")
 NUMERIC_TYPES = frozenset({"integer", "number"})
-REPORT_FORMATS = ("json", "csv", "html", "xlsx")
+REPORT_FORMATS = ("json", "csv", "html", "xlsx", "pdf")
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 MAX_GROUP_BY = 3
 MAX_METRICS = 5

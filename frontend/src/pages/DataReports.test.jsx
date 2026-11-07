@@ -13,6 +13,7 @@ vi.mock("../api/client", () => ({
   createReportPlan: vi.fn(),
   runReportPlan: vi.fn(),
   cancelReportPlan: vi.fn(),
+  downloadReport: vi.fn(),
   getDatabaseSchema: vi.fn(),
   listDatabaseProfiles: vi.fn(),
   listEngineRequests: vi.fn(),
@@ -205,5 +206,62 @@ describe("DataReports", () => {
     await user.click(screen.getByRole("button", { name: /Kirim permintaan/ }));
     expect(api.createEngineRequest).toHaveBeenCalledWith({ engine: "Oracle 19c", reason: "finance" });
     expect(await screen.findByText(/Oracle 19c · open/)).toBeTruthy();
+  });
+
+  it("sends the chosen file format with the plan and downloads the file with the token-based client", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue({ ...PLAN, plan: { ...PLAN.plan, format: "xlsx" } });
+    api.runReportPlan.mockResolvedValue({
+      status: "succeeded",
+      plan: PLAN.plan,
+      rows: [{ region: "west", revenue: 217 }],
+      download: { url: "/api/v1/table-reports/reports/w1/download", filename: "report.xlsx" },
+    });
+    const blob = new Blob(["x"]);
+    api.downloadReport.mockResolvedValue({ blob, filename: "report-abcd1234.xlsx" });
+    const created = [];
+    globalThis.URL.createObjectURL = vi.fn((b) => { created.push(b); return "blob:fake"; });
+    globalThis.URL.revokeObjectURL = vi.fn();
+    const clicked = [];
+    const realClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () { clicked.push(this.download); };
+
+    try {
+      renderPage();
+      await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+      await user.selectOptions(screen.getByLabelText("Hasil"), "xlsx");
+      await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+      expect(api.createReportPlan).toHaveBeenCalledWith(
+        expect.objectContaining({ question: "total", format: "xlsx" }),
+      );
+      expect((await screen.findByLabelText("Rencana laporan")).textContent).toMatch(/File: XLSX/);
+      await user.click(screen.getByRole("button", { name: "Jalankan" }));
+      await user.click(await screen.findByRole("button", { name: "Unduh XLSX" }));
+      expect(api.downloadReport).toHaveBeenCalledWith("/api/v1/table-reports/reports/w1/download");
+      expect(created).toEqual([blob]);
+      expect(clicked).toEqual(["report-abcd1234.xlsx"]);
+      expect(globalThis.URL.revokeObjectURL).toHaveBeenCalledWith("blob:fake");
+    } finally {
+      HTMLAnchorElement.prototype.click = realClick;
+    }
+  });
+
+  it("omits the format when the user keeps the default and shows no download button without a file", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.createReportPlan.mockResolvedValue(PLAN);
+    api.runReportPlan.mockResolvedValue({ status: "succeeded", plan: PLAN.plan, rows: [{ region: "w", revenue: 1 }], download: null });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "total");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(api.createReportPlan.mock.calls[0][0].format).toBeUndefined();
+    await user.click(await screen.findByRole("button", { name: "Jalankan" }));
+    await screen.findByRole("table", { name: "Hasil laporan" });
+    expect(screen.queryByRole("button", { name: /Unduh/ })).toBeNull();
   });
 });

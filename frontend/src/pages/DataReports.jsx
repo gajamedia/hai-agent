@@ -6,6 +6,7 @@ import {
   cancelReportPlan,
   createEngineRequest,
   createReportPlan,
+  downloadReport,
   connectDatabase,
   disconnectDatabase,
   getDatabaseSchema,
@@ -169,6 +170,7 @@ export default function DataReports() {
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState(null);
   const [plan, setPlan] = useState(null);
+  const [format, setFormat] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -260,6 +262,7 @@ export default function DataReports() {
       const data = await createReportPlan({
         question: question.trim(),
         database: selected || undefined,
+        format: format || undefined,
       });
       if (data.status === "planned") setPlan(data);
       else setResult(data);
@@ -272,6 +275,19 @@ export default function DataReports() {
       const key = globalThis.crypto?.randomUUID?.() ?? `run-${Date.now()}`;
       setResult(await runReportPlan(plan.plan_id, key));
       setPlan(null);
+    });
+
+  const saveFile = (info) =>
+    guarded(async () => {
+      const { blob, filename } = await downloadReport(info.url);
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(href);
     });
 
   const dropPlan = () =>
@@ -408,6 +424,16 @@ export default function DataReports() {
                     placeholder="Total penjualan widget per wilayah"
                   />
                 </label>
+                <label>
+                  Hasil
+                  <select value={format} onChange={(e) => setFormat(e.target.value)}>
+                    <option value="">Tampilan di layar (file JSON tersedia)</option>
+                    <option value="xlsx">Tampilan di layar + file Excel</option>
+                    <option value="pdf">Tampilan di layar + file PDF</option>
+                    <option value="html">Tampilan di layar + file HTML</option>
+                    <option value="csv">Tampilan di layar + file CSV</option>
+                  </select>
+                </label>
                 <button
                   className="at-button at-button-primary"
                   disabled={busy || !question.trim() || !active.length}
@@ -419,6 +445,7 @@ export default function DataReports() {
                 <div className="at-config-summary" style={{ marginTop: 16 }} aria-label="Rencana laporan">
                   <b>Rencana (belum ada data yang dibaca)</b>
                   <span>Tabel: {plan.plan.table}</span>
+                  <span>File: {String(plan.plan.format || "json").toUpperCase()}</span>
                   <span>Kelompokkan per: {plan.plan.group_by.join(", ")}</span>
                   <span>
                     Hitung: {plan.plan.metrics.map((m) => `${m.operation}(${m.column || "*"})`).join(", ")}
@@ -447,6 +474,17 @@ export default function DataReports() {
                         {Object.keys(filters).length ? `, filter ${JSON.stringify(filters)}` : ""}.
                       </p>
                       <ResultTable rows={result.rows} />
+                      {result.download && (
+                        <button
+                          type="button"
+                          className="at-button"
+                          style={{ marginTop: 12 }}
+                          disabled={busy}
+                          onClick={() => saveFile(result.download)}
+                        >
+                          Unduh {String(result.download.filename || "file").split(".").pop().toUpperCase()}
+                        </button>
+                      )}
                     </>
                   )}
                   {result.status === "unsupported" && (

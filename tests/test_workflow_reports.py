@@ -128,7 +128,7 @@ def test_source_analysis_is_not_modified(tmp_path):
 
 
 @pytest.mark.parametrize("bad_input", [
-    {"source_task_key": "analyze", "format": "pdf"},
+    {"source_task_key": "analyze", "format": "docx"},
     {"source_task_key": "analyze", "format": "json", "file_path": "../../evil"},
     {"source_task_key": "", "format": "json"},
 ])

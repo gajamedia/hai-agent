@@ -271,3 +271,23 @@ export async function cancelReportPlan(planId, signal) {
     signal,
   });
 }
+
+// Report files need the bearer token, so a plain link cannot be used: fetch, then save the blob.
+export async function downloadReport(url, signal) {
+  const headers = {};
+  if (accessTokenProvider) {
+    const token = await accessTokenProvider();
+    if (!token || typeof token !== "string") {
+      throw new Error("Sesi Keycloak tidak memiliki access token yang valid.");
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const response = await fetch(`${API_BASE_URL}${url}`, { headers, signal });
+  if (!response.ok) {
+    await parseResponse(response); // throws a readable error from the JSON body
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+  return { blob: await response.blob(), filename: match ? match[1] : "report" };
+}

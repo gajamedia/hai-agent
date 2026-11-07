@@ -83,7 +83,7 @@ def test_invalid_answer_is_retried_once_with_the_exact_error():
       "metrics": [{"output": "Bad Name", "operation": "count"}]}, "snake_case"),
     ({"table": "sales", "group_by": ["region"],
       "metrics": [{"output": "region", "operation": "count"}]}, "Duplicate output"),
-    ({"table": "sales", "group_by": ["region"], "format": "pdf",
+    ({"table": "sales", "group_by": ["region"], "format": "docx",
       "metrics": [{"output": "n", "operation": "count"}]}, "format"),
 ])
 def test_hallucinated_or_unsafe_plans_are_rejected(answer, needle):

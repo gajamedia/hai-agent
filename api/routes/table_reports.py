@@ -5,6 +5,7 @@ import threading
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import Response
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
@@ -16,6 +17,7 @@ from api.database_runtime_registry import (
     DatabaseRuntimeRegistry, RegistryError, RegistryNotFound,
 )
 from api.table_report_plans import PlanConflict, PlanNotFound, PlanStore
+from agent.workflow.table_report_service import REPORT_FORMATS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/table-reports", tags=["table-reports"])
@@ -45,13 +47,17 @@ def _principal(request: Request):
     return principal
 
 
-def _parse(payload: dict[str, Any]) -> tuple[str, str | None]:
-    unknown = set(payload) - {"question", "database"}
+def _parse(payload: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    unknown = set(payload) - {"question", "database", "format"}
     question, database = payload.get("question"), payload.get("database")
-    if unknown or not isinstance(question, str) or not (database is None or isinstance(database, str)):
+    report_format = payload.get("format")
+    if (unknown or not isinstance(question, str)
+            or not (database is None or isinstance(database, str))
+            or not (report_format is None or report_format in REPORT_FORMATS)):
         raise _error(422, "invalid_request",
-                     "Body must be {\"question\": \"<text>\", \"database\": \"<name, optional>\"}.")
-    return question, database
+                     "Body must be {\"question\": \"<text>\", \"database\": \"<name, optional>\", "
+                     "\"format\": \"<" + "|".join(REPORT_FORMATS) + ", optional>\"}.")
+    return question, database, report_format
 
 
 def _service(request: Request, database: str | None) -> tuple[TableReportService, str | None]:
@@ -71,9 +77,25 @@ def _service(request: Request, database: str | None) -> tuple[TableReportService
     return service, None
 
 
-def _body(outcome) -> dict[str, Any]:
+def _body(request: Request, outcome, principal=None, database: str | None = None) -> dict[str, Any]:
     # Unsupported questions are a valid answer, not a server fault.
+    download = None
+    registry = getattr(request.app.state, "database_runtime_registry", None)
+    if (outcome.artifact and principal is not None and database
+            and isinstance(registry, DatabaseRuntimeRegistry)):
+        try:
+            registry.record_report(owner=principal.actor_id, database=database,
+                                   workflow_id=outcome.workflow_id, artifact=outcome.artifact)
+            download = {
+                "url": f"/api/v1/table-reports/reports/{outcome.workflow_id}/download",
+                "filename": outcome.artifact.get("filename"),
+                "media_type": outcome.artifact.get("media_type"),
+                "size_bytes": outcome.artifact.get("size_bytes"),
+            }
+        except Exception:  # the on-screen result must not depend on the download index
+            logger.warning("Could not index the report file.", exc_info=True)
     return {
+        "download": download,
         "status": outcome.status, "question": outcome.question, "reason": outcome.reason,
         "workflow_id": outcome.workflow_id, "error_code": outcome.error_code,
         "failed_task": outcome.failed_task_key, "artifact": outcome.artifact,
@@ -98,27 +120,28 @@ def _plans(request: Request) -> PlanStore:
 def ask_table_report(request: Request, payload: dict[str, Any] = Body(...)):
     """Plan and run in one call: a validated, read-only table report."""
     principal = _principal(request)
-    question, database = _parse(payload)
-    service, _ = _service(request, database)
+    question, database, report_format = _parse(payload)
+    service, name = _service(request, database)
     try:
-        outcome = service.ask(question, execution_context=TrustedExecutionContext(principal))
+        outcome = service.ask(question, execution_context=TrustedExecutionContext(principal),
+                              report_format=report_format)
     except ValueError as exc:
         raise _error(422, "invalid_question", str(exc)) from exc
     except Exception as exc:  # LLM unavailable, store failure, ...
         logger.exception("Table report request failed.")
         raise _error(503, "table_report_failed",
                      "The report could not be produced right now.") from exc
-    return _body(outcome)
+    return _body(request, outcome, principal, name)
 
 
 @router.post("/plans", status_code=201)
 def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
     """Phase 1: generate a plan for review. No data is read."""
     principal = _principal(request)
-    question, database = _parse(payload)
+    question, database, report_format = _parse(payload)
     service, name = _service(request, database)
     try:
-        plan = service.plan(question)
+        plan = service.plan(question, report_format)
     except ValueError as exc:
         raise _error(422, "invalid_question", str(exc)) from exc
     except Exception as exc:
@@ -180,9 +203,38 @@ def run_plan(plan_id: str, request: Request, payload: dict[str, Any] = Body(defa
         logger.exception("Table report run failed.")
         raise _error(503, "table_report_failed",
                      "The report could not be produced right now.") from exc
-    result = _body(outcome)
+    result = _body(request, outcome, principal, stored.database)
     store.finish(stored, result)
     return {**result, "replayed": False}
+
+
+_EXTENSIONS = {"application/json": "json", "text/csv": "csv", "text/html": "html",
+               "application/pdf": "pdf",
+               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"}
+
+
+@router.get("/reports/{workflow_id}/download")
+def download_report(workflow_id: str, request: Request):
+    """Download a report file you produced (Excel, PDF, CSV, HTML or JSON)."""
+    principal = _principal(request)
+    registry = getattr(request.app.state, "database_runtime_registry", None)
+    found = (registry.find_report(principal.actor_id, workflow_id)
+             if isinstance(registry, DatabaseRuntimeRegistry) else None)
+    if found is None:
+        raise _error(404, "report_not_found", "No such report file.")
+    media = found["media_type"].split(";")[0].strip()
+    extension = _EXTENSIONS.get(media)
+    if extension is None:
+        raise _error(404, "report_not_found", "No such report file.")
+    return Response(
+        content=found["path"].read_bytes(), media_type=found["media_type"],
+        headers={
+            "Content-Disposition": f'attachment; filename="report-{workflow_id[:8]}.{extension}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+            # Even if a browser rendered the file, it could not run script or load anything.
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        })
 
 
 @router.delete("/plans/{plan_id}")

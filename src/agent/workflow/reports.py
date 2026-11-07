@@ -23,9 +23,11 @@ from agent.workflow.contracts import TaskStatus, WorkflowStatus, WorkflowTask
 from agent.workflow.analytics import ANALYTICAL_TASK_TYPE
 
 
+from agent.workflow.report_renderers import render_pdf, render_xlsx
+
 REPORT_TASK_TYPE = "report.generate"
 _ALLOWED_INPUT_FIELDS = frozenset({"source_task_key", "title", "format"})
-_REPORT_FORMATS = frozenset({"json", "csv", "html", "xlsx"})
+_REPORT_FORMATS = frozenset({"json", "csv", "html", "xlsx", "pdf"})
 
 
 class WorkflowReportGenerationError(RuntimeError):
@@ -67,11 +69,12 @@ class LocalArtifactStore:
             raise TypeError("content must be bytes")
         if len(content) > self.max_artifact_bytes:
             raise ArtifactPersistenceError("artifact exceeds configured size limit")
-        if filename not in {"report.json", "report.csv", "report.html", "report.xlsx"}:
+        if filename not in {"report.json", "report.csv", "report.html", "report.xlsx",
+                            "report.pdf"}:
             raise ArtifactPersistenceError("unsupported artifact filename")
         if media_type not in {
             "application/json; charset=utf-8", "text/csv; charset=utf-8",
-            "text/html; charset=utf-8",
+            "text/html; charset=utf-8", "application/pdf",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }:
             raise ArtifactPersistenceError("unsupported artifact media type")
@@ -132,6 +135,9 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
         raise ValueError("report contains values that are not strict JSON") from exc
 
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _csv_bytes(aggregation: Any) -> bytes:
     if not isinstance(aggregation, Mapping):
         raise ValueError("CSV report requires an aggregation result")
@@ -151,6 +157,10 @@ def _csv_bytes(aggregation: Any) -> bytes:
         for key, value in row.items():
             if isinstance(value, (dict, list)):
                 safe_row[key] = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True)
+            elif isinstance(value, str) and value[:1] in _CSV_FORMULA_PREFIXES:
+                # Spreadsheet apps run cells starting with = + - @ as formulas; a
+                # leading apostrophe keeps database text from being executed.
+                safe_row[key] = "'" + value
             else:
                 safe_row[key] = value
         writer.writerow(safe_row)
@@ -200,53 +210,17 @@ def _html_bytes(*, title: str, aggregation: Any) -> bytes:
 
 
 def _xlsx_bytes(*, title: str, aggregation: Any) -> bytes:
-    """Produce a minimal, dependency-free XLSX workbook from validated rows.
-
-    Formula cells are deliberately never emitted: all user/data values become
-    inline strings, preventing spreadsheet formula injection on open.
-    """
     fieldnames, rows = _aggregation_rows(aggregation)
-    output = io.BytesIO()
-    def cell(value: Any, column: int, row: int) -> str:
-        # Excel column labels beyond Z are not needed for the small report
-        # schemas accepted here, but this keeps the encoder generally correct.
-        letters = ""
-        position = column
-        while position:
-            position, remainder = divmod(position - 1, 26)
-            letters = chr(65 + remainder) + letters
-        reference = f"{letters}{row}"
-        text = xml_escape(_cell_text(value), {'"': '&quot;'})
-        return f'<c r="{reference}" t="inlineStr"><is><t>{text}</t></is></c>'
+    return render_xlsx(title=title, fieldnames=fieldnames, rows=rows)
 
-    worksheet_rows = []
-    for index, values in enumerate([fieldnames, *rows], start=1):
-        worksheet_rows.append(
-            f'<row r="{index}">' + "".join(
-                cell(value, column, index)
-                for column, value in enumerate(
-                    values if isinstance(values, list) else [values[name] for name in fieldnames],
-                    start=1,
-                )
-            ) + "</row>"
-        )
-    worksheet = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<sheetData>' + "".join(worksheet_rows) + '</sheetData></worksheet>'
-    )
-    safe_title = title.replace("'", "")[:31] or "Report"
-    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>""")
-        archive.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>""")
-        archive.writestr("xl/workbook.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name=""" + xml_escape(safe_title, {'"': '&quot;'}) + """" sheetId="1" r:id="rId1"/></sheets></workbook>""")
-        archive.writestr("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""")
-        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
-    return output.getvalue()
+
+def _pdf_bytes(*, title: str, aggregation: Any) -> bytes:
+    fieldnames, rows = _aggregation_rows(aggregation)
+    return render_pdf(title=title, fieldnames=fieldnames, rows=rows)
 
 
 class WorkflowReportTaskExecutor:
-    """Build a JSON, CSV, HTML, or XLSX report from verified analytical data."""
+    """Build a JSON, CSV, HTML, XLSX, or PDF report from verified analytical data."""
 
     def __init__(
         self, *, store: Any, artifact_store: LocalArtifactStore,
@@ -302,7 +276,7 @@ class WorkflowReportTaskExecutor:
             raise WorkflowReportGenerationError("title must contain 1-200 characters.", task=task, error_code="invalid_report_input")
         if output_format not in _REPORT_FORMATS:
             raise WorkflowReportGenerationError(
-                "format must be json, csv, html, or xlsx.",
+                "format must be json, csv, html, xlsx, or pdf.",
                 task=task,
                 error_code="unsupported_report_format",
             )
@@ -346,10 +320,13 @@ class WorkflowReportTaskExecutor:
         elif output_format == "html":
             content = _html_bytes(title=title.strip(), aggregation=analytical["aggregation"])
             filename, media_type = "report.html", "text/html; charset=utf-8"
-        else:
+        elif output_format == "xlsx":
             content = _xlsx_bytes(title=title.strip(), aggregation=analytical["aggregation"])
             filename = "report.xlsx"
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            content = _pdf_bytes(title=title.strip(), aggregation=analytical["aggregation"])
+            filename, media_type = "report.pdf", "application/pdf"
 
         if len(content) > self.max_report_bytes:
             raise WorkflowReportGenerationError("Rendered report exceeds size limit.", task=task, error_code="report_too_large")
