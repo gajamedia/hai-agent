@@ -156,3 +156,14 @@ def test_provider_is_compatible_with_existing_authentication_contract():
     )
     provider = BearerTokenAuthenticationProvider(verifier)
     assert callable(provider.authenticate)
+
+
+@pytest.mark.parametrize("claim,expected", [(1_700_000_000, 1_700_000_000), (None, None), ("1700000000", None),
+                                            (True, None), (-5, None), (0, None), (1.5, None)])
+def test_auth_time_is_used_only_when_it_is_a_positive_integer(claim, expected):
+    claims = {"sub": "u1", "iss": "https://issuer.example"}
+    if claim is not None:
+        claims["auth_time"] = claim
+    provider = BearerTokenAuthenticationProvider(FakeVerifiedTokenVerifier(claims=claims))
+    principal = asyncio.run(provider.authenticate(make_request({"Authorization": "Bearer t"})))
+    assert principal.auth_time == expected

@@ -31,6 +31,8 @@ KNOWN_ROLES = {
     "data-reports-user": "Create and run database reports and request new database engines.",
     "database-connection-manager": "Connect databases and approve which tables the agent may use.",
     "database-engine-reviewer": "Review requests for new database engines.",
+    "data-writer": "Plan and execute data changes (insert, update, delete) after re-confirming identity.",
+    "data-change-approver": "Approve data changes made by someone else (second pair of eyes).",
 }
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 

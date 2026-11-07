@@ -69,6 +69,15 @@ export function getAuthenticatedUser() {
   };
 }
 
+/**
+ * Ask Keycloak for a new sign-in right now (the person types their credentials again), then come
+ * back to this page. The backend checks the token's auth_time, so this is what unlocks a data
+ * change. The application itself never sees the password.
+ */
+export function signInAgain() {
+  return keycloak.login({ prompt: "login", maxAge: 0, redirectUri: currentPageRedirectUri() });
+}
+
 export async function logoutFromKeycloak() {
   await keycloak.logout({
     redirectUri: `${window.location.origin}/`,

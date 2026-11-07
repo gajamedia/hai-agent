@@ -308,3 +308,135 @@ def test_the_real_connection_error_goes_to_the_server_log_but_not_to_the_browser
     log = caplog.text
     assert "Access denied for user 'hai_reader'@'172.17.0.1'" in log
     assert "local_mysql" in log and "check_database_profile.py" in log
+
+
+# ------------------------------------------------------------ changing data (live)
+@pytest.fixture
+def rw(my, monkeypatch, tmp_path):
+    """A reader (SELECT) plus a separate writer account with data-changing rights on one database."""
+    writer = f"dw_{uuid.uuid4().hex[:8]}"
+    my.admin.execute(f"CREATE USER '{writer}'@'%' IDENTIFIED BY 'rolepw'")
+    my.admin.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {my.db}.* TO '{writer}'@'%'")
+    my.admin.execute(f"ALTER TABLE {my.db}.sales MODIFY id INT NOT NULL AUTO_INCREMENT")  # inserts get their key
+    monkeypatch.setenv("HAI_TEST_MY_ROLE_PW", "rolepw")
+    base = {"type": "mysql", "host": HOST, "port": int(PORT), "database": my.db, "user": my.reader,
+            "password_env": "HAI_TEST_MY_ROLE_PW", "ssl": "require"}
+    profiles = parse_profiles({
+        "my_rw": {**base, "writer": {"user": writer, "password_env": "HAI_TEST_MY_ROLE_PW"}},
+        "my_ro": base})
+
+    def build(profile="my_rw"):
+        reg = DatabaseRuntimeRegistry(
+            data_root=tmp_path, work_dir=tmp_path / "w2", authorization_policy=AuthorizationPolicy(),
+            llm_provider_factory=lambda: _Provider(), profiles=profiles)
+        reg.connect("sales_rw", engine="mysql", source=profile, actor_id="alice")
+        reg.activate("sales_rw", {"sales": {
+            "columns": ["id", "region", "product", "amount", "sold_on"],
+            "filterable_columns": ["id", "region", "product", "amount", "sold_on"], "key_column": "id",
+            "writable": {"operations": ["insert", "update", "delete"],
+                         "columns": ["region", "product", "amount", "sold_on"]}}}, actor_id="bob")
+        return reg
+
+    made = []
+    try:
+        yield SimpleNamespace(build=lambda *a, **k: made.append(build(*a, **k)) or made[-1],
+                              admin=my.admin, db=my.db, tmp=tmp_path)
+    finally:
+        for r in made:
+            r.shutdown()
+        my.admin.execute(f"DROP USER '{writer}'@'%'")
+
+
+def _mysql_row_count(rw, where):
+    rw.admin.execute(f"SELECT COUNT(*) FROM {rw.db}.sales WHERE {where}")
+    return rw.admin.fetchone()[0]
+
+
+def _run_change(service, payload, max_rows=100, approver=None):
+    request = service.planner.validate(payload, max_rows=max_rows)
+    preview = service.preview(request)
+    return service.execute(request, expected_rows=preview.expected_rows, actor="alice",
+                           approver=approver, plan_id="p", question="q"), preview
+
+
+@live
+def test_update_with_a_date_range_and_bound_values_matches_independent_sql(rw):
+    service = rw.build().data_changes("sales_rw")
+    expected = _mysql_row_count(rw, "sold_on BETWEEN '2026-01-05' AND '2026-01-10' AND region = 'west'")
+    assert expected
+    done, preview = _run_change(service, {
+        "operation": "update", "table": "sales", "set": {"product": "x'; DROP TABLE s;--"},
+        "conditions": [{"column": "sold_on", "operator": "between", "value": ["2026-01-05", "2026-01-10"]},
+                       {"column": "region", "operator": "eq", "value": "west"}]})
+    assert done.rows_affected == preview.expected_rows == expected
+    assert _mysql_row_count(rw, "product LIKE 'x%DROP TABLE s%'") == expected    # stored as plain text
+    assert _mysql_row_count(rw, "1=1") == 30                                    # the table is still there
+
+
+@live
+def test_setting_a_value_the_row_already_has_still_counts_the_row(rw):
+    """MySQL normally counts only rows that changed; the safety check needs rows that matched."""
+    service = rw.build().data_changes("sales_rw")
+    done, _ = _run_change(service, {
+        "operation": "update", "table": "sales", "set": {"amount": 11.25},
+        "conditions": [{"column": "id", "operator": "eq", "value": 1}]})     # id 1 already has 11.25
+    assert done.rows_affected == 1
+
+
+@live
+def test_delete_and_insert_work_and_the_audit_keeps_the_deleted_rows(rw):
+    service = rw.build().data_changes("sales_rw")
+    done, _ = _run_change(service, {
+        "operation": "delete", "table": "sales",
+        "conditions": [{"column": "id", "operator": "in", "value": [1, 2, 3]}]}, approver="bob")
+    assert done.rows_affected == 3 and _mysql_row_count(rw, "id IN (1,2,3)") == 0
+    assert sorted(r["id"] for r in done.before_image) == [1, 2, 3]
+    ins, _ = _run_change(service, {
+        "operation": "insert", "table": "sales",
+        "rows": [{"region": "south", "product": "gadget", "amount": 5, "sold_on": "2026-02-01"}]})
+    assert ins.rows_affected == 1 and _mysql_row_count(rw, "region = 'south'") == 1
+
+
+@live
+def test_the_users_row_limit_stops_a_change_that_is_too_big(rw):
+    from agent.workflow.data_change import ChangeRefused
+    service = rw.build().data_changes("sales_rw")
+    request = service.planner.validate({
+        "operation": "update", "table": "sales", "set": {"product": "z"},
+        "conditions": [{"column": "region", "operator": "eq", "value": "west"}]}, max_rows=3)
+    with pytest.raises(ChangeRefused, match="more than 3 rows"):
+        service.preview(request)
+    assert _mysql_row_count(rw, "product = 'z'") == 0
+
+
+@live
+def test_the_reader_connection_still_cannot_write_even_on_a_connection_that_can_change_data(rw):
+    reg = rw.build()
+    with reg._connections["sales_rw"].manager.connection("sales_rw") as c:
+        cur = c.cursor()
+        with pytest.raises(Exception):
+            cur.execute(f"UPDATE {rw.db}.sales SET amount = 0")
+    assert _mysql_row_count(rw, "amount = 0") == 0
+
+
+@live
+def test_a_profile_without_a_writer_cannot_enable_writing(rw):
+    with pytest.raises(RegistryError, match="no writer account"):
+        rw.build("my_ro")
+
+
+@live
+def test_a_writer_with_schema_changing_rights_is_refused(rw, monkeypatch):
+    writer = f"dx_{uuid.uuid4().hex[:8]}"
+    rw.admin.execute(f"CREATE USER '{writer}'@'%' IDENTIFIED BY 'rolepw'")
+    rw.admin.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE, DROP ON {rw.db}.* TO '{writer}'@'%'")
+    try:
+        base = {"type": "mysql", "host": HOST, "port": int(PORT), "database": rw.db, "user": "unused_reader",
+                "password_env": "HAI_TEST_MY_ROLE_PW", "ssl": "require"}
+        profile = parse_profiles({"my_bad": {**base, "writer": {"user": writer,
+                                                                  "password_env": "HAI_TEST_MY_ROLE_PW"}}})
+        from api.database_engines import MySQLEngine
+        with pytest.raises(EngineError, match="more than"):
+            MySQLEngine(profile).open_writer("my_bad")
+    finally:
+        rw.admin.execute(f"DROP USER '{writer}'@'%'")

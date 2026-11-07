@@ -125,10 +125,13 @@ class MySQLProfile:
     ssl: str = "require"
     statement_timeout_ms: int = 15000
     type: str = "mysql"
+    # Optional second account that may INSERT/UPDATE/DELETE. The reader above never can.
+    writer_user: str = ""
+    writer_password_env: str = ""
 
 
 _COMMON = {"type", "host", "port", "database", "user", "password_env", "statement_timeout_ms"}
-_EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl"}}
+_EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl", "writer"}}
 _DEFAULT_PORT = {"postgresql": 5432, "mysql": 3306}
 
 
@@ -160,7 +163,18 @@ def parse_profiles(data: Any) -> dict[str, Any]:
                     **common, schema=str(raw.get("schema", "public")),
                     sslmode=str(raw.get("sslmode", "require")))
             else:
-                profile = MySQLProfile(**common, ssl=str(raw.get("ssl", "require")))
+                writer = raw.get("writer") or {}
+                if writer and (not isinstance(writer, Mapping) or set(writer) - {"user", "password_env"}
+                               or not writer.get("user") or not writer.get("password_env")):
+                    raise EngineError(f"profile {name!r}: writer must be "
+                                      '{"user": "...", "password_env": "..."}')
+                if writer and str(writer["user"]).strip() == common["user"]:
+                    raise EngineError(f"profile {name!r}: the writer must be a different account "
+                                      "than the read-only user")
+                profile = MySQLProfile(
+                    **common, ssl=str(raw.get("ssl", "require")),
+                    writer_user=str(writer.get("user", "")).strip(),
+                    writer_password_env=str(writer.get("password_env", "")).strip())
         except (KeyError, TypeError, ValueError) as exc:
             raise EngineError(f"profile {name!r} is incomplete or invalid: {exc}") from exc
         if not all((profile.host, profile.database, profile.user, profile.password_env)):
@@ -339,6 +353,33 @@ def check_mysql_grants(grants: list[str]) -> None:
                               + ", ".join(sorted(excess)[:5]) + "); grant it SELECT only")
 
 
+_MYSQL_WRITER_PRIVILEGES = {"USAGE", "SELECT", "INSERT", "UPDATE", "DELETE"}
+
+
+def check_mysql_writer_grants(grants: list[str], database: str) -> None:
+    """The writer may only SELECT/INSERT/UPDATE/DELETE inside the profile's one database.
+
+    No DDL (DROP, ALTER, CREATE, TRUNCATE needs DROP), no GRANT OPTION, no global grants, no roles.
+    """
+    for line in grants:
+        text = line.strip()
+        match = _GRANT.match(text)
+        if not match:
+            raise EngineError("the writer account has role or proxy grants that cannot be verified; "
+                              "use an account with direct grants only")
+        privileges = {p.strip().upper() for p in match.group(1).split(",")}
+        excess = privileges - _MYSQL_WRITER_PRIVILEGES
+        if excess:
+            raise EngineError("the writer account holds more than SELECT, INSERT, UPDATE and DELETE ("
+                              + ", ".join(sorted(excess)[:5]) + ")")
+        if re.search(r"WITH\s+GRANT\s+OPTION\s*$", text, re.IGNORECASE):
+            raise EngineError("the writer account can grant privileges to others (GRANT OPTION)")
+        scope = match.group(2).replace("`", "").replace("\\_", "_").strip()
+        if privileges != {"USAGE"} and not scope.startswith(f"{database}."):
+            raise EngineError("the writer account has privileges outside the database "
+                              f"'{database}'; limit it to that database")
+
+
 class MySQLEngine:
     kind = "mysql"
     paramstyle = "format"
@@ -398,6 +439,52 @@ class MySQLEngine:
             schema, skipped = self._discover(connection, name, profile)
         return schema, _skipped_warning(skipped)
 
+    def has_writer(self, source: str) -> bool:
+        profile = self.profiles.get(source)
+        return bool(profile and profile.writer_user and profile.writer_password_env)
+
+    def open_writer(self, source: str):
+        """A function that opens write-capable connections for the profile's writer account.
+
+        The account is verified once, here: it must hold only data-changing privileges on the
+        profile's one database. The reader connections are never reused for writing.
+        """
+        profile = self.profiles.get(source)
+        if profile is None or not self.has_writer(source):
+            raise EngineError("this database profile has no writer account configured")
+        if not os.environ.get(profile.writer_password_env):
+            raise EngineError(f"environment variable {profile.writer_password_env} is not set")
+        connect = self._connect
+        # By default MySQL reports only rows whose value actually changed. The safety check compares the
+        # statement's row count with the rows that were previewed, so it must count rows that MATCHED.
+        flags: dict[str, Any] = {}
+        if connect is None:
+            import pymysql
+            from pymysql.constants import CLIENT
+            connect = pymysql.connect
+            flags = {"client_flag": CLIENT.FOUND_ROWS}
+        tls: dict[str, Any] = {}
+        if profile.ssl == "require":
+            tls = {"ssl": {"check_hostname": False}, "ssl_verify_cert": False}
+        elif profile.ssl == "verify":
+            tls = {"ssl": {}, "ssl_verify_cert": True, "ssl_verify_identity": True}
+        timeout_s = max(1, profile.statement_timeout_ms // 1000)
+
+        def factory():
+            return connect(
+                host=profile.host, port=profile.port, user=profile.writer_user,
+                password=os.environ.get(profile.writer_password_env, ""), database=profile.database,
+                connect_timeout=5, read_timeout=timeout_s, write_timeout=timeout_s,
+                charset="utf8mb4", autocommit=False, **flags, **tls)
+
+        connection = factory()
+        try:
+            check_mysql_writer_grants(
+                [r[0] for r in PostgresEngine._rows(connection, "SHOW GRANTS")], profile.database)
+        finally:
+            connection.close()
+        return factory
+
     @staticmethod
     def _discover(connection, name: str, profile: MySQLProfile):
         rows = PostgresEngine._rows(
@@ -420,6 +507,6 @@ class MySQLEngine:
         return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
 
 
-__all__ = ["EngineError", "MySQLEngine", "MySQLProfile", "PostgresEngine", "PostgresProfile",
+__all__ = ["EngineError", "MySQLEngine", "check_mysql_writer_grants", "MySQLProfile", "PostgresEngine", "PostgresProfile",
            "SQLiteEngine", "check_mysql_grants", "load_profiles", "map_mysql_type",
            "map_postgres_type", "map_sqlite_type", "parse_profiles"]

@@ -67,6 +67,9 @@ class AuthenticatedPrincipal:
     issuer: str | None = None
     subject: str | None = None
     is_authenticated: bool = True
+    # When the user last typed their credentials (the token's auth_time, seconds since the epoch).
+    # Sensitive actions require this to be recent ("step-up"); None means the provider did not say.
+    auth_time: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor_id, str) or not self.actor_id.strip():
@@ -92,6 +95,11 @@ class AuthenticatedPrincipal:
                         f"{field_name} must be None or a non-empty string."
                     )
                 object.__setattr__(self, field_name, value.strip())
+        if self.auth_time is not None and (
+            isinstance(self.auth_time, bool) or not isinstance(self.auth_time, int)
+            or self.auth_time <= 0
+        ):
+            raise InvalidAuthenticatedPrincipal("auth_time must be None or positive epoch seconds.")
         if self.is_authenticated is not True:
             raise InvalidAuthenticatedPrincipal(
                 "AuthenticatedPrincipal must represent a verified identity."

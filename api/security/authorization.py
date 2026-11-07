@@ -151,6 +151,9 @@ API_ROUTE_PERMISSIONS = MappingProxyType({
     "database_connection_manage": "database:connection:manage",
     "database_engine_request": "database:engine:request",
     "database_engine_review": "database:engine:review",
+    "data_change_plan": "data:change:plan",
+    "data_change_execute": "data:change:execute",
+    "data_change_approve": "data:change:approve",
 })
 
 CAPABILITY_PERMISSIONS = MappingProxyType({

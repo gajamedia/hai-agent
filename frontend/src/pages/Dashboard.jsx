@@ -1524,6 +1524,9 @@ export default function Dashboard() {
         <Link className="nav" to="/data-reports">
           <Database size={16} /> Data Reports
         </Link>
+        <Link className="nav" to="/data-changes">
+          <Database size={16} /> Ubah data
+        </Link>
         <Link className="nav" to="/autonomous-testing">
           <FlaskConical size={16} /> Autonomous Testing
         </Link>

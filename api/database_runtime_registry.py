@@ -47,6 +47,9 @@ from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
+from agent.workflow.data_change import (
+    DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
+)
 from api.database_engines import (
     EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, map_mysql_type, map_postgres_type,
     map_sqlite_type,
@@ -102,6 +105,7 @@ class _Connection:
     tables_approved_at: str | None = None
     selection: Mapping[str, Any] | None = None
     warnings: tuple[str, ...] = ()
+    changes: DataChangeService | None = None  # only when tables were approved for writing
 
 
 class DatabaseRuntimeRegistry:
@@ -365,6 +369,7 @@ class DatabaseRuntimeRegistry:
             by_table = {t.name: t for t in conn.schema.tables}
             specs: dict[str, ReadOnlyTableSpec] = {}
             entries: list[TableCatalogEntry] = []
+            writables: list[WritableTable] = []
             for table, sel in tables.items():
                 found = by_table.get(table)
                 if found is None:
@@ -372,7 +377,7 @@ class DatabaseRuntimeRegistry:
                 if not isinstance(sel, Mapping):
                     raise RegistryError(f"selection for '{table}' must be an object")
                 unknown = set(sel) - {"columns", "filterable_columns", "key_column",
-                                      "required_non_null_columns", "description"}
+                                      "required_non_null_columns", "description", "writable"}
                 if unknown:
                     raise RegistryError(f"unsupported fields for '{table}': {sorted(unknown)}")
                 columns = sel.get("columns")
@@ -404,6 +409,10 @@ class DatabaseRuntimeRegistry:
                     raise RegistryError(f"'{table}': {exc}") from exc
                 specs[table] = spec
                 entries.append(entry)
+                if sel.get("writable"):
+                    writables.append(self._writable_table(conn, table, sel, entry))
+            changes = self._build_changes(conn, writables) if writables else None
+            conn.changes = changes
             conn.service = self._build_service(conn, specs, entries)
             conn.tables = tuple(specs)
             conn.selection = {t: dict(v) for t, v in tables.items()}
@@ -411,6 +420,67 @@ class DatabaseRuntimeRegistry:
             self._degraded.pop(name, None)
             if persist:
                 self._save(conn)
+
+    # ---------------------------------------------------------- data changes
+    def _writer_engine(self, conn: _Connection):
+        impl = self._engines[conn.engine]
+        if not (hasattr(impl, "open_writer") and impl.has_writer(conn.filename)):
+            raise RegistryError(
+                "changing data is not possible on this connection: its server profile has no "
+                "writer account (see docs/TRY_DATA_REPORTS_LOCALLY.md, 'Changing data')")
+        return impl
+
+    def _writable_table(self, conn: _Connection, table: str, sel: Mapping[str, Any],
+                        entry: TableCatalogEntry) -> WritableTable:
+        self._writer_engine(conn)
+        cfg = sel["writable"]
+        if not isinstance(cfg, Mapping) or set(cfg) - {"operations", "columns"}:
+            raise RegistryError(f"'{table}': writable must be {{operations, columns}}")
+        operations, columns = cfg.get("operations"), cfg.get("columns", [])
+        if (not isinstance(operations, list) or not operations
+                or not set(operations) <= set(CHANGE_OPERATIONS)):
+            raise RegistryError(f"'{table}': operations must be a non-empty list of {list(CHANGE_OPERATIONS)}")
+        if not isinstance(columns, list) or not set(columns) <= set(entry.columns):
+            raise RegistryError(f"'{table}': writable columns must be approved columns")
+        if entry.key_column and entry.key_column in columns:
+            raise RegistryError(f"'{table}': the key column cannot be made writable")
+        if {"insert", "update"} & set(operations) and not columns:
+            raise RegistryError(f"'{table}': tick the columns that may be written")
+        if {"update", "delete"} & set(operations) and not entry.filterable_columns:
+            raise RegistryError(f"'{table}': update and delete need at least one 'boleh difilter' "
+                                "column to select the rows")
+        return WritableTable(entry=entry, operations=tuple(operations), writable_columns=tuple(columns))
+
+    def _build_changes(self, conn: _Connection, tables: list[WritableTable]) -> DataChangeService:
+        impl = self._writer_engine(conn)
+        try:
+            factory = impl.open_writer(conn.filename)
+        except EngineError as exc:
+            raise RegistryError(f"cannot use the writer account: {exc}") from exc
+        if self._llm is None:
+            self._llm = LLMService(self.llm_provider_factory())
+        return DataChangeService(
+            planner=DataChangePlanner(self._llm, tables), connect=factory, quote=impl.quote,
+            paramstyle=impl.paramstyle, lock_clause=getattr(impl, "lock_clause", " FOR UPDATE"),
+            audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl")
+
+    def data_changes(self, name: Any) -> DataChangeService:
+        with self._lock:
+            conn = self._get(name)
+            if conn.changes is None:
+                raise RegistryError("no table of this connection is approved for changing data")
+            return conn.changes
+
+    def resolve_change_name(self, name: Any = None) -> str:
+        """The connection to use for a change: the named one, or the only one that can change data."""
+        with self._lock:
+            if name is not None:
+                return self._get(name) and name
+            able = [n for n, c in self._connections.items() if c.changes is not None]
+            if len(able) != 1:
+                raise RegistryError("name the database to change" if able
+                                    else "no connection has tables approved for changing data")
+            return able[0]
 
     def _build_service(self, conn: _Connection, specs: Mapping[str, ReadOnlyTableSpec],
                        entries: list[TableCatalogEntry]) -> TableReportService:
@@ -456,7 +526,8 @@ class DatabaseRuntimeRegistry:
                 "approved_by": conn.approved_by, "approved_at": conn.approved_at,
                 "tables_approved_by": conn.tables_approved_by,
                 "status": "active" if conn.service else "connected_pending_approval",
-                "tables": list(conn.tables)}
+                "tables": list(conn.tables),
+                "writable_tables": sorted(conn.changes.planner.tables) if conn.changes else []}
 
     def schema(self, name: str) -> dict[str, Any]:
         with self._lock:
@@ -464,8 +535,12 @@ class DatabaseRuntimeRegistry:
             data = conn.schema.to_dict()
             # What is approved right now, so the page can show it and let the user change it.
             data["approved"] = {t: {"columns": list(v.get("columns", [])),
-                                    "filterable_columns": list(v.get("filterable_columns", []))}
+                                    "filterable_columns": list(v.get("filterable_columns", [])),
+                                    "writable": v.get("writable")}
                                 for t, v in (conn.selection or {}).items()}
+            impl = self._engines[conn.engine]
+            data["writer_available"] = bool(
+                hasattr(impl, "has_writer") and impl.has_writer(conn.filename))
             return data
 
     def list(self) -> list[dict[str, Any]]:

@@ -128,6 +128,72 @@ def _extract_json(text: str) -> dict[str, Any]:
     return data
 
 
+def condition_scalar(kind: str, column: str, value: Any) -> Any:
+    """One value of a condition, checked against the column's type."""
+    if kind in {"integer", "number"}:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise PlanValidationError(
+                f"A condition on {column!r} ({kind}) needs a plain number, got {value!r}. "
+                'Convert "30 ribu" to 30000.')
+        return value
+    if kind in {"date", "datetime"}:
+        if not isinstance(value, str):
+            raise PlanValidationError(f"A condition on {column!r} ({kind}) needs an ISO date string.")
+        try:
+            (date if kind == "date" else datetime).fromisoformat(value)
+        except ValueError as exc:
+            raise PlanValidationError(f"Value {value!r} for {column!r} must be an ISO {kind}.") from exc
+        return value
+    if kind == "boolean":
+        if not isinstance(value, bool):
+            raise PlanValidationError(f"A condition on {column!r} (boolean) needs true or false.")
+        return value
+    if not isinstance(value, str) or not value.strip() or len(value) > MAX_FILTER_VALUE_LENGTH:
+        raise PlanValidationError(f"A condition on {column!r} needs non-empty text (max {MAX_FILTER_VALUE_LENGTH} characters).")
+    return value
+
+def validate_conditions(entry: TableCatalogEntry, raw: Any) -> tuple[tuple[str, str, Any], ...]:
+    """Comparisons beyond equality: a closed set of operators on approved, filterable columns."""
+    if raw is None or raw == []:
+        return ()
+    if not isinstance(raw, list) or len(raw) > MAX_CONDITIONS:
+        raise PlanValidationError(f"conditions must be a list of at most {MAX_CONDITIONS} items.")
+    result: list[tuple[str, str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) - {"column", "operator", "value"}:
+            raise PlanValidationError('Each condition must be {"column": ..., "operator": ..., "value": ...}.')
+        column, operator, value = item.get("column"), item.get("operator"), item.get("value")
+        if not isinstance(column, str) or column not in entry.filterable_columns:
+            raise PlanValidationError(
+                f"Cannot filter on {column!r}; filterable columns: {list(entry.filterable_columns)}.")
+        if operator not in CONDITION_OPERATORS:
+            raise PlanValidationError(
+                f"Operator {operator!r} is not allowed; use one of {sorted(CONDITION_OPERATORS)}.")
+        kind = entry.columns[column]
+        allowed = OPERATORS_BY_TYPE.get(kind, OPERATORS_BY_TYPE["any"])
+        if operator not in allowed:
+            raise PlanValidationError(
+                f"{operator!r} cannot be used on {column!r} ({kind}); allowed: {sorted(allowed)}.")
+        if operator in {"is_null", "is_not_null"}:
+            if value is not None:
+                raise PlanValidationError(f"{operator!r} takes no value.")
+            result.append((column, operator, None))
+        elif operator == "between":
+            if not isinstance(value, list) or len(value) != 2:
+                raise PlanValidationError("'between' needs a value like [low, high].")
+            low, high = (condition_scalar(kind, column, v) for v in value)
+            if low > high:
+                raise PlanValidationError(f"'between' on {column!r}: low {low!r} is greater than high {high!r}.")
+            result.append((column, operator, (low, high)))
+        elif operator == "in":
+            if not isinstance(value, list) or not 1 <= len(value) <= MAX_IN_VALUES:
+                raise PlanValidationError(f"'in' needs a list of 1-{MAX_IN_VALUES} values.")
+            result.append((column, operator, tuple(condition_scalar(kind, column, v) for v in value)))
+        else:
+            result.append((column, operator, condition_scalar(kind, column, value)))
+    return tuple(result)
+
+
 class TableReportPlanner:
     def __init__(self, llm_service: Any, catalog: Sequence[TableCatalogEntry],
                  *, max_attempts: int = 2, experience: Any = None,
@@ -281,69 +347,10 @@ class TableReportPlanner:
 
     @staticmethod
     def _condition_scalar(kind: str, column: str, value: Any) -> Any:
-        """One value of a condition, checked against the column's type."""
-        if kind in {"integer", "number"}:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise PlanValidationError(
-                    f"A condition on {column!r} ({kind}) needs a plain number, got {value!r}. "
-                    'Convert "30 ribu" to 30000.')
-            return value
-        if kind in {"date", "datetime"}:
-            if not isinstance(value, str):
-                raise PlanValidationError(f"A condition on {column!r} ({kind}) needs an ISO date string.")
-            try:
-                (date if kind == "date" else datetime).fromisoformat(value)
-            except ValueError as exc:
-                raise PlanValidationError(f"Value {value!r} for {column!r} must be an ISO {kind}.") from exc
-            return value
-        if kind == "boolean":
-            if not isinstance(value, bool):
-                raise PlanValidationError(f"A condition on {column!r} (boolean) needs true or false.")
-            return value
-        if not isinstance(value, str) or not value.strip() or len(value) > MAX_FILTER_VALUE_LENGTH:
-            raise PlanValidationError(f"A condition on {column!r} needs non-empty text (max {MAX_FILTER_VALUE_LENGTH} characters).")
-        return value
+        return condition_scalar(kind, column, value)
 
     def _validate_conditions(self, entry: TableCatalogEntry, raw: Any) -> tuple[tuple[str, str, Any], ...]:
-        """Comparisons beyond equality: a closed set of operators on approved, filterable columns."""
-        if raw is None or raw == []:
-            return ()
-        if not isinstance(raw, list) or len(raw) > MAX_CONDITIONS:
-            raise PlanValidationError(f"conditions must be a list of at most {MAX_CONDITIONS} items.")
-        result: list[tuple[str, str, Any]] = []
-        for item in raw:
-            if not isinstance(item, Mapping) or set(item) - {"column", "operator", "value"}:
-                raise PlanValidationError('Each condition must be {"column": ..., "operator": ..., "value": ...}.')
-            column, operator, value = item.get("column"), item.get("operator"), item.get("value")
-            if not isinstance(column, str) or column not in entry.filterable_columns:
-                raise PlanValidationError(
-                    f"Cannot filter on {column!r}; filterable columns: {list(entry.filterable_columns)}.")
-            if operator not in CONDITION_OPERATORS:
-                raise PlanValidationError(
-                    f"Operator {operator!r} is not allowed; use one of {sorted(CONDITION_OPERATORS)}.")
-            kind = entry.columns[column]
-            allowed = OPERATORS_BY_TYPE.get(kind, OPERATORS_BY_TYPE["any"])
-            if operator not in allowed:
-                raise PlanValidationError(
-                    f"{operator!r} cannot be used on {column!r} ({kind}); allowed: {sorted(allowed)}.")
-            if operator in {"is_null", "is_not_null"}:
-                if value is not None:
-                    raise PlanValidationError(f"{operator!r} takes no value.")
-                result.append((column, operator, None))
-            elif operator == "between":
-                if not isinstance(value, list) or len(value) != 2:
-                    raise PlanValidationError("'between' needs a value like [low, high].")
-                low, high = (self._condition_scalar(kind, column, v) for v in value)
-                if low > high:
-                    raise PlanValidationError(f"'between' on {column!r}: low {low!r} is greater than high {high!r}.")
-                result.append((column, operator, (low, high)))
-            elif operator == "in":
-                if not isinstance(value, list) or not 1 <= len(value) <= MAX_IN_VALUES:
-                    raise PlanValidationError(f"'in' needs a list of 1-{MAX_IN_VALUES} values.")
-                result.append((column, operator, tuple(self._condition_scalar(kind, column, v) for v in value)))
-            else:
-                result.append((column, operator, self._condition_scalar(kind, column, value)))
-        return tuple(result)
+        return validate_conditions(entry, raw)
 
     def _validate_list(self, entry: TableCatalogEntry, data: Mapping[str, Any]) -> TableReportRequest:
         """A "show the rows" plan: columns, optional equality filters, order and a row limit."""

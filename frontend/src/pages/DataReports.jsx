@@ -15,6 +15,7 @@ import {
   listEngineRequests,
   runReportPlan,
 } from "../api/client.js";
+import { describeCondition } from "./conditions.js";
 import "./autonomous-testing.css";
 
 // The server discovers the schema; the user only picks which tables/columns the
@@ -25,7 +26,10 @@ function ApprovalForm({ connection, schema, busy, onApprove }) {
   const [selection, setSelection] = useState(() =>
     Object.fromEntries(
       Object.entries(schema.approved || {}).map(([table, v]) => [
-        table, { columns: v.columns, filterable: v.filterable_columns || [] },
+        table, {
+          columns: v.columns, filterable: v.filterable_columns || [],
+          writable: v.writable ? { operations: v.writable.operations || [], columns: v.writable.columns || [] } : null,
+        },
       ]),
     ),
   );
@@ -34,7 +38,7 @@ function ApprovalForm({ connection, schema, busy, onApprove }) {
     setSelection((cur) => {
       const next = { ...cur };
       if (next[table]) delete next[table];
-      else next[table] = { columns: columns.map((c) => c.name), filterable: [] };
+      else next[table] = { columns: columns.map((c) => c.name), filterable: [], writable: null };
       return next;
     });
 
@@ -46,8 +50,33 @@ function ApprovalForm({ connection, schema, busy, onApprove }) {
       const columns = has ? entry.columns.filter((c) => c !== name) : [...entry.columns, name];
       return {
         ...cur,
-        [table]: { columns, filterable: entry.filterable.filter((c) => columns.includes(c)) },
+        [table]: {
+          ...entry, columns, filterable: entry.filterable.filter((c) => columns.includes(c)),
+          writable: entry.writable
+            ? { ...entry.writable, columns: entry.writable.columns.filter((c) => columns.includes(c)) }
+            : null,
+        },
       };
+    });
+
+  const toggleOperation = (table, operation) =>
+    setSelection((cur) => {
+      const entry = cur[table];
+      const writable = entry.writable || { operations: [], columns: [] };
+      const operations = writable.operations.includes(operation)
+        ? writable.operations.filter((o) => o !== operation)
+        : [...writable.operations, operation];
+      return { ...cur, [table]: { ...entry, writable: operations.length ? { ...writable, operations } : null } };
+    });
+
+  const toggleWritableColumn = (table, name) =>
+    setSelection((cur) => {
+      const entry = cur[table];
+      const writable = entry.writable || { operations: [], columns: [] };
+      const columns = writable.columns.includes(name)
+        ? writable.columns.filter((c) => c !== name)
+        : [...writable.columns, name];
+      return { ...cur, [table]: { ...entry, writable: { ...writable, columns } } };
     });
 
   const toggleFilter = (table, name) =>
@@ -69,6 +98,9 @@ function ApprovalForm({ connection, schema, busy, onApprove }) {
         columns: entry.columns,
         filterable_columns: entry.filterable,
         ...(key ? { key_column: key.name } : {}),
+        ...(entry.writable?.operations.length
+          ? { writable: { operations: entry.writable.operations, columns: entry.writable.columns } }
+          : {}),
       };
     }
     onApprove(tables);
@@ -115,8 +147,34 @@ function ApprovalForm({ connection, schema, busy, onApprove }) {
                     />
                     boleh difilter
                   </label>
+                  {schema.writer_available && !column.primary_key && (
+                    <label className="at-check">
+                      <input
+                        type="checkbox"
+                        disabled={!entry.columns.includes(column.name)}
+                        checked={Boolean(entry.writable?.columns.includes(column.name))}
+                        onChange={() => toggleWritableColumn(table.name, column.name)}
+                      />
+                      boleh diubah
+                    </label>
+                  )}
                 </div>
               ))}
+            {entry && schema.writer_available && (
+              <div className="at-form-row" aria-label={`Izin ubah data ${table.name}`}>
+                <b>Izin ubah data:</b>
+                {[["insert", "Tambah"], ["update", "Ubah"], ["delete", "Hapus"]].map(([op, label]) => (
+                  <label key={op} className="at-check">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(entry.writable?.operations.includes(op))}
+                      onChange={() => toggleOperation(table.name, op)}
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            )}
           </fieldset>
         );
       })}
@@ -166,18 +224,6 @@ const STATUS_TEXT = (c) =>
       : c.status === "unavailable"
         ? `tidak tersedia${c.reason ? `: ${c.reason}` : ""}`
         : "menunggu persetujuan";
-
-const OPERATOR_SYMBOL = { eq: "=", ne: "≠", gt: ">", gte: "≥", lt: "<", lte: "≤" };
-
-function describeCondition({ column, operator, value }) {
-  if (OPERATOR_SYMBOL[operator]) return `${column} ${OPERATOR_SYMBOL[operator]} ${value}`;
-  if (operator === "between") return `${column} antara ${value[0]} dan ${value[1]}`;
-  if (operator === "in") return `${column} salah satu dari (${value.join(", ")})`;
-  if (operator === "contains") return `${column} mengandung "${value}"`;
-  if (operator === "starts_with") return `${column} diawali "${value}"`;
-  if (operator === "ends_with") return `${column} diakhiri "${value}"`;
-  return `${column} ${operator === "is_null" ? "kosong" : "tidak kosong"}`;
-}
 
 export default function DataReports() {
   const [connections, setConnections] = useState([]);

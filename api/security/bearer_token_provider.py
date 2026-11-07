@@ -113,7 +113,11 @@ class BearerTokenAuthenticationProvider:
                 "Verified permissions claim must be an array of strings."
             )
 
+        auth_time = claims.get("auth_time")
+        if isinstance(auth_time, bool) or not isinstance(auth_time, int) or auth_time <= 0:
+            auth_time = None  # a missing or odd value must never count as a recent login
         return AuthenticatedPrincipal(
+            auth_time=auth_time,
             actor_id=actor_id,
             roles=tuple(roles),
             permissions=tuple(permissions),

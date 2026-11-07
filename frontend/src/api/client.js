@@ -295,3 +295,44 @@ export async function downloadReport(url, signal) {
   const match = /filename="([^"]+)"/.exec(disposition);
   return { blob: await response.blob(), filename: match ? match[1] : "report" };
 }
+
+// Data changes (insert / update / delete). Running needs a fresh login and the exact phrase.
+export async function getDataChangeConfig(signal) {
+  return request(`${API_V1}/data-changes/config`, { signal });
+}
+
+export async function createDataChangePlan(payload, signal) {
+  return jsonPost(`${API_V1}/data-changes/plans`, payload, signal);
+}
+
+export async function getDataChangePlan(planId, signal) {
+  return request(`${API_V1}/data-changes/plans/${encodeURIComponent(planId)}`, { signal });
+}
+
+export async function runDataChangePlan(planId, confirm, idempotencyKey, signal) {
+  return jsonPost(
+    `${API_V1}/data-changes/plans/${encodeURIComponent(planId)}/run`,
+    { confirm },
+    signal,
+    idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+  );
+}
+
+export async function cancelDataChangePlan(planId, signal) {
+  return request(`${API_V1}/data-changes/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+    signal,
+  });
+}
+
+export async function listDataChangeApprovals(signal) {
+  return request(`${API_V1}/data-changes/approvals`, { signal });
+}
+
+export async function decideDataChange(planId, decision, signal) {
+  return jsonPost(
+    `${API_V1}/data-changes/approvals/${encodeURIComponent(planId)}/${decision === "reject" ? "reject" : "approve"}`,
+    {},
+    signal,
+  );
+}

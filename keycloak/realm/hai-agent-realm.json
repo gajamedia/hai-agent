@@ -104,6 +104,14 @@
         {
           "name": "database-engine-reviewer",
           "description": "Review requests for new database engines."
+        },
+        {
+          "name": "data-writer",
+          "description": "Plan and execute data changes (insert, update, delete) after re-confirming identity."
+        },
+        {
+          "name": "data-change-approver",
+          "description": "Approve data changes made by someone else (second pair of eyes)."
         }
       ]
     }

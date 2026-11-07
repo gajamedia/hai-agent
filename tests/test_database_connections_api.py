@@ -194,7 +194,8 @@ def test_an_active_connection_shows_what_is_approved_and_can_be_changed(world):
     assert client.post(f"{DB}/sales/approve", json=APPROVE).json()["status"] == "active"
     approved = client.get(f"{DB}/sales/schema").json()["approved"]
     assert approved == {"sales": {"columns": ["id", "region", "product", "amount"],
-                                  "filterable_columns": ["region", "product"]}}
+                                  "filterable_columns": ["region", "product"],
+                                  "writable": None}}
     # Changing it replaces the selection: now amount may be filtered too, and the connection stays active.
     changed = {"tables": {"sales": {**APPROVE["tables"]["sales"],
                                     "filterable_columns": ["region", "product", "amount"]}}}

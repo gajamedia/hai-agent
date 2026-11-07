@@ -60,6 +60,14 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"^/api/v1/database-connections/[^/]+/schema$", "database:connection:manage"),
     ("POST", r"^/api/v1/database-connections/[^/]+/approve$", "database:connection:manage"),
     ("DELETE", r"^/api/v1/database-connections/[^/]+$", "database:connection:manage"),
+    # Data changes: planning/cancelling and running are the writer's; approving is a second person's.
+    ("GET", r"^/api/v1/data-changes/config$", "data:change:plan"),
+    ("POST", r"^/api/v1/data-changes/plans$", "data:change:plan"),
+    ("GET", r"^/api/v1/data-changes/plans/[^/]+$", "data:change:plan"),
+    ("DELETE", r"^/api/v1/data-changes/plans/[^/]+$", "data:change:plan"),
+    ("POST", r"^/api/v1/data-changes/plans/[^/]+/run$", "data:change:execute"),
+    ("GET", r"^/api/v1/data-changes/approvals$", "data:change:approve"),
+    ("POST", r"^/api/v1/data-changes/approvals/[^/]+/(?:approve|reject)$", "data:change:approve"),
     # Engine requests: anyone who may ask can list (the handler narrows it to their own
     # unless they are a reviewer); only reviewers can change a request.
     ("POST", r"^/api/v1/database-engine-requests$", "database:engine:request"),

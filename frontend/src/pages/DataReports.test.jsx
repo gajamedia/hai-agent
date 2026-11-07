@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import DataReports, { PLAN_TIMEOUT_MS } from "./DataReports";
@@ -196,6 +196,40 @@ describe("DataReports", () => {
     const [, tables] = api.approveDatabaseTables.mock.calls[0];
     expect(tables.sales.columns).toEqual(["id", "amount"]);
     expect(tables.sales.filterable_columns).toEqual(["amount"]);
+  });
+
+  it("offers write permissions only when the server has a writer account, and sends them with the approval", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.getDatabaseSchema.mockResolvedValue({
+      ...SCHEMA, writer_available: true,
+      approved: { sales: { columns: ["id", "region", "amount"], filterable_columns: ["id", "region"], writable: null } },
+    });
+    api.approveDatabaseTables.mockResolvedValue({ status: "active" });
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Ubah persetujuan" }));
+    const group = await screen.findByLabelText("Izin ubah data sales");
+    expect(screen.getAllByLabelText(/boleh diubah/)).toHaveLength(2);   // the key column is never offered
+    await user.click(screen.getAllByLabelText(/boleh diubah/)[1]);     // amount
+    await user.click(within(group).getByRole("checkbox", { name: "Ubah" }));
+    await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
+    const [, tables] = api.approveDatabaseTables.mock.calls[0];
+    expect(tables.sales.writable).toEqual({ operations: ["update"], columns: ["amount"] });
+  });
+
+  it("does not offer write permissions on a connection without a writer account", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "connected_pending_approval", tables: [] }],
+    });
+    api.getDatabaseSchema.mockResolvedValue(SCHEMA);
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Setujui" }));
+    await screen.findByRole("checkbox", { name: "sales" });
+    expect(screen.queryByLabelText(/boleh diubah/)).toBeNull();
+    expect(screen.queryByLabelText(/Izin ubah data/)).toBeNull();
   });
 
   it("connects by server profile name without asking for a file or credentials", async () => {

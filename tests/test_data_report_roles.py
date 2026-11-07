@@ -100,3 +100,24 @@ def test_the_realm_clients_include_the_basic_scope_that_carries_the_sub_claim():
     realm = json.loads(REALM.read_text(encoding="utf-8"))
     for client in realm["clients"]:
         assert "basic" in client["defaultClientScopes"], client["clientId"]
+
+
+WRITER, APPROVER = "data-writer", "data-change-approver"
+PLAN_P, EXEC_P, APPROVE_P = "data:change:plan", "data:change:execute", "data:change:approve"
+
+
+def test_changing_data_is_its_own_pair_of_roles_and_reading_never_grants_it(policy):
+    assert all(_allowed(policy, _principal(WRITER), p) for p in (PLAN_P, EXEC_P))
+    assert not _allowed(policy, _principal(WRITER), APPROVE_P)           # a writer cannot approve
+    assert _allowed(policy, _principal(APPROVER), APPROVE_P)
+    assert not any(_allowed(policy, _principal(APPROVER), p) for p in (PLAN_P, EXEC_P))
+    for role in (USER, MANAGER, REVIEWER):
+        assert not any(_allowed(policy, _principal(role), p) for p in (PLAN_P, EXEC_P, APPROVE_P))
+
+
+def test_the_realm_declares_the_data_change_roles():
+    realm = json.loads(REALM.read_text(encoding="utf-8"))
+    declared = {r["name"] for r in realm["roles"]["client"][CLIENT]}
+    assert {WRITER, APPROVER} <= declared
+    dev = next(u for u in realm["users"] if u["username"] == "hai.dev")
+    assert not ({WRITER, APPROVER} & set(dev["clientRoles"][CLIENT]))
