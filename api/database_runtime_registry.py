@@ -47,7 +47,8 @@ from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
 from api.database_engines import (
-    EngineError, PostgresEngine, SQLiteEngine, map_postgres_type, map_sqlite_type,
+    EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, map_mysql_type, map_postgres_type,
+    map_sqlite_type,
 )
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
@@ -115,8 +116,13 @@ class DatabaseRuntimeRegistry:
         self.llm_provider_factory = llm_provider_factory
         self.max_connections = max_connections
         self._engines: dict[str, Any] = {"sqlite": SQLiteEngine(self.data_root)}
-        if profiles:
-            self._engines["postgresql"] = PostgresEngine(profiles)
+        by_type: dict[str, dict[str, Any]] = {}
+        for pname, profile in (profiles or {}).items():
+            by_type.setdefault(profile.type, {})[pname] = profile
+        if "postgresql" in by_type:
+            self._engines["postgresql"] = PostgresEngine(by_type["postgresql"])
+        if "mysql" in by_type:
+            self._engines["mysql"] = MySQLEngine(by_type["mysql"])
         if engines:
             self._engines.update(engines)
         self._connections: dict[str, _Connection] = {}
@@ -250,8 +256,17 @@ class DatabaseRuntimeRegistry:
 
     def profiles(self) -> list[dict[str, str]]:
         """Names and types only: never hosts, users or secrets."""
-        pg = self._engines.get("postgresql")
-        return [{"name": n, "type": "postgresql"} for n in sorted(getattr(pg, "profiles", {}))]
+        out = [{"name": n, "type": kind}
+               for kind, engine in self._engines.items()
+               for n in getattr(engine, "profiles", {})]
+        return sorted(out, key=lambda item: item["name"])
+
+    def profile_engine(self, name: Any) -> str | None:
+        """Engine type of a named server profile, or None if there is no such profile."""
+        for item in self.profiles():
+            if item["name"] == name:
+                return item["type"]
+        return None
 
     def connect(self, name: Any, *, engine: str, source: Any, actor_id: str) -> dict[str, Any]:
         if not isinstance(name, str) or not _NAME.match(name):
@@ -450,4 +465,4 @@ def registry_factory_from_environment(app: Any) -> DatabaseRuntimeRegistry:
 
 
 __all__ = ["registry_factory_from_environment", "DatabaseRuntimeRegistry", "RegistryError", "RegistryNotFound",
-           "map_sqlite_type", "map_postgres_type", "resolve_in_root"]
+           "map_sqlite_type", "map_postgres_type", "map_mysql_type", "resolve_in_root"]

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 postgresql = ["psycopg[binary]>=3.2,<4"]
+mysql = ["PyMySQL>=1.1,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

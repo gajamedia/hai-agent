@@ -57,11 +57,13 @@ def connect_database(request: Request, payload: dict[str, Any]):
     principal, registry = _guard(request)
     if set(payload) - {"name", "filename", "profile", "type"}:
         raise _err(422, "invalid_request",
-                   "Only name, filename (sqlite) or profile (postgresql) and type are accepted.")
+                   "Only name, filename (sqlite) or profile (server-defined) and type are accepted.")
     has_file, has_profile = "filename" in payload, "profile" in payload
     if has_file == has_profile:
         raise _err(422, "invalid_request", "Provide exactly one of filename or profile.")
-    engine = "sqlite" if has_file else "postgresql"
+    engine = "sqlite" if has_file else registry.profile_engine(payload.get("profile"))
+    if engine is None:
+        raise _err(422, "unknown_profile", "That database profile does not exist.")
     if payload.get("type", engine) != engine:
         raise _err(422, "unsupported_database_type",
                    f"'{payload.get('type')}' does not match the source you provided ({engine}).")

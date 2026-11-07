@@ -38,7 +38,7 @@ def test_profile_parsing_accepts_a_valid_profile_and_applies_safe_defaults():
 
 
 @pytest.mark.parametrize("change", [
-    {"password": "secret"}, {"type": "mysql"}, {"sslmode": "none"}, {"schema": "Public;drop"},
+    {"password": "secret"}, {"type": "oracle"}, {"sslmode": "none"}, {"schema": "Public;drop"},
     {"port": 0}, {"port": "x"}, {"statement_timeout_ms": 1}, {"extra": 1}, {"host": " "},
     {"password_env": ""}])
 def test_invalid_profiles_are_rejected(change):
@@ -167,7 +167,7 @@ def test_select_only_role_connects_and_schema_is_discovered_with_mapped_types(pg
     assert set(tables) == {"sales"}  # mixed-case table is skipped: the adapter cannot quote it
     cols = {c["name"]: c for c in tables["sales"]["columns"]}
     assert cols["id"]["primary_key"] is True and cols["amount"]["declared_type"] == "numeric"
-    assert out["warnings"] == []
+    assert any("hidden" in w for w in out["warnings"])  # the MixedCase table
 
 
 @live
