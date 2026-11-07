@@ -46,3 +46,6 @@ scripts/Collect-*
 scripts/Apply-*
 scripts/apply-*
 scripts/P3_5_*
+
+# Data Reports: sample/real databases and everything generated from them (reports, traces, workflow DB)
+data/reports/
