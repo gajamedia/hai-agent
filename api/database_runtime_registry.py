@@ -355,7 +355,8 @@ class DatabaseRuntimeRegistry:
             connection_manager=conn.manager, profile_name=conn.name,
             authorization_policy=self.authorization_policy, table_specs=specs,
             trace_path=self.work_dir / f"trace-{conn.name}.jsonl",
-            paramstyle=self._engines[conn.engine].paramstyle)
+            paramstyle=self._engines[conn.engine].paramstyle,
+            identifier_quote=getattr(self._engines[conn.engine], "quote", None))
         port = TrustedCapabilityInvocationPort(
             gateway=assembly.gateway,
             specs={READ_ACTION: CapabilityInvocationSpec(

@@ -95,7 +95,10 @@ class BusinessDatabaseAdapter:
         connection_factory: Callable[[], Any],
         table_specs: Mapping[str, ReadOnlyTableSpec],
         paramstyle: str = "qmark",
+        identifier_quote: str | None = None,
     ) -> None:
+        if identifier_quote not in {None, '"', "`"}:
+            raise ValueError("identifier_quote must be None, '\"' or '`'.")
         if not callable(connection_factory):
             raise TypeError("connection_factory must be callable.")
         if paramstyle not in {"qmark", "format"}:
@@ -115,6 +118,13 @@ class BusinessDatabaseAdapter:
         self._connection_factory = connection_factory
         self._table_specs = dict(normalized)
         self._placeholder = "?" if paramstyle == "qmark" else "%s"
+        # Identifiers are already validated against a strict pattern, so quoting
+        # them can never be broken out of; it only makes reserved words and
+        # mixed-case names usable. None keeps the historical unquoted SQL.
+        self._quote = identifier_quote
+
+    def _q(self, identifier: str) -> str:
+        return identifier if self._quote is None else f"{self._quote}{identifier}{self._quote}"
 
     @property
     def target(self) -> str:
@@ -260,7 +270,7 @@ class BusinessDatabaseAdapter:
                     "A sort column is not allowlisted."
                 )
             order_fragments.append(
-                f"{column} {'DESC' if descending else 'ASC'}"
+                f"{self._q(column)} {'DESC' if descending else 'ASC'}"
             )
 
         limit = arguments.get("limit", spec.default_limit)
@@ -273,20 +283,21 @@ class BusinessDatabaseAdapter:
                 f"limit must be an integer between 1 and {spec.max_limit}."
             )
 
-        sql = f"SELECT {', '.join(requested_columns)} FROM {table}"
+        sql = (f"SELECT {', '.join(self._q(c) for c in requested_columns)} "
+               f"FROM {self._q(table)}")
         parameters: list[Any] = []
         if filters:
             where_fragments: list[str] = []
             for column, value in filters.items():
                 if value is None:
-                    where_fragments.append(f"{column} IS NULL")
+                    where_fragments.append(f"{self._q(column)} IS NULL")
                 else:
                     if isinstance(value, (dict, list, tuple, set)):
                         raise CapabilityRequestValidationError(
                             f"Filter value for '{column}' must be a scalar."
                         )
                     where_fragments.append(
-                        f"{column} = {self._placeholder}"
+                        f"{self._q(column)} = {self._placeholder}"
                     )
                     parameters.append(value)
             sql += " WHERE " + " AND ".join(where_fragments)

@@ -113,7 +113,11 @@ def pg(monkeypatch, tmp_path):
     cur.execute(f"CREATE SCHEMA {schema}")
     cur.execute(f"CREATE TABLE {schema}.sales (id integer PRIMARY KEY, region text, "
                 f"product text, amount numeric(10,2), sold_on date)")
-    cur.execute(f'CREATE TABLE {schema}."MixedCase" (id integer)')
+    cur.execute(f'ALTER TABLE {schema}.sales ADD COLUMN "weird name" text')
+    cur.execute(f'CREATE TABLE {schema}."Order" (id integer PRIMARY KEY, "group" text, '
+                f'"user" text, amount numeric(8,2))')
+    cur.executemany(f'INSERT INTO {schema}."Order" VALUES (%s,%s,%s,%s)',
+                    [(i, ["a", "b"][i % 2], "u1", f"{i}.50") for i in range(1, 9)])
     rows = [(i, ["west", "east", "north"][i % 3], "widget" if i % 2 else "gadget",
              f"{10 + i}.25", f"2026-01-{(i % 28) + 1:02d}") for i in range(1, 31)]
     cur.executemany(f"INSERT INTO {schema}.sales VALUES (%s,%s,%s,%s,%s)", rows)
@@ -164,10 +168,11 @@ def test_select_only_role_connects_and_schema_is_discovered_with_mapped_types(pg
     reg = pg.registry()
     out = reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
     tables = {t["name"]: t for t in out["schema"]["tables"]}
-    assert set(tables) == {"sales"}  # mixed-case table is skipped: the adapter cannot quote it
+    assert set(tables) == {"sales", "Order"}  # mixed case is kept: identifiers are quoted
+    assert "weird name" not in {c["name"] for c in tables["sales"]["columns"]}
     cols = {c["name"]: c for c in tables["sales"]["columns"]}
     assert cols["id"]["primary_key"] is True and cols["amount"]["declared_type"] == "numeric"
-    assert any("hidden" in w for w in out["warnings"])  # the MixedCase table
+    assert any("hidden" in w for w in out["warnings"])  # the column with a space
 
 
 @live
@@ -253,3 +258,21 @@ def test_api_exposes_profile_names_only_and_connects_by_profile(pg, tmp_path):
             assert client.post("/api/v1/database-connections", json=body).status_code == 422
         assert client.post("/api/v1/database-connections",
                            json={"name": "x2", "profile": "nope"}).status_code == 422
+
+
+@live
+def test_mixed_case_reserved_word_table_and_columns_can_be_reported(pg):
+    plan = json.dumps({"supported": True, "table": "Order", "group_by": ["group"],
+                       "metrics": [{"output": "total", "operation": "sum", "column": "amount"}],
+                       "filters": {"user": "u1"}})
+    reg = pg.registry(plan)
+    reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
+    reg.activate("pgsales", {"Order": {
+        "columns": ["id", "group", "user", "amount"], "filterable_columns": ["user"],
+        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
+    outcome = reg.service("pgsales").ask("total per group", execution_context=_context())
+    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
+    pg.admin.execute(f'SELECT "group", SUM(amount) FROM {pg.schema}."Order" '
+                     f"WHERE \"user\"='u1' GROUP BY \"group\"")
+    expected = {g: float(t) for g, t in pg.admin.fetchall()}
+    assert {r["group"]: float(r["total"]) for r in outcome.rows} == pytest.approx(expected)

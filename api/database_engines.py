@@ -23,30 +23,21 @@ from agent.database.sqlite_schema import (
     SQLiteColumn, SQLiteSchema, SQLiteTable, discover_sqlite_schema,
 )
 
-_IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")  # profile schema names only
+_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")  # what the adapter accepts
 MAX_TABLES = 200
 
-# The adapter does not quote identifiers, so names that are reserved words in
-# PostgreSQL or MySQL would break the query. They are hidden and reported.
-_RESERVED = frozenset("""
-select from where group order by table user key index limit desc asc union join insert
-update delete drop create alter grant check primary foreign references case when then else
-end and or not null like in is as on all any distinct having values default column
-constraint interval match partition rename replace trigger unique using window with for into
-leading natural out outer over some to trailing true false only offset condition describe
-explain load lock analyze both if use
-""".split())
-
-
+# The adapter quotes every identifier, so reserved words and mixed case are fine.
+# Only names it cannot represent (spaces, hyphens, non-ASCII) are hidden.
 def _usable(name: str) -> bool:
-    return bool(_IDENT.match(name)) and name not in _RESERVED
+    return bool(_NAME.match(name))
 
 
 def _skipped_warning(count: int) -> list[str]:
     if not count:
         return []
-    return [f"{count} table(s)/column(s) are hidden because their names are not simple "
-            "lowercase identifiers or are SQL reserved words."]
+    return [f"{count} table(s)/column(s) are hidden because their names contain "
+            "characters other than letters, digits and underscores."]
 
 
 class EngineError(ValueError):
@@ -91,6 +82,7 @@ def map_postgres_type(declared: str) -> str:
 class SQLiteEngine:
     kind = "sqlite"
     paramstyle = "qmark"
+    quote = "`"  # backticks: SQLite never reinterprets them as string literals
     map_type = staticmethod(map_sqlite_type)
 
     def __init__(self, data_root: Path) -> None:
@@ -202,6 +194,7 @@ def load_profiles(path: str | Path) -> dict[str, Any]:
 class PostgresEngine:
     kind = "postgresql"
     paramstyle = "format"
+    quote = '"'
     map_type = staticmethod(map_postgres_type)
 
     def __init__(self, profiles: Mapping[str, PostgresProfile], *, connect=None) -> None:
@@ -345,6 +338,7 @@ def check_mysql_grants(grants: list[str]) -> None:
 class MySQLEngine:
     kind = "mysql"
     paramstyle = "format"
+    quote = "`"
     map_type = staticmethod(map_mysql_type)
 
     def __init__(self, profiles: Mapping[str, MySQLProfile], *, connect=None) -> None:

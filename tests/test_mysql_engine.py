@@ -81,9 +81,10 @@ def test_accounts_with_more_than_select_are_refused(grants, needle):
         check_mysql_grants(grants)
 
 
-def test_reserved_and_unsafe_identifiers_are_hidden():
-    assert _usable("sales") and _usable("order_total")
-    assert not any(_usable(n) for n in ("order", "user", "group", "Sales", "a-b", "1abc", "key"))
+def test_only_names_the_adapter_cannot_represent_are_hidden():
+    # Reserved words and mixed case are fine: every identifier is quoted.
+    assert all(_usable(n) for n in ("sales", "order_total", "order", "user", "group", "Sales", "key"))
+    assert not any(_usable(n) for n in ("a-b", "1abc", "with space", "naive\u00ef", "x;drop", ""))
 
 
 def test_registry_lists_profiles_of_every_engine_without_hosts(tmp_path):
@@ -126,11 +127,15 @@ def my(monkeypatch, tmp_path):
     cur.execute(f"CREATE DATABASE {db}")
     cur.execute(f"CREATE TABLE {db}.sales (id INT PRIMARY KEY, region VARCHAR(20), "
                 f"product VARCHAR(20), amount DECIMAL(10,2), sold_on DATE)")
-    cur.execute(f"CREATE TABLE {db}.`order` (id INT)")
-    cur.execute(f"CREATE TABLE {db}.`MixedCase` (id INT)")
+    cur.execute(f"ALTER TABLE {db}.sales ADD COLUMN `weird name` VARCHAR(5)")
+    cur.execute(f"CREATE TABLE {db}.`order` (id INT PRIMARY KEY, `group` VARCHAR(10), "
+                f"`user` VARCHAR(10), amount DECIMAL(8,2))")
+    cur.executemany(f"INSERT INTO {db}.`order` VALUES (%s,%s,%s,%s)",
+                    [(i, ["a", "b"][i % 2], "u1", f"{i}.50") for i in range(1, 9)])
     rows = [(i, ["west", "east", "north"][i % 3], "widget" if i % 2 else "gadget",
              f"{10 + i}.25", f"2026-01-{(i % 28) + 1:02d}") for i in range(1, 31)]
-    cur.executemany(f"INSERT INTO {db}.sales VALUES (%s,%s,%s,%s,%s)", rows)
+    cur.executemany(f"INSERT INTO {db}.sales (id, region, product, amount, sold_on) "
+                    f"VALUES (%s,%s,%s,%s,%s)", rows)
     for user in (reader, writer):
         cur.execute(f"CREATE USER '{user}'@'%' IDENTIFIED BY 'rolepw'")
         cur.execute(f"GRANT SELECT ON {db}.* TO '{user}'@'%'")
@@ -169,7 +174,8 @@ def my(monkeypatch, tmp_path):
 def test_select_only_account_connects_and_hidden_names_are_reported(my):
     out = my.registry().connect("mysales", engine="mysql", source="my_reader", actor_id="alice")
     tables = {t["name"]: t for t in out["schema"]["tables"]}
-    assert set(tables) == {"sales"}
+    assert set(tables) == {"sales", "order"}  # reserved word is fine; it is quoted
+    assert "weird name" not in {c["name"] for c in tables["sales"]["columns"]}
     cols = {c["name"]: c for c in tables["sales"]["columns"]}
     assert cols["id"]["primary_key"] is True and cols["amount"]["declared_type"] == "decimal"
     assert any("hidden" in w for w in out["warnings"])
@@ -250,3 +256,20 @@ def test_mysql_connection_survives_restart_and_api_connects_by_profile(my):
         assert client.post("/api/v1/database-connections",
                            json={"name": "x2", "profile": "my_reader", "type": "postgresql"}
                            ).status_code == 422
+
+
+@live
+def test_reserved_word_table_and_columns_can_be_reported(my):
+    plan = json.dumps({"supported": True, "table": "order", "group_by": ["group"],
+                       "metrics": [{"output": "total", "operation": "sum", "column": "amount"}],
+                       "filters": {"user": "u1"}})
+    reg = my.registry(plan)
+    reg.connect("mysales", engine="mysql", source="my_reader", actor_id="alice")
+    reg.activate("mysales", {"order": {
+        "columns": ["id", "group", "user", "amount"], "filterable_columns": ["user"],
+        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
+    outcome = reg.service("mysales").ask("total per group", execution_context=_context())
+    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
+    my.admin.execute(f"SELECT `group`, SUM(amount) FROM {my.db}.`order` WHERE `user`='u1' GROUP BY `group`")
+    expected = {g: float(t) for g, t in my.admin.fetchall()}
+    assert {r["group"]: float(r["total"]) for r in outcome.rows} == pytest.approx(expected)
