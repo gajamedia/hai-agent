@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # openpyxl and pypdf only read the generated Excel/PDF files back in tests.
+      - run: pip install -e ".[postgresql,mysql]" pytest openpyxl pypdf
+      - run: python -m pytest -q -p no:cacheprovider
+
+  database-engines:
+    name: PostgreSQL and MySQL engine tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Disposable servers with throwaway credentials; they exist only for this job.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: salesdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: salesdb
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -prootpw"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      HAI_PG_TEST_PORT: "5432"
+      HAI_PG_TEST_ADMIN_PASSWORD: testpw
+      HAI_MYSQL_TEST_PORT: "3306"
+      HAI_MYSQL_TEST_ROOT_PASSWORD: rootpw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[postgresql,mysql]" pytest openpyxl pypdf
+      - run: python -m pytest -q -p no:cacheprovider tests/test_postgres_engine.py tests/test_mysql_engine.py
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx vitest run
+      - run: npx vite build

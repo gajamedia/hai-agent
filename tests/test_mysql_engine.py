@@ -29,6 +29,7 @@ from tests.test_table_reports_api import PERMISSION, READ, _Attach, _principal
 
 CONNECT = "database:connection:manage"
 PORT = os.getenv("HAI_MYSQL_TEST_PORT")
+HOST = os.getenv("HAI_MYSQL_TEST_HOST", "127.0.0.1")  # CI service containers use their own host name
 ROOT_PW = os.getenv("HAI_MYSQL_TEST_ROOT_PASSWORD", "")
 live = pytest.mark.skipif(not PORT, reason="set HAI_MYSQL_TEST_PORT for live MySQL tests")
 GOOD = {"type": "mysql", "host": "h", "database": "d", "user": "u", "password_env": "P"}
@@ -122,7 +123,7 @@ def my(monkeypatch, tmp_path):
     import pymysql
     tag = uuid.uuid4().hex[:8]
     db, reader, writer = f"rep_{tag}", f"rd_{tag}", f"wr_{tag}"
-    admin = pymysql.connect(host="127.0.0.1", port=int(PORT), user="root", password=ROOT_PW,
+    admin = pymysql.connect(host=HOST, port=int(PORT), user="root", password=ROOT_PW,
                             autocommit=True)
     cur = admin.cursor()
     cur.execute(f"CREATE DATABASE {db}")
@@ -145,7 +146,7 @@ def my(monkeypatch, tmp_path):
     monkeypatch.setenv("HAI_TEST_MY_ROOT_PW", ROOT_PW)
 
     def profile(user, pw_env="HAI_TEST_MY_ROLE_PW", **extra):
-        return {"type": "mysql", "host": "127.0.0.1", "port": int(PORT), "database": db,
+        return {"type": "mysql", "host": HOST, "port": int(PORT), "database": db,
                 "user": user, "password_env": pw_env, "ssl": "require", **extra}
 
     profiles = parse_profiles({
@@ -224,7 +225,7 @@ def test_mysql_connection_survives_restart_and_api_connects_by_profile(my):
     with TestClient(app) as client:
         listing = client.get("/api/v1/database-connections/profiles")
         assert {"name": "my_reader", "type": "mysql"} in listing.json()["profiles"]
-        assert "127.0.0.1" not in listing.text
+        assert HOST not in listing.text
         ok = client.post("/api/v1/database-connections", json={"name": "viaapi", "profile": "my_reader"})
         assert ok.status_code == 200 and ok.json()["database"] == "mysql"
         assert client.post("/api/v1/database-connections",
@@ -253,4 +254,4 @@ class TestMySQLConformance(ConformanceSuite):
             privileged="my_root", wrong_password="my_wrongpw", sql=sql,
             q_sales=f"{my.db}.sales", q_order=f"{my.db}.`order`", order_name="order",
             quote=lambda column: f"`{column}`", assert_read_only=probe,
-            leak_tokens=["127.0.0.1", my.reader, my.db, ROOT_PW])
+            leak_tokens=[HOST, my.reader, my.db, ROOT_PW])

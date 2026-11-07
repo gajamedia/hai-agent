@@ -26,6 +26,7 @@ from tests.test_table_reports_api import PERMISSION, READ, _Attach, _principal
 
 CONNECT = "database:connection:manage"
 PORT = os.getenv("HAI_PG_TEST_PORT")
+HOST = os.getenv("HAI_PG_TEST_HOST", "127.0.0.1")  # CI service containers use their own host name
 ADMIN_PW = os.getenv("HAI_PG_TEST_ADMIN_PASSWORD", "")
 live = pytest.mark.skipif(not PORT, reason="set HAI_PG_TEST_PORT for live PostgreSQL tests")
 
@@ -108,7 +109,7 @@ def pg(monkeypatch, tmp_path):
     import psycopg
     tag = uuid.uuid4().hex[:8]
     schema, reader, writer = f"rep_{tag}", f"rd_{tag}", f"wr_{tag}"
-    admin = psycopg.connect(host="127.0.0.1", port=int(PORT), dbname="salesdb",
+    admin = psycopg.connect(host=HOST, port=int(PORT), dbname="salesdb",
                             user="postgres", password=ADMIN_PW, autocommit=True)
     cur = admin.cursor()
     cur.execute(f"CREATE SCHEMA {schema}")
@@ -131,7 +132,7 @@ def pg(monkeypatch, tmp_path):
     monkeypatch.setenv("HAI_TEST_PG_ADMIN_PW", ADMIN_PW)
 
     def profile(user, password_env="HAI_TEST_PG_ROLE_PW", **extra):
-        return {"type": "postgresql", "host": "127.0.0.1", "port": int(PORT), "database": "salesdb",
+        return {"type": "postgresql", "host": HOST, "port": int(PORT), "database": "salesdb",
                 "user": user, "password_env": password_env, "schema": schema,
                 "sslmode": "disable", **extra}
 
@@ -197,7 +198,7 @@ def test_api_exposes_profile_names_only_and_connects_by_profile(pg, tmp_path):
         listing = client.get("/api/v1/database-connections/profiles")
         assert listing.status_code == 200
         assert {p["name"] for p in listing.json()["profiles"]} >= {"pg_reader"}
-        assert "127.0.0.1" not in listing.text and "salesdb" not in listing.text
+        assert HOST not in listing.text and "salesdb" not in listing.text
         ok = client.post("/api/v1/database-connections", json={"name": "pgsales", "profile": "pg_reader"})
         assert ok.status_code == 200 and ok.json()["database"] == "postgresql"
         for body in ({"name": "x1", "profile": "pg_reader", "filename": "a.db"},
@@ -224,7 +225,7 @@ def _harness(pg, registry=None):
         writer="pg_writer", privileged="pg_admin", wrong_password="pg_wrongpw", sql=sql,
         q_sales=f"{pg.schema}.sales", q_order=f'{pg.schema}."Order"', order_name="Order",
         quote=lambda column: f'"{column}"', assert_read_only=probe,
-        leak_tokens=["127.0.0.1", "salesdb", ADMIN_PW, pg.reader])
+        leak_tokens=[HOST, "salesdb", ADMIN_PW, pg.reader])
 
 
 @live
