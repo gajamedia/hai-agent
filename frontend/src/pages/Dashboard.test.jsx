@@ -3,7 +3,7 @@ import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 const api = vi.hoisted(() => ({
   checkHealth: vi.fn(),
@@ -382,5 +382,41 @@ describe("Dashboard goal execution", () => {
     resolveRequest(successfulPlanRun());
 
     await screen.findByText("Goal tercapai");
+  });
+});
+
+
+describe("sidebar navigation", () => {
+  afterEach(cleanup);
+
+  function renderWithRoutes() {
+    const Where = () => <div data-testid="where">{useLocation().pathname}</div>;
+    return render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Where />
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/data-reports" element={<h1>DATA REPORTS PAGE</h1>} />
+          <Route path="/autonomous-testing" element={<h1>AUTONOMOUS PAGE</h1>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("opens Data Reports with a client-side navigation instead of a page reload", async () => {
+    const user = userEvent.setup();
+    renderWithRoutes();
+    const link = await screen.findByRole("link", { name: /Data Reports/ });
+    expect(link).toHaveAttribute("href", "/data-reports");
+    await user.click(link);
+    expect(await screen.findByText("DATA REPORTS PAGE")).toBeInTheDocument();
+    expect(screen.getByTestId("where")).toHaveTextContent("/data-reports");
+  });
+
+  it("opens Autonomous Testing the same way", async () => {
+    const user = userEvent.setup();
+    renderWithRoutes();
+    await user.click(await screen.findByRole("link", { name: /Autonomous Testing/ }));
+    expect(await screen.findByText("AUTONOMOUS PAGE")).toBeInTheDocument();
   });
 });

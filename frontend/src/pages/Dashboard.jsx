@@ -1,6 +1,7 @@
 import "./execution.css";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { Link } from "react-router-dom";
 import {
   Activity,
   AlertCircle,
@@ -1519,12 +1520,13 @@ export default function Dashboard() {
         </div>
 
         <p className="nav-label">WORKSPACE</p>
-        <a className="nav" href="/data-reports">
+        {/* Router links, not plain anchors: no full reload, so the Keycloak token is kept. */}
+        <Link className="nav" to="/data-reports">
           <Database size={16} /> Data Reports
-        </a>
-        <a className="nav" href="/autonomous-testing">
+        </Link>
+        <Link className="nav" to="/autonomous-testing">
           <FlaskConical size={16} /> Autonomous Testing
-        </a>
+        </Link>
         <a
           className={`nav ${activeHash === "#top" ? "active" : ""}`}
           href="#top"

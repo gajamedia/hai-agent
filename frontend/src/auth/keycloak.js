@@ -9,6 +9,17 @@ const keycloakConfig = {
 const keycloak = new Keycloak(keycloakConfig);
 let initializationPromise = null;
 
+/**
+ * Where Keycloak should send the browser back after signing in: the page the user was on.
+ * A fixed "/" made every full page load (F5, a plain link, a bookmark) land on the home
+ * dashboard instead of the page that was asked for. Only same-origin location parts are
+ * used, and Keycloak still validates the result against the client's allowed redirect URIs.
+ */
+export function currentPageRedirectUri() {
+  const { origin, pathname, search } = window.location;
+  return `${origin}${pathname || "/"}${search}`;
+}
+
 export function getKeycloak() {
   return keycloak;
 }
@@ -20,7 +31,7 @@ export function initializeKeycloak() {
       flow: "standard",
       pkceMethod: "S256",
       checkLoginIframe: false,
-      redirectUri: `${window.location.origin}/`,
+      redirectUri: currentPageRedirectUri(),
     }).catch((error) => {
       // Permit an explicit retry after an initialization failure.
       initializationPromise = null;

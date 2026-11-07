@@ -365,7 +365,7 @@ export default function DataReports() {
                 Alasan
                 <input value={wantedReason} onChange={(e) => setWantedReason(e.target.value)} placeholder="Data keuangan kami ada di sana" />
               </label>
-              <button className="at-button" disabled={busy || !wantedEngine.trim() || !wantedReason.trim()}>
+              <button className="at-button at-button-secondary" disabled={busy || !wantedEngine.trim() || !wantedReason.trim()}>
                 Kirim permintaan
               </button>
             </form>
@@ -383,13 +383,13 @@ export default function DataReports() {
                   {STATUS_TEXT(c)}
                 </span>
                 {c.status !== "active" && c.status !== "unavailable" && (
-                  <button type="button" className="at-button" disabled={busy} onClick={() => review(c.name)}>
+                  <button type="button" className="at-button at-button-secondary" disabled={busy} onClick={() => review(c.name)}>
                     Setujui
                   </button>
                 )}
                 <button
                   type="button"
-                  className="at-button"
+                  className="at-button at-button-secondary"
                   disabled={busy}
                   onClick={() => disconnect(c.name)}
                   aria-label={`Putuskan ${c.name}`}
@@ -459,7 +459,7 @@ export default function DataReports() {
                     <button type="button" className="at-button at-button-primary" disabled={busy} onClick={runPlan}>
                       Jalankan
                     </button>
-                    <button type="button" className="at-button" disabled={busy} onClick={dropPlan}>
+                    <button type="button" className="at-button at-button-secondary" disabled={busy} onClick={dropPlan}>
                       Batal
                     </button>
                   </div>
@@ -477,7 +477,7 @@ export default function DataReports() {
                       {result.download && (
                         <button
                           type="button"
-                          className="at-button"
+                          className="at-button at-button-secondary"
                           style={{ marginTop: 12 }}
                           disabled={busy}
                           onClick={() => saveFile(result.download)}

@@ -7,13 +7,7 @@ import {
   useState,
 } from "react";
 import { setAccessTokenProvider } from "../api/client.js";
-import {
-  getAuthenticatedUser,
-  getFreshAccessToken,
-  getKeycloak,
-  initializeKeycloak,
-  logoutFromKeycloak,
-} from "./keycloak.js";
+import { getAuthenticatedUser, getFreshAccessToken, getKeycloak, initializeKeycloak, logoutFromKeycloak, currentPageRedirectUri } from "./keycloak.js";
 
 const AuthContext = createContext(null);
 
@@ -60,7 +54,7 @@ export function AuthProvider({ children }) {
   const login = useCallback(() => {
     setError("");
     return getKeycloak().login({
-      redirectUri: `${window.location.origin}/`,
+      redirectUri: currentPageRedirectUri(),
     });
   }, []);
 
