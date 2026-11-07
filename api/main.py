@@ -504,6 +504,7 @@ def create_app(
     from api.routes.database_onboarding import router as database_onboarding_router
     from api.routes.table_reports import router as table_reports_router
     from api.routes.database_connections import router as database_connections_router
+    from api.routes.database_engine_requests import router as database_engine_requests_router
 
     application.include_router(cognitive_router, prefix="/api/v1")
     application.include_router(execution_router, prefix="/api/v1")
@@ -518,6 +519,7 @@ def create_app(
     application.include_router(database_onboarding_router, prefix="/api/v1")
     application.include_router(table_reports_router, prefix="/api/v1")
     application.include_router(database_connections_router, prefix="/api/v1")
+    application.include_router(database_engine_requests_router, prefix="/api/v1")
 
     @application.get("/health", tags=["system"])
     def health() -> dict[str, str]:

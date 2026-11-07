@@ -251,6 +251,13 @@ class DatabaseRuntimeRegistry:
                            approved_by=actor_id, approved_at=approved_at, manager=manager,
                            schema=schema, warnings=tuple(warnings))
 
+    def supported_engine_names(self) -> list[str]:
+        """Product names users might type when asking for an engine (already supported ones)."""
+        aliases = {"sqlite": ["sqlite"], "postgresql": ["postgresql", "postgres"],
+                   "mysql": ["mysql", "mariadb"]}
+        return sorted({alias for kind in {"sqlite", "postgresql", "mysql"}
+                       for alias in aliases[kind]})
+
     def available_engines(self) -> list[str]:
         return sorted(self._engines)
 
@@ -356,7 +363,8 @@ class DatabaseRuntimeRegistry:
             authorization_policy=self.authorization_policy, table_specs=specs,
             trace_path=self.work_dir / f"trace-{conn.name}.jsonl",
             paramstyle=self._engines[conn.engine].paramstyle,
-            identifier_quote=getattr(self._engines[conn.engine], "quote", None))
+            identifier_quote=getattr(self._engines[conn.engine], "quote", None),
+            dialect=getattr(self._engines[conn.engine], "dialect", "limit"))
         port = TrustedCapabilityInvocationPort(
             gateway=assembly.gateway,
             specs={READ_ACTION: CapabilityInvocationSpec(

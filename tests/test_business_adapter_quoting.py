@@ -73,7 +73,7 @@ def test_null_filter_is_quoted_too():
     assert "`group` IS NULL" in sql
 
 
-@pytest.mark.parametrize("quote", ["'", "[", "``", "x", ""])
+@pytest.mark.parametrize("quote", ["'", "(", "``", "x", ""])
 def test_unknown_quote_characters_are_rejected(quote):
     with pytest.raises(ValueError):
         BusinessDatabaseAdapter(connection_factory=lambda: None, table_specs={"order": SPEC},

@@ -13,6 +13,8 @@ vi.mock("../api/client", () => ({
   askTableReport: vi.fn(),
   getDatabaseSchema: vi.fn(),
   listDatabaseProfiles: vi.fn(),
+  listEngineRequests: vi.fn(),
+  createEngineRequest: vi.fn(),
 }));
 
 const SCHEMA = {
@@ -42,6 +44,7 @@ describe("DataReports", () => {
     vi.clearAllMocks();
     api.listDatabaseConnections.mockResolvedValue({ connections: [] });
     api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
   });
 
   it("connects, approves chosen columns only, then shows a report", async () => {
@@ -140,5 +143,20 @@ describe("DataReports", () => {
     expect(screen.queryByLabelText(/password/i)).toBeNull();
     await user.click(screen.getByRole("button", { name: /Hubungkan/ }));
     expect(api.connectDatabase).toHaveBeenCalledWith({ name: "crm", profile: "crm_pg" });
+  });
+
+  it("lets the user ask for an unsupported database and shows the request status", async () => {
+    const user = userEvent.setup();
+    api.createEngineRequest.mockResolvedValue({ id: "r1" });
+    api.listEngineRequests
+      .mockResolvedValueOnce({ requests: [] })
+      .mockResolvedValueOnce({ requests: [{ id: "r1", engine: "Oracle 19c", status: "open" }] });
+    renderPage();
+    await user.click(screen.getByText(/belum didukung/));
+    await user.type(screen.getByLabelText("Nama database"), "Oracle 19c");
+    await user.type(screen.getByLabelText("Alasan"), "finance");
+    await user.click(screen.getByRole("button", { name: /Kirim permintaan/ }));
+    expect(api.createEngineRequest).toHaveBeenCalledWith({ engine: "Oracle 19c", reason: "finance" });
+    expect(await screen.findByText(/Oracle 19c · open/)).toBeTruthy();
   });
 });

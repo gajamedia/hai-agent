@@ -242,3 +242,11 @@ export async function getDatabaseSchema(name, signal) {
 export async function listDatabaseProfiles(signal) {
   return request(`${API_V1}/database-connections/profiles`, { signal });
 }
+
+export async function listEngineRequests(signal) {
+  return request(`${API_V1}/database-engine-requests`, { signal });
+}
+
+export async function createEngineRequest(payload, signal) {
+  return jsonPost(`${API_V1}/database-engine-requests`, payload, signal);
+}

@@ -4,11 +4,13 @@ import { Link } from "react-router-dom";
 import {
   approveDatabaseTables,
   askTableReport,
+  createEngineRequest,
   connectDatabase,
   disconnectDatabase,
   getDatabaseSchema,
   listDatabaseConnections,
   listDatabaseProfiles,
+  listEngineRequests,
 } from "../api/client.js";
 import "./autonomous-testing.css";
 
@@ -159,6 +161,9 @@ export default function DataReports() {
   const [profiles, setProfiles] = useState([]);
   const [source, setSource] = useState("");
   const [warnings, setWarnings] = useState([]);
+  const [engineRequests, setEngineRequests] = useState([]);
+  const [wantedEngine, setWantedEngine] = useState("");
+  const [wantedReason, setWantedReason] = useState("");
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -175,6 +180,9 @@ export default function DataReports() {
 
   useEffect(() => {
     refresh();
+    listEngineRequests()
+      .then((data) => setEngineRequests(data.requests || []))
+      .catch(() => setEngineRequests([]));
     listDatabaseProfiles()
       .then((data) => setProfiles(data.profiles || []))
       .catch(() => setProfiles([]));
@@ -230,6 +238,16 @@ export default function DataReports() {
       setSelected(target);
       setResult(null);
     });
+
+  const requestEngine = (event) => {
+    event.preventDefault();
+    return guarded(async () => {
+      await createEngineRequest({ engine: wantedEngine.trim(), reason: wantedReason.trim() });
+      setWantedEngine("");
+      setWantedReason("");
+      setEngineRequests((await listEngineRequests()).requests || []);
+    });
+  };
 
   const ask = (event) => {
     event.preventDefault();
@@ -296,6 +314,27 @@ export default function DataReports() {
               <Plug size={14} /> Hubungkan
             </button>
           </form>
+          <details style={{ marginTop: 14 }}>
+            <summary>Database Anda belum didukung?</summary>
+            <form className="at-form" onSubmit={requestEngine} aria-label="Minta engine baru">
+              <label>
+                Nama database
+                <input value={wantedEngine} onChange={(e) => setWantedEngine(e.target.value)} placeholder="Oracle 19c" />
+              </label>
+              <label>
+                Alasan
+                <input value={wantedReason} onChange={(e) => setWantedReason(e.target.value)} placeholder="Data keuangan kami ada di sana" />
+              </label>
+              <button className="at-button" disabled={busy || !wantedEngine.trim() || !wantedReason.trim()}>
+                Kirim permintaan
+              </button>
+            </form>
+            <ul style={{ listStyle: "none", padding: 0 }}>
+              {engineRequests.map((r) => (
+                <li key={r.id}>{r.engine} · {r.status}{r.note ? ` (${r.note})` : ""}</li>
+              ))}
+            </ul>
+          </details>
           <ul style={{ listStyle: "none", padding: 0, marginTop: 14 }}>
             {connections.map((c) => (
               <li key={c.name} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}>

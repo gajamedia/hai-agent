@@ -70,6 +70,7 @@ def build_business_database_gateway(
     risk_score: float = DEFAULT_RISK_SCORE,
     fsync_trace: bool = True,
     identifier_quote: str | None = None,
+    dialect: str = "limit",
 ) -> BusinessDatabaseGatewayAssembly:
     """Compose an explicitly configured read-only database capability.
 
@@ -119,6 +120,7 @@ def build_business_database_gateway(
         table_specs=table_specs,
         paramstyle=paramstyle,
         identifier_quote=identifier_quote,
+        dialect=dialect,
     )
 
     registry = TrustedCapabilityRegistry()

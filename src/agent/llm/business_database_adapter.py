@@ -15,6 +15,9 @@ from .capability_execution_contracts import (
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# How each SQL family limits rows: LIMIT n (SQLite/PostgreSQL/MySQL), SELECT TOP (n)
+# (SQL Server) and FETCH FIRST n ROWS ONLY (Oracle 12c+).
+_DIALECTS = frozenset({"limit", "top", "fetch_first"})
 _ALLOWED_ARGUMENTS = frozenset({"table", "columns", "filters", "order_by", "limit"})
 
 
@@ -96,13 +99,16 @@ class BusinessDatabaseAdapter:
         table_specs: Mapping[str, ReadOnlyTableSpec],
         paramstyle: str = "qmark",
         identifier_quote: str | None = None,
+        dialect: str = "limit",
     ) -> None:
-        if identifier_quote not in {None, '"', "`"}:
-            raise ValueError("identifier_quote must be None, '\"' or '`'.")
+        if identifier_quote not in {None, '"', "`", "["}:
+            raise ValueError("identifier_quote must be None, '\"', '`' or '['.")
+        if dialect not in _DIALECTS:
+            raise ValueError(f"dialect must be one of {sorted(_DIALECTS)}.")
         if not callable(connection_factory):
             raise TypeError("connection_factory must be callable.")
-        if paramstyle not in {"qmark", "format"}:
-            raise ValueError("paramstyle must be 'qmark' or 'format'.")
+        if paramstyle not in {"qmark", "format", "numeric"}:
+            raise ValueError("paramstyle must be 'qmark', 'format' or 'numeric'.")
         if not isinstance(table_specs, Mapping) or not table_specs:
             raise ValueError("table_specs must be a non-empty mapping.")
         normalized: dict[str, ReadOnlyTableSpec] = {}
@@ -117,14 +123,27 @@ class BusinessDatabaseAdapter:
             normalized[key] = spec
         self._connection_factory = connection_factory
         self._table_specs = dict(normalized)
-        self._placeholder = "?" if paramstyle == "qmark" else "%s"
+        self._paramstyle = paramstyle
+        self._dialect = dialect
         # Identifiers are already validated against a strict pattern, so quoting
         # them can never be broken out of; it only makes reserved words and
         # mixed-case names usable. None keeps the historical unquoted SQL.
         self._quote = identifier_quote
 
     def _q(self, identifier: str) -> str:
-        return identifier if self._quote is None else f"{self._quote}{identifier}{self._quote}"
+        if self._quote is None:
+            return identifier
+        if self._quote == "[":  # SQL Server brackets
+            return f"[{identifier}]"
+        return f"{self._quote}{identifier}{self._quote}"
+
+    def _placeholder(self, position: int) -> str:
+        """Placeholder for the parameter at 1-based ``position`` in the final SQL text."""
+        if self._paramstyle == "qmark":
+            return "?"
+        if self._paramstyle == "format":
+            return "%s"
+        return f":{position}"  # numeric (Oracle)
 
     @property
     def target(self) -> str:
@@ -283,9 +302,17 @@ class BusinessDatabaseAdapter:
                 f"limit must be an integer between 1 and {spec.max_limit}."
             )
 
-        sql = (f"SELECT {', '.join(self._q(c) for c in requested_columns)} "
-               f"FROM {self._q(table)}")
         parameters: list[Any] = []
+
+        def bind(value: Any) -> str:
+            # Placeholders are numbered by their order in the final SQL text, so a
+            # dialect that puts the row limit first (TOP) still binds correctly.
+            parameters.append(value)
+            return self._placeholder(len(parameters))
+
+        top = f"TOP ({bind(limit)}) " if self._dialect == "top" else ""
+        sql = (f"SELECT {top}{', '.join(self._q(c) for c in requested_columns)} "
+               f"FROM {self._q(table)}")
         if filters:
             where_fragments: list[str] = []
             for column, value in filters.items():
@@ -296,15 +323,14 @@ class BusinessDatabaseAdapter:
                         raise CapabilityRequestValidationError(
                             f"Filter value for '{column}' must be a scalar."
                         )
-                    where_fragments.append(
-                        f"{self._q(column)} = {self._placeholder}"
-                    )
-                    parameters.append(value)
+                    where_fragments.append(f"{self._q(column)} = {bind(value)}")
             sql += " WHERE " + " AND ".join(where_fragments)
         if order_fragments:
             sql += " ORDER BY " + ", ".join(order_fragments)
-        sql += f" LIMIT {self._placeholder}"
-        parameters.append(limit)
+        if self._dialect == "limit":
+            sql += f" LIMIT {bind(limit)}"
+        elif self._dialect == "fetch_first":  # Oracle 12c+, standard SQL
+            sql += f" FETCH FIRST {bind(limit)} ROWS ONLY"
         return sql, tuple(parameters)
 
 
