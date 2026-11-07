@@ -75,6 +75,29 @@ Open http://localhost:5173, sign in, and choose **Data Reports** in the sidebar.
 MySQL is chosen **by profile name**, never by typing a host or password into the page: those live on the
 server. The page only shows a **Sumber** list once at least one profile exists.
 
+### Quick way (recommended): one command creates the account and fills in the files
+
+1. Create `data\reports\profiles.json` as in step **c** below, with your database name. The `user` field may
+   say anything (even `root`); the tool replaces it.
+2. Make sure `.env` has `HAI_DATABASE_PROFILES=...` (step **d**). Leave `HAI_MYSQL_LOCAL_PASSWORD=` empty.
+3. Run:
+
+   ```powershell
+   python scripts\setup_mysql_readonly_user.py local_mysql
+   ```
+
+   It shows the plan and asks for a yes, then asks for the password of a MySQL administrator (`root` by
+   default; typed hidden, never stored or printed). It creates a read-only account `hai_reader` that can
+   only `SELECT` from your one database, gives it a random password, writes that password into `.env`,
+   sets `"user": "hai_reader"` in `profiles.json`, and runs the same check as `check_database_profile.py`.
+   Your other databases stay out of its reach. Running it again just resets the password.
+4. Restart the backend, reload the page, choose **Sumber -> local_mysql**, **Hubungkan**.
+
+If the final check says `Access denied for 'hai_reader'@'<host>'`, run the tool again with that host,
+for example `--hosts localhost,127.0.0.1,::1`. A different administrator: `--admin-user <name>`.
+
+The manual way follows, if you prefer to run the SQL yourself.
+
 **a. The driver** is installed with the project (`pip install ".[mysql]"` if it is missing).
 
 **b. Create a read-only account.** In MySQL Shell or Workbench, as an administrator:
