@@ -91,7 +91,15 @@ def check_profile(name: str, profiles: Mapping[str, Any]) -> tuple[bool, list[st
         lines.append(f"[FAIL] environment variable {profile.password_env} is not set or empty. "
                      "Put it in .env (or set it in this terminal), then restart the server.")
         return False, lines
-    lines.append(f"[ok]   password variable {profile.password_env} is set")
+    secret = os.environ[profile.password_env]
+    # The length is not a secret but lets you spot a value that .env cut short (a `#`
+    # starts a comment) without the tool ever printing the password itself.
+    lines.append(f"[ok]   password variable {profile.password_env} is set ({len(secret)} characters)")
+    if secret[:1] in {'"', "'"} or secret[-1:] in {'"', "'"}:
+        lines.append("[WARN] the password starts or ends with a quote character. In .env write the "
+                     "value without quotes, or the quote becomes part of the password.")
+    if secret != secret.strip():
+        lines.append("[WARN] the password starts or ends with a space.")
     engine = _ENGINES[profile.type]({name: profile})
     manager = ConnectionManager()
     try:

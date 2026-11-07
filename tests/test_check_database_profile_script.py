@@ -188,3 +188,20 @@ def test_loading_an_env_file_inside_a_test_does_not_leak_into_the_next_test(tmp_
 def test_the_probe_from_the_previous_test_is_gone():
     import os
     assert "HAI_TEST_LEAK_PROBE" not in os.environ
+
+
+def test_the_password_length_is_shown_but_never_the_password(monkeypatch):
+    monkeypatch.setattr(MySQLEngine, "open", lambda self, *a, **k: (_ for _ in ()).throw(Exception(1045, "denied")))
+    ok, lines = tool.check_profile("local_mysql", _profiles())
+    text = _text(lines)
+    assert "(20 characters)" in text and "very-secret-password" not in text
+
+
+@pytest.mark.parametrize("value,warning", [
+    ('"quoted"', "quote character"), ("'single'", "quote character"), ("trailing ", "ends with a space"),
+])
+def test_values_that_look_mangled_get_a_warning(monkeypatch, value, warning):
+    monkeypatch.setenv("HAI_TEST_CHECK_PW", value)
+    monkeypatch.setattr(MySQLEngine, "open", lambda self, *a, **k: (_ for _ in ()).throw(Exception(1045, "denied")))
+    ok, lines = tool.check_profile("local_mysql", _profiles())
+    assert warning in _text(lines)
