@@ -1,4 +1,3 @@
-
 import "@testing-library/jest-dom/vitest";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +15,42 @@ const api = vi.hoisted(() => ({
   runExecution: vi.fn(),
   resetExecution: vi.fn(),
   getCapabilityTelemetry: vi.fn(),
+  getEnvironmentProviders: vi.fn(),
+  getEnvironmentInstances: vi.fn(),
+  getEnvironmentInstanceCapabilities: vi.fn(),
+}));
+
+
+vi.mock("../components/AssistantComposer.jsx", () => ({
+  default: ({ onPrepareExecution }) => (
+    <button
+      type="button"
+      onClick={() => onPrepareExecution({
+        goalDescription: "Open the box",
+        plan: {
+          goal: "Open the box",
+          rationale: "Use the registered action.",
+          steps: [{
+            index: 1,
+            action: "open_box",
+            purpose: "Open the box",
+            preconditions: [],
+            expected_observation: "The box is open.",
+            success_criteria: "box=open",
+            risk: null,
+          }],
+          assumptions: [],
+          constraints: [],
+          stop_conditions: [],
+          confidence: 0.95,
+          provider: "test-provider",
+          model: "test-model",
+        },
+      })}
+    >
+      Prepare test Cognitive Pass plan
+    </button>
+  ),
 }));
 
 vi.mock("../api/client.js", () => ({
@@ -91,6 +126,12 @@ beforeEach(() => {
   api.getCapabilityTelemetry.mockResolvedValue({});
   api.getStrategies.mockResolvedValue([]);
   api.getExecutionState.mockResolvedValue(initialState);
+  api.getEnvironmentProviders.mockResolvedValue({ items: [] });
+  api.getEnvironmentInstances.mockResolvedValue({ items: [] });
+  api.getEnvironmentInstanceCapabilities.mockResolvedValue({
+    available_capability_ids: [],
+    candidates: [],
+  });
   api.runCognitive.mockResolvedValue({});
   api.runExecution.mockResolvedValue({});
   api.resetExecution.mockResolvedValue(initialState);
@@ -108,7 +149,7 @@ describe("Dashboard goal execution", () => {
     renderDashboard();
 
     const button = await screen.findByRole("button", {
-      name: "Plan & Run Goal",
+      name: "Run autonomous goal",
     });
 
     await waitFor(() => {
@@ -129,9 +170,74 @@ describe("Dashboard goal execution", () => {
 
     expect(payload.goal_description).toBe("Open the box");
     expect(payload.target_state).toEqual({ box: "open" });
-    expect(payload.actions).toContain("open_box");
+    expect(payload).not.toHaveProperty("actions");
+    expect(payload).not.toHaveProperty("plan");
     expect(idempotencyKey).toEqual(expect.any(String));
     expect(idempotencyKey.length).toBeGreaterThan(0);
+  });
+
+  it("hands the original Cognitive Pass plan to the backend without actions", async () => {
+    const user = userEvent.setup();
+
+    renderDashboard();
+
+    await user.click(await screen.findByRole("button", {
+      name: "Prepare test Cognitive Pass plan",
+    }));
+
+    expect(
+      await screen.findByText("Cognitive Pass plan siap diserahkan"),
+    ).toBeInTheDocument();
+
+    const button = screen.getByRole("button", {
+      name: "Run autonomous goal",
+    });
+    await waitFor(() => expect(button).toBeEnabled());
+    await user.click(button);
+
+    await screen.findByText("Goal tercapai");
+
+    const [payload] = api.runCognitivePlan.mock.calls[0];
+    expect(payload.plan).toMatchObject({
+      goal: "Open the box",
+      provider: "test-provider",
+      model: "test-model",
+      steps: [{ index: 1, action: "open_box", purpose: "Open the box" }],
+    });
+    expect(payload).not.toHaveProperty("actions");
+    expect(payload.observation).toEqual(initialState.state);
+  });
+
+  it("discards a prepared plan when the goal is edited", async () => {
+    const user = userEvent.setup();
+
+    renderDashboard();
+
+    await user.click(await screen.findByRole("button", {
+      name: "Prepare test Cognitive Pass plan",
+    }));
+    expect(
+      await screen.findByText("Cognitive Pass plan siap diserahkan"),
+    ).toBeInTheDocument();
+
+    const goalInput = screen.getByPlaceholderText("Contoh: Unlock the door");
+    await user.clear(goalInput);
+    await user.type(goalInput, "Take the key");
+
+    expect(
+      screen.queryByText("Cognitive Pass plan siap diserahkan"),
+    ).not.toBeInTheDocument();
+
+    const button = screen.getByRole("button", {
+      name: "Run autonomous goal",
+    });
+    await waitFor(() => expect(button).toBeEnabled());
+    await user.click(button);
+    await screen.findByText("Goal tercapai");
+
+    const [payload] = api.runCognitivePlan.mock.calls[0];
+    expect(payload).not.toHaveProperty("plan");
+    expect(payload).not.toHaveProperty("actions");
   });
 
   it("does not claim the goal is achieved when execution succeeds but verification fails", async () => {
@@ -147,7 +253,7 @@ describe("Dashboard goal execution", () => {
     renderDashboard();
 
     const button = await screen.findByRole("button", {
-      name: "Plan & Run Goal",
+      name: "Run autonomous goal",
     });
 
     await waitFor(() => expect(button).toBeEnabled());
@@ -182,7 +288,7 @@ describe("Dashboard goal execution", () => {
     renderDashboard();
 
     const button = await screen.findByRole("button", {
-      name: "Plan & Run Goal",
+      name: "Run autonomous goal",
     });
 
     await waitFor(() => expect(button).toBeEnabled());
@@ -202,6 +308,43 @@ describe("Dashboard goal execution", () => {
     expect(
       screen.getByText(/rekonsiliasi diperlukan/i),
     ).toBeInTheDocument();
+
+    // An unknown outcome must block every UI action that can mutate simulation state.
+    expect(
+      screen.getByRole("button", { name: "Run autonomous goal" }),
+    ).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "Execute actions" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Reset simulation" }),
+    ).toBeDisabled();
+
+    // Reading state remains available; it does not clear the safety lock.
+    expect(
+      screen.getByRole("button", { name: "Refresh state" }),
+    ).toBeEnabled();
+  });
+
+  it("lets manual mode send the explicit selected action IDs", async () => {
+    const user = userEvent.setup();
+
+    renderDashboard();
+
+    const manualMode = await screen.findByRole("button", {
+      name: "Manual mode",
+    });
+    await user.click(manualMode);
+
+    const button = screen.getByRole("button", { name: "Plan & Run Goal" });
+    await waitFor(() => expect(button).toBeEnabled());
+    await user.click(button);
+
+    await screen.findByText("Goal tercapai");
+
+    const [payload] = api.runCognitivePlan.mock.calls[0];
+    expect(payload.actions).toEqual(["open_box"]);
+    expect(payload).not.toHaveProperty("plan");
   });
 
   it("disables the plan-run button while a request is pending", async () => {
@@ -219,7 +362,7 @@ describe("Dashboard goal execution", () => {
     renderDashboard();
 
     const button = await screen.findByRole("button", {
-      name: "Plan & Run Goal",
+      name: "Run autonomous goal",
     });
 
     await waitFor(() => expect(button).toBeEnabled());

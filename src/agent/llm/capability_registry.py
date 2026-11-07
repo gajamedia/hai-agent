@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
 from types import MappingProxyType
-from typing import Iterable, Mapping
+from typing import Iterable, Iterator, Mapping
 
 from agent.core.action import Action
 
@@ -90,6 +91,10 @@ class TrustedCapabilityRegistry:
         builtin_actions: Iterable[Action] | None = None,
     ) -> None:
         self._lock = RLock()
+        # Per-capability locks serialize reads against lifecycle changes without
+        # blocking unrelated capabilities. Lock objects are retained for the
+        # registry lifetime so all callers coordinate on the same lock.
+        self._execution_locks: dict[str, RLock] = {}
         self._records: dict[str, CapabilityRecord] = {}
         self._action_index: dict[str, str] = {}
         self._version = 0
@@ -296,6 +301,96 @@ class TrustedCapabilityRegistry:
             permissions=permissions,
         )
 
+    def register_approved_proposal(
+        self,
+        *,
+        capability_id: str,
+        action: Action,
+        risk_level: str,
+        permissions: Iterable[str] = (),
+    ) -> CapabilityRecord:
+        """
+        Register an application-built Action after an application approval.
+
+        The proposal itself supplies metadata only. The caller must resolve the
+        handler from an application-owned catalog before calling this method.
+        This method must never be exposed directly as an LLM tool.
+        """
+        self._validate_capability_id(capability_id)
+        self._validate_action(action)
+        self._validate_action_name(action.name)
+        self._validate_risk_level(risk_level)
+        normalized_permissions = self._normalize_permissions(permissions)
+
+        return self._register(
+            capability_id=capability_id,
+            action=action,
+            trust_level=CapabilityTrustLevel.APPROVED_PROPOSAL,
+            risk_level=risk_level,
+            permissions=normalized_permissions,
+        )
+
+    def rollback_approved_proposal_registration(
+        self,
+        capability_id: str,
+        *,
+        expected_action: Action,
+    ) -> bool:
+        """
+        Remove a just-created approved-proposal registration during rollback.
+
+        Only APPROVED_PROPOSAL records can be removed. This is intended for
+        application transaction recovery when Agent/Planner synchronization
+        fails immediately after registration; it is not a user-facing delete.
+        """
+        execution_lock = self._execution_lock_for(capability_id)
+        with execution_lock, self._lock:
+            record = self._records.get(capability_id)
+            if record is None:
+                return False
+            if record.trust_level != CapabilityTrustLevel.APPROVED_PROPOSAL:
+                raise CapabilityRegistrationError(
+                    "Only approved-proposal registrations can be rolled back."
+                )
+            if record.action is not expected_action:
+                raise CapabilityRegistrationError(
+                    "Approved-proposal rollback action identity mismatch."
+                )
+            self._records.pop(capability_id)
+            self._action_index.pop(record.action_name, None)
+            self._version += 1
+            return True
+
+    def _execution_lock_for(self, capability_id: str) -> RLock:
+        """Return the stable per-capability lock, creating it if needed."""
+        with self._lock:
+            lock = self._execution_locks.get(capability_id)
+            if lock is None:
+                lock = RLock()
+                self._execution_locks[capability_id] = lock
+            return lock
+
+    @contextmanager
+    def execution_lease(self, capability_id: str) -> Iterator[CapabilityRecord]:
+        """Hold an active capability against disable/revoke for one operation.
+
+        The global registry lock is held only while resolving the record. The
+        per-capability lock remains held for the caller's entire context, so a
+        lifecycle transition for this capability waits until the operation
+        finishes. Other capability IDs remain independently executable.
+
+        A lease does not make a capability permanently active: once the
+        context exits, a waiting disable/revoke may immediately take effect.
+        """
+        if not isinstance(capability_id, str) or not capability_id:
+            raise CapabilityValidationError(
+                "capability_id must be a non-empty string."
+            )
+        execution_lock = self._execution_lock_for(capability_id)
+        with execution_lock:
+            record = self.get(capability_id)
+            yield record
+
     def get(
         self,
         capability_id: str,
@@ -399,7 +494,8 @@ class TrustedCapabilityRegistry:
                 "synchronize must be callable."
             )
 
-        with self._lock:
+        execution_lock = self._execution_lock_for(capability_id)
+        with execution_lock, self._lock:
             previous = self._records.get(capability_id)
             if previous is None:
                 raise CapabilityNotFoundError(
@@ -429,7 +525,8 @@ class TrustedCapabilityRegistry:
                 "status must be a CapabilityStatus."
             )
 
-        with self._lock:
+        execution_lock = self._execution_lock_for(capability_id)
+        with execution_lock, self._lock:
             record = self._records.get(capability_id)
 
             if record is None:

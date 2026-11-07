@@ -297,3 +297,52 @@ def test_status_type_is_validated():
 
     with pytest.raises(CapabilityLifecycleValidationError):
         manager.transition("application.inspect_room", "disabled")
+
+
+def test_inspection_reports_active_action_missing_from_agent_mapping():
+    manager, _, agent, _ = make_manager()
+    agent.actions.pop("inspect_room")
+
+    report = manager.inspect()
+
+    assert report.active_registry_action_names == ("inspect_room",)
+    assert report.missing_active_action_names == ("inspect_room",)
+    assert report.is_consistent is False
+    assert report.adapter_report.ready_action_names == ("inspect_room",)
+
+
+def test_inspection_reports_active_action_missing_from_planner():
+    manager, _, agent, action = make_manager()
+    agent.planner.actions.clear()
+
+    report = manager.inspect()
+
+    assert report.active_registry_action_names == ("inspect_room",)
+    assert report.missing_active_action_names == ("inspect_room",)
+    assert report.is_consistent is False
+    assert report.adapter_report.already_registered_action_names == ("inspect_room",)
+    assert action not in agent.planner.actions
+
+
+def test_inspection_reports_active_action_mapping_identity_conflict():
+    manager, _, agent, _ = make_manager()
+    replacement = make_action("inspect_room")
+    agent.actions["inspect_room"] = replacement
+
+    report = manager.inspect()
+
+    assert report.active_registry_action_names == ("inspect_room",)
+    assert report.missing_active_action_names == ("inspect_room",)
+    assert report.is_consistent is False
+    assert report.adapter_report.conflicts == ("agent_action_conflict:inspect_room",)
+
+
+def test_inspection_reports_detached_hook_as_inconsistent():
+    manager, _, _, _ = make_manager()
+    assert manager.adapter.detach() is True
+
+    report = manager.inspect()
+
+    assert report.planner_sync_hook_attached is False
+    assert report.is_consistent is False
+

@@ -1,6 +1,19 @@
-﻿export const API_BASE_URL = (
+export const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
 ).replace(/\/+$/, "");
+
+let accessTokenProvider = null;
+
+/**
+ * Register the authenticated-session token provider.
+ * Pass null during auth teardown or in isolated tests.
+ */
+export function setAccessTokenProvider(provider) {
+  if (provider !== null && typeof provider !== "function") {
+    throw new TypeError("Access token provider must be a function or null.");
+  }
+  accessTokenProvider = provider;
+}
 
 async function parseResponse(response) {
   const text = await response.text();
@@ -29,8 +42,25 @@ async function parseResponse(response) {
   return body;
 }
 
+function isPublicEndpoint(path) {
+  return path === "/health" || path.startsWith("/health?");
+}
+
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+  const headers = { ...(options.headers || {}) };
+
+  if (!isPublicEndpoint(path) && accessTokenProvider) {
+    const token = await accessTokenProvider();
+    if (!token || typeof token !== "string") {
+      throw new Error("Sesi Keycloak tidak memiliki access token yang valid.");
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers,
+  });
   return parseResponse(response);
 }
 
@@ -52,11 +82,9 @@ export async function getCapabilityTelemetry({
   signal,
 } = {}) {
   const query = new URLSearchParams({ limit: String(limit) });
-
-  return request(
-    `/api/v1/telemetry/capabilities?${query.toString()}`,
-    { signal },
-  );
+  return request(`/api/v1/telemetry/capabilities?${query.toString()}`, {
+    signal,
+  });
 }
 
 export async function getCapabilityTelemetrySources({ limit = 20, signal } = {}) {
@@ -69,6 +97,26 @@ export async function getCapabilityTelemetrySources({ limit = 20, signal } = {})
 
 export async function getStrategies(signal) {
   return request("/api/v1/strategies", { signal });
+}
+
+const ENVIRONMENT_WORKSPACE_BASE = "/api/v1/capabilities/environment-workspace";
+
+export async function getEnvironmentProviders(signal) {
+  return request(`${ENVIRONMENT_WORKSPACE_BASE}/providers`, { signal });
+}
+
+export async function getEnvironmentInstances(signal) {
+  return request(`${ENVIRONMENT_WORKSPACE_BASE}/instances`, { signal });
+}
+
+export async function getEnvironmentInstanceCapabilities(instanceId, signal) {
+  if (!instanceId || typeof instanceId !== "string") {
+    throw new TypeError("Environment instance ID is required.");
+  }
+  return request(
+    `${ENVIRONMENT_WORKSPACE_BASE}/instances/${encodeURIComponent(instanceId)}/capabilities`,
+    { signal },
+  );
 }
 
 export async function getExecutionState(signal) {
@@ -84,14 +132,6 @@ export async function runExecution(payload, signal) {
   });
 }
 
-// export async function runCognitivePlan(payload, signal) {
-//   return request("/api/v1/execution/plan-run", {
-//     method: "POST",
-//     headers: { "Content-Type": "application/json" },
-//     body: JSON.stringify(payload),
-//     signal,
-//   });
-// }
 export async function runCognitivePlan(
   payload,
   signal,
@@ -118,4 +158,87 @@ export async function resetExecution(signal) {
     method: "POST",
     signal,
   });
+}
+
+const AUTONOMOUS_TESTING_BASE = "/api/v1/autonomous-testing";
+
+export async function createAutonomousTestBatch(payload, signal) {
+  return request(`${AUTONOMOUS_TESTING_BASE}/batches`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+}
+
+export async function startAutonomousTestBatch(batchId, signal) {
+  return request(
+    `${AUTONOMOUS_TESTING_BASE}/batches/${encodeURIComponent(batchId)}/run`,
+    { method: "POST", signal },
+  );
+}
+
+export async function getAutonomousTestBatches({ limit = 50, signal } = {}) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`${AUTONOMOUS_TESTING_BASE}/batches?${query.toString()}`, {
+    signal,
+  });
+}
+
+export async function getAutonomousTestBatch(batchId, signal) {
+  return request(
+    `${AUTONOMOUS_TESTING_BASE}/batches/${encodeURIComponent(batchId)}`,
+    { signal },
+  );
+}
+
+export async function getAutonomousTestBatchResults(batchId, signal) {
+  return request(
+    `${AUTONOMOUS_TESTING_BASE}/batches/${encodeURIComponent(batchId)}/results`,
+    { signal },
+  );
+}
+
+const API_V1 = "/api/v1";
+const jsonPost = (path, payload, signal) =>
+  request(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+export async function listDatabaseConnections(signal) {
+  return request(`${API_V1}/database-connections`, { signal });
+}
+
+export async function connectDatabase(payload, signal) {
+  return jsonPost(`${API_V1}/database-connections`, payload, signal);
+}
+
+export async function approveDatabaseTables(name, tables, signal) {
+  return jsonPost(
+    `${API_V1}/database-connections/${encodeURIComponent(name)}/approve`,
+    { tables },
+    signal,
+  );
+}
+
+export async function disconnectDatabase(name, signal) {
+  return request(`${API_V1}/database-connections/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    signal,
+  });
+}
+
+export async function askTableReport(payload, signal) {
+  return jsonPost(`${API_V1}/table-reports`, payload, signal);
+}
+
+export async function getDatabaseSchema(name, signal) {
+  return request(`${API_V1}/database-connections/${encodeURIComponent(name)}/schema`, { signal });
+}
+
+export async function listDatabaseProfiles(signal) {
+  return request(`${API_V1}/database-connections/profiles`, { signal });
 }

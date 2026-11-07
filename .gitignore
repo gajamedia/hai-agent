@@ -34,8 +34,9 @@ artifacts/**/*.jsonl
 *-bak.*
 *,bak*
 audit_reports/
-artifacts/phase0_*/
+artifacts/
 frontend/test-results/
 demo03_plan_run_error.json
 data/e2e/
 data/execution_traces.jsonl*
+*pybak*

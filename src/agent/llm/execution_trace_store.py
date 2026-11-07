@@ -2,21 +2,27 @@ from __future__ import annotations
 
 """Append-only JSONL persistence and read-only replay for execution traces.
 
-This module stores events; it deliberately never invokes an executor, action,
-planner, or agent. Events are hash chained so accidental edits, truncation,
-reordering, and duplicate event identifiers can be detected on read.
+The store uses both an in-process reentrant lock and an operating-system file
+lock. The sidecar lock coordinates independent ExecutionTraceStore instances
+and worker processes that share the same local trace path.
+
+The JSONL schema and hash-chain format remain compatible with schema version 1.
+This module never invokes an executor, action, planner, or agent.
 """
 
+import errno
 import hashlib
 import json
 import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 
 class ExecutionTraceError(RuntimeError):
-    """Base error for execution trace operations."""
+    """Base error for trace-store operations."""
 
 
 class ExecutionTraceInputError(ExecutionTraceError, ValueError):
@@ -28,14 +34,14 @@ class ExecutionTraceIntegrityError(ExecutionTraceError):
 
 
 class ExecutionTraceStore:
-    """Append-only, hash-chained JSONL event store with idempotent appends.
+    """Append-only, hash-chained JSONL event store with process-safe appends.
 
-    Each event must provide non-empty ``event_id``, ``execution_id``, and
-    ``event_type``. ``payload`` may be any JSON-serializable mapping.
+    Identical duplicate event IDs are idempotent; conflicting duplicates are
+    rejected. All reads and writes acquire the same sidecar OS lock so a reader
+    cannot observe a writer halfway through an append.
 
-    Re-appending the same event_id and same event content is idempotent. Using
-    the same event_id for different content raises an integrity error.
-    ``replay`` returns stored events in sequence order and never executes them.
+    The lock is intended for processes sharing a local filesystem path. Network
+    filesystems may have different locking guarantees and are not covered.
     """
 
     SCHEMA_VERSION = 1
@@ -53,6 +59,7 @@ class ExecutionTraceStore:
         self.path = Path(path)
         self.fsync = bool(fsync)
         self._lock = RLock()
+        self._lock_path = self.path.with_name(self.path.name + ".lock")
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -73,13 +80,17 @@ class ExecutionTraceStore:
     @classmethod
     def _record_hash(cls, record: Mapping[str, Any]) -> str:
         material = {key: record[key] for key in cls._HASH_FIELDS}
-        return hashlib.sha256(cls._canonical_json(material).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            cls._canonical_json(material).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _required_text(event: Mapping[str, Any], key: str) -> str:
         value = event.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise ExecutionTraceInputError(f"event.{key} must be a non-empty string.")
+            raise ExecutionTraceInputError(
+                f"event.{key} must be a non-empty string."
+            )
         return value.strip()
 
     def _normalise_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
@@ -91,7 +102,6 @@ class ExecutionTraceStore:
         payload = event.get("payload", {})
         if not isinstance(payload, Mapping):
             raise ExecutionTraceInputError("event.payload must be a mapping.")
-        # Round-trip to detach caller-owned nested structures and validate JSON.
         detached_payload = json.loads(self._canonical_json(dict(payload)))
         return {
             "event_id": event_id,
@@ -100,91 +110,178 @@ class ExecutionTraceStore:
             "payload": detached_payload,
         }
 
-    def read_all(self) -> list[dict[str, Any]]:
-        """Read and verify the complete store; fail closed on any corruption."""
+    @contextmanager
+    def _process_file_lock(self) -> Iterator[None]:
+        """Acquire an exclusive OS lock on a stable sidecar file."""
+        try:
+            stream = self._lock_path.open("a+b")
+        except OSError as exc:
+            raise ExecutionTraceError(
+                f"Unable to open trace lock file: {exc}"
+            ) from exc
+
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() == 0:
+                    stream.write(b"\0")
+                    stream.flush()
+                stream.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {
+                            errno.EACCES,
+                            errno.EAGAIN,
+                            errno.EDEADLK,
+                        }:
+                            raise
+                        time.sleep(0.05)
+            elif os.name == "posix":
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                acquired = True
+            else:
+                raise ExecutionTraceError(
+                    f"Process-safe trace locking is unsupported on os.name={os.name!r}."
+                )
+
+            yield
+        except ExecutionTraceError:
+            raise
+        except OSError as exc:
+            raise ExecutionTraceError(
+                f"Unable to acquire or use trace lock: {exc}"
+            ) from exc
+        finally:
+            if acquired:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    elif os.name == "posix":
+                        import fcntl
+
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                finally:
+                    stream.close()
+            else:
+                stream.close()
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[None]:
+        # The thread lock prevents same-instance threads from racing; the
+        # sidecar OS lock coordinates independent instances and processes.
         with self._lock:
-            if not self.path.exists():
-                return []
-            records: list[dict[str, Any]] = []
-            seen_ids: dict[str, dict[str, Any]] = {}
-            previous_hash = "0" * 64
-            try:
-                with self.path.open("r", encoding="utf-8", newline="") as stream:
-                    for line_number, line in enumerate(stream, start=1):
-                        if not line.endswith("\n"):
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} is incomplete (missing newline)."
-                            )
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError as exc:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} is not valid JSON."
-                            ) from exc
-                        if not isinstance(record, dict):
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} must contain a JSON object."
-                            )
-                        expected_sequence = len(records) + 1
-                        if record.get("schema_version") != self.SCHEMA_VERSION:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} has an unsupported schema version."
-                            )
-                        if record.get("sequence") != expected_sequence:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} has sequence {record.get('sequence')!r}; "
-                                f"expected {expected_sequence}."
-                            )
-                        if record.get("previous_hash") != previous_hash:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} breaks the hash chain."
-                            )
-                        required = set(self._HASH_FIELDS) | {"record_hash"}
-                        if set(record) != required:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} has missing or unexpected fields."
-                            )
-                        event_id = record.get("event_id")
-                        if not isinstance(event_id, str) or not event_id.strip():
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} has an invalid event_id."
-                            )
-                        if event_id in seen_ids:
-                            raise ExecutionTraceIntegrityError(
-                                f"Duplicate event_id {event_id!r} at line {line_number}."
-                            )
-                        if not all(
-                            isinstance(record.get(key), str) and record[key].strip()
-                            for key in ("execution_id", "event_type")
-                        ):
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} has invalid event metadata."
-                            )
-                        if not isinstance(record.get("payload"), dict):
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} payload must be an object."
-                            )
-                        actual_hash = self._record_hash(record)
-                        if record.get("record_hash") != actual_hash:
-                            raise ExecutionTraceIntegrityError(
-                                f"Line {line_number} record hash does not match."
-                            )
-                        records.append(record)
-                        seen_ids[event_id] = record
-                        previous_hash = actual_hash
-            except OSError as exc:
-                raise ExecutionTraceError(f"Unable to read trace store: {exc}") from exc
-            return records
+            with self._process_file_lock():
+                yield
+
+    def _read_all_unlocked(self) -> list[dict[str, Any]]:
+        """Read and verify while the caller already holds both locks."""
+        if not self.path.exists():
+            return []
+
+        records: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        previous_hash = "0" * 64
+
+        try:
+            with self.path.open("r", encoding="utf-8", newline="") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    if not line.endswith("\n"):
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} is incomplete (missing newline)."
+                        )
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} is not valid JSON."
+                        ) from exc
+
+                    if not isinstance(record, dict):
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} must contain a JSON object."
+                        )
+
+                    expected_sequence = len(records) + 1
+                    if record.get("schema_version") != self.SCHEMA_VERSION:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} has an unsupported schema version."
+                        )
+                    if record.get("sequence") != expected_sequence:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} has sequence "
+                            f"{record.get('sequence')!r}; expected {expected_sequence}."
+                        )
+                    if record.get("previous_hash") != previous_hash:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} breaks the hash chain."
+                        )
+
+                    required = set(self._HASH_FIELDS) | {"record_hash"}
+                    if set(record) != required:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} has missing or unexpected fields."
+                        )
+
+                    event_id = record.get("event_id")
+                    if not isinstance(event_id, str) or not event_id.strip():
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} has an invalid event_id."
+                        )
+                    if event_id in seen_ids:
+                        raise ExecutionTraceIntegrityError(
+                            f"Duplicate event_id {event_id!r} at line {line_number}."
+                        )
+                    if not all(
+                        isinstance(record.get(key), str) and record[key].strip()
+                        for key in ("execution_id", "event_type")
+                    ):
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} has invalid event metadata."
+                        )
+                    if not isinstance(record.get("payload"), dict):
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} payload must be an object."
+                        )
+
+                    actual_hash = self._record_hash(record)
+                    if record.get("record_hash") != actual_hash:
+                        raise ExecutionTraceIntegrityError(
+                            f"Line {line_number} record hash does not match."
+                        )
+
+                    records.append(record)
+                    seen_ids.add(event_id)
+                    previous_hash = actual_hash
+        except OSError as exc:
+            raise ExecutionTraceError(
+                f"Unable to read trace store: {exc}"
+            ) from exc
+
+        return records
+
+    def read_all(self) -> list[dict[str, Any]]:
+        """Read and verify the complete store under the process lock."""
+        with self._exclusive_lock():
+            return self._read_all_unlocked()
 
     def append(self, event: Mapping[str, Any]) -> dict[str, Any]:
-        """Persist one event, returning its immutable persisted envelope.
-
-        A duplicate identical event_id is a no-op. A conflicting duplicate is
-        rejected instead of silently overwriting the original event.
-        """
+        """Persist one event, returning its immutable persisted envelope."""
         normalised = self._normalise_event(event)
-        with self._lock:
-            existing = self.read_all()
+
+        with self._exclusive_lock():
+            existing = self._read_all_unlocked()
             for record in existing:
                 if record["event_id"] == normalised["event_id"]:
                     original = {
@@ -195,10 +292,14 @@ class ExecutionTraceStore:
                     }
                     if original != normalised:
                         raise ExecutionTraceIntegrityError(
-                            f"event_id {normalised['event_id']!r} already exists with different content."
+                            f"event_id {normalised['event_id']!r} "
+                            "already exists with different content."
                         )
                     return dict(record)
-            previous_hash = existing[-1]["record_hash"] if existing else "0" * 64
+
+            previous_hash = (
+                existing[-1]["record_hash"] if existing else "0" * 64
+            )
             record: dict[str, Any] = {
                 "schema_version": self.SCHEMA_VERSION,
                 "sequence": len(existing) + 1,
@@ -207,6 +308,7 @@ class ExecutionTraceStore:
             }
             record["record_hash"] = self._record_hash(record)
             line = self._canonical_json(record) + "\n"
+
             try:
                 with self.path.open("a", encoding="utf-8", newline="") as stream:
                     stream.write(line)
@@ -214,7 +316,10 @@ class ExecutionTraceStore:
                     if self.fsync:
                         os.fsync(stream.fileno())
             except OSError as exc:
-                raise ExecutionTraceError(f"Unable to append trace event: {exc}") from exc
+                raise ExecutionTraceError(
+                    f"Unable to append trace event: {exc}"
+                ) from exc
+
             return dict(record)
 
     def replay(self, execution_id: str | None = None) -> list[dict[str, Any]]:
@@ -222,20 +327,35 @@ class ExecutionTraceStore:
         if execution_id is not None and (
             not isinstance(execution_id, str) or not execution_id.strip()
         ):
-            raise ExecutionTraceInputError("execution_id must be non-empty when provided.")
+            raise ExecutionTraceInputError(
+                "execution_id must be non-empty when provided."
+            )
         records = self.read_all()
         if execution_id is not None:
-            records = [r for r in records if r["execution_id"] == execution_id]
+            records = [
+                record for record in records
+                if record["execution_id"] == execution_id
+            ]
         return [dict(record) for record in records]
 
     def verify(self) -> dict[str, Any]:
-        """Return a concise integrity summary or raise on corrupted storage."""
+        """Return an integrity summary or raise on corrupted storage."""
         records = self.read_all()
         return {
             "valid": True,
             "record_count": len(records),
-            "execution_ids": sorted({r["execution_id"] for r in records}),
+            "execution_ids": sorted(
+                {record["execution_id"] for record in records}
+            ),
             "first_sequence": records[0]["sequence"] if records else None,
             "last_sequence": records[-1]["sequence"] if records else None,
             "last_hash": records[-1]["record_hash"] if records else None,
         }
+
+
+__all__ = [
+    "ExecutionTraceError",
+    "ExecutionTraceInputError",
+    "ExecutionTraceIntegrityError",
+    "ExecutionTraceStore",
+]

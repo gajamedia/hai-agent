@@ -3,9 +3,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from api.main import create_app
+
+
+@pytest.fixture(autouse=True)
+def isolate_plan_run_idempotency_db(monkeypatch, tmp_path):
+    """Keep each test's mutation gate isolated from the developer's durable DB."""
+    database_path = tmp_path / "plan-run-idempotency.sqlite3"
+    monkeypatch.setenv("HAI_PLAN_RUN_IDEMPOTENCY_DB", str(database_path))
 
 
 def _client() -> TestClient:

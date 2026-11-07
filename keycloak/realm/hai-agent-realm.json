@@ -1,0 +1,194 @@
+{
+  "realm": "hai-agent",
+  "enabled": true,
+  "displayName": "hAI Agent",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "hai-user",
+        "description": "Basic hAI Agent user"
+      },
+      {
+        "name": "hai-reviewer",
+        "description": "May review submitted capability proposals"
+      },
+      {
+        "name": "hai-capability-operator",
+        "description": "Capability lifecycle operator role"
+      }
+    ],
+    "client": {
+      "hai-agent-api": [
+        {
+          "name": "proposal-reader",
+          "description": "Read capability proposals"
+        },
+        {
+          "name": "proposal-submitter",
+          "description": "Submit capability proposals"
+        },
+        {
+          "name": "proposal-approver",
+          "description": "Approve capability proposals"
+        },
+        {
+          "name": "proposal-rejector",
+          "description": "Reject capability proposals"
+        },
+        {
+          "name": "proposal-register",
+          "description": "Register approved read-only proposals"
+        },
+        {
+          "name": "lifecycle-reader",
+          "description": "Read capability lifecycle state"
+        },
+        {
+          "name": "lifecycle-activator",
+          "description": "Activate trusted capabilities"
+        },
+        {
+          "name": "lifecycle-disabler",
+          "description": "Disable trusted capabilities"
+        },
+        {
+          "name": "lifecycle-revoker",
+          "description": "Revoke trusted capabilities"
+        },
+        {
+          "name": "api-reader",
+          "description": "Read simulation state, strategies, telemetry, and autonomous-testing results"
+        },
+        {
+          "name": "execution-operator",
+          "description": "Execute allowlisted simulation actions and plans; cannot write or reset simulation state"
+        },
+        {
+          "name": "execution-state-operator",
+          "description": "Write execution simulation state; does not grant action execution, plan execution, or reset"
+        },
+        {
+          "name": "execution-reset-operator",
+          "description": "Reset execution simulation state; does not grant state write or action execution"
+        },
+        {
+          "name": "execution-reconciler",
+          "description": "Perform explicit execution reconciliation after operator review"
+        },
+        {
+          "name": "cognitive-operator",
+          "description": "Run cognitive reasoning cycles"
+        },
+        {
+          "name": "autonomous-testing-operator",
+          "description": "Create and run autonomous-testing batches"
+        },
+        {
+          "name": "autonomous-testing-reconciler",
+          "description": "Reconcile stale interrupted autonomous-testing batches without replay"
+        }
+      ]
+    }
+  },
+  "clients": [
+    {
+      "clientId": "hai-agent-api",
+      "name": "hAI Agent API Resource",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "roles",
+        "profile",
+        "email"
+      ]
+    },
+    {
+      "clientId": "hai-agent-web",
+      "name": "hAI Agent React Frontend",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "http://localhost:5173/*",
+        "http://127.0.0.1:5173/*",
+        "http://localhost:5174/*",
+        "http://127.0.0.1:5174/*"
+      ],
+      "webOrigins": [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:5173/*##http://127.0.0.1:5173/*##http://localhost:5174/*##http://127.0.0.1:5174/*"
+      },
+      "defaultClientScopes": [
+        "roles",
+        "profile",
+        "email"
+      ],
+      "protocolMappers": [
+        {
+          "name": "hai-agent-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "hai-agent-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "hai.dev",
+      "enabled": true,
+      "email": "hai.dev@example.invalid",
+      "emailVerified": false,
+      "firstName": "hAI",
+      "lastName": "Developer",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${HAI_KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": true
+        }
+      ],
+      "realmRoles": [
+        "hai-user"
+      ],
+      "clientRoles": {
+        "hai-agent-api": [
+          "proposal-reader",
+          "lifecycle-reader",
+          "api-reader"
+        ]
+      }
+    }
+  ]
+}

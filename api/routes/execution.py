@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ from agent.cognition.agent_decision import AgentDecision, DecisionMode
 from agent.llm.agent_canonical_single_action_api import (
     AgentCanonicalSingleActionAPI,
 )
+from agent.llm.execution_trace_store import ExecutionTraceStore
+from agent.llm.execution_trace_runtime_observer import ExecutionTraceRuntimeObserver
 from agent.llm.execution_security import (
     ExecutionSecurityAuditError,
     ExecutionSecurityError,
@@ -60,6 +63,7 @@ from agent.llm.goal_feasibility import assess_goal_feasibility
 from api.plan_run_idempotency import (
     PlanRunIdempotencyConflict,
     PlanRunIdempotencyInProgress,
+    PlanRunExecutionBlocked,
     PlanRunIdempotencyStore,
 )
 from agent.llm.plan_validation import LLMPlanValidator
@@ -79,6 +83,70 @@ def _get_runtime(request: Request) -> Any:
             },
         )
     return runtime
+
+
+
+def _get_idempotency_store(request: Request) -> PlanRunIdempotencyStore:
+    """Return the app-scoped persistent ledger and global mutation gate."""
+    store = getattr(request.app.state, "plan_run_idempotency_store", None)
+    if store is None:
+        configured_path = os.environ.get("HAI_PLAN_RUN_IDEMPOTENCY_DB")
+        database_path = (
+            Path(configured_path).expanduser()
+            if configured_path and configured_path.strip()
+            else Path(__file__).resolve().parents[2] / "data" / "execution_plan_run_idempotency.sqlite3"
+        )
+        store = PlanRunIdempotencyStore(database_path)
+        request.app.state.plan_run_idempotency_store = store
+    return store
+
+
+def _get_execution_trace_store(request: Request) -> ExecutionTraceStore | None:
+    """Return the app-scoped append-only trace store, if it can be initialized."""
+    store = getattr(request.app.state, "execution_trace_store", None)
+    if store is not None:
+        return store
+
+    configured_path = os.environ.get("HAI_EXECUTION_TRACE_JSONL")
+    trace_path = (
+        Path(configured_path).expanduser()
+        if configured_path and configured_path.strip()
+        else Path(__file__).resolve().parents[2] / "data" / "execution_traces.jsonl"
+    )
+    try:
+        store = ExecutionTraceStore(trace_path)
+    except Exception:
+        # Trace telemetry must not prevent a validated simulation action from running.
+        logger.exception("Unable to initialize execution trace store at %s.", trace_path)
+        return None
+
+    request.app.state.execution_trace_store = store
+    return store
+
+
+def _build_execution_trace_observer(request: Request) -> ExecutionTraceRuntimeObserver | None:
+    store = _get_execution_trace_store(request)
+    if store is None:
+        return None
+
+    def on_trace_error(exc: Exception) -> None:
+        logger.error("Execution trace persistence failed: %s", exc, exc_info=True)
+
+    return ExecutionTraceRuntimeObserver(
+        store,
+        include_world_state=False,
+        raise_on_error=False,
+        on_error=on_trace_error,
+    )
+
+
+def _raise_mutation_blocked(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "error": "execution_reconciliation_required",
+        "message": str(exc),
+        "retry_safe": False,
+        "reconciliation_required": True,
+    })
 
 
 def _decision_factory(request: Any) -> AgentDecision:
@@ -390,8 +458,23 @@ def set_execution_state(
 ) -> dict[str, Any]:
     """Set a validated initial state for the isolated Room sandbox."""
     runtime = _get_runtime(request)
+    store = _get_idempotency_store(request)
+    owner = f"put-state:{uuid.uuid4().hex}"
     try:
-        state = runtime.set_state(payload)
+        store.acquire_mutation(owner)
+        try:
+            with runtime.lock:
+                state = runtime.set_state(payload)
+        except ValueError:
+            store.release_mutation(owner)
+            raise
+        except Exception:
+            store.mark_mutation_unknown(owner)
+            raise
+        else:
+            store.release_mutation(owner)
+    except PlanRunExecutionBlocked as exc:
+        raise _raise_mutation_blocked(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=422,
@@ -417,8 +500,14 @@ def run_execution(
 ) -> dict[str, Any]:
     """Execute one allowlisted action or an explicit ordered plan."""
     runtime = _get_runtime(request)
+    mutation_store = _get_idempotency_store(request)
+    mutation_owner = f"run:{uuid.uuid4().hex}"
+    mutation_gate_acquired = False
+    mutation_started = False
 
     try:
+        mutation_store.acquire_mutation(mutation_owner)
+        mutation_gate_acquired = True
         # Authorize every requested step before any action can have a side effect.
         # The policy and durable audit sink are shared with /plan-run.
         with runtime.lock:
@@ -455,11 +544,15 @@ def run_execution(
             for security_request in security_requests:
                 security_policy.authorize(security_request)
 
+            mutation_started = True
             result = runtime.run(
                 actions=payload.actions,
                 goal_description=payload.goal_description,
                 target_state=payload.target_state,
             )
+            mutation_started = False
+            mutation_store.release_mutation(mutation_owner)
+            mutation_gate_acquired = False
 
             # Record outcomes only after runtime.run returns, using per-step
             # evidence when available. If result auditing fails, report that
@@ -493,6 +586,8 @@ def run_execution(
                     reason=reason,
                 )
             return result
+    except PlanRunExecutionBlocked as exc:
+        raise _raise_mutation_blocked(exc) from exc
     except ExecutionSecurityError as exc:
         raise HTTPException(
             status_code=403,
@@ -526,6 +621,15 @@ def run_execution(
                 "message": "The simulation execution could not be completed.",
             },
         ) from exc
+    finally:
+        if mutation_gate_acquired:
+            try:
+                if mutation_started:
+                    mutation_store.mark_mutation_unknown(mutation_owner)
+                else:
+                    mutation_store.release_mutation(mutation_owner)
+            except Exception:
+                logger.exception("Unable to finalize /run mutation gate safely.")
 
 
 class _AdaptiveAPIPlanValidator:
@@ -567,6 +671,7 @@ def _run_cognitive_plan_impl(
     """
     cognitive_runtime = get_runtime(request)
     execution_runtime = _get_runtime(request)
+    execution_id = uuid.uuid4().hex
 
     observation = payload.get("observation")
     goal_description = payload.get("goal_description")
@@ -821,6 +926,9 @@ def _run_cognitive_plan_impl(
                     _goal_satisfied(world_state, target_state)
                 ),
             )
+            trace_observer = _build_execution_trace_observer(request)
+            if trace_observer is not None:
+                runtime_executor.add_event_observer(trace_observer)
             live_runtime = LLMPlanLiveRuntimeExecutor(runtime_executor)
 
             adaptive_enabled = payload.get("adaptive_replanning", False) is True
@@ -877,6 +985,7 @@ def _run_cognitive_plan_impl(
                     metadata={
                         "source": "execution_plan_run",
                         "execution_mode": "isolated_simulation",
+                        "execution_id": execution_id,
                     },
                     # validator=lambda replacement_plan: (
                     #     _reject_plan_that_violates_explicit_constraints(
@@ -935,6 +1044,7 @@ def _run_cognitive_plan_impl(
                     metadata={
                         "source": "execution_plan_run",
                         "execution_mode": "isolated_simulation",
+                        "execution_id": execution_id,
                     },
                 )
                 report = integration_result.runtime_result.report
@@ -1079,6 +1189,30 @@ def _run_cognitive_plan_impl(
                     if adaptive_result is not None
                     else {"enabled": False, "replanned": False, "generation_count": 1, "segment_count": 1, "replans": []}
                 ),
+                "execution_trace": {
+                    "execution_id": execution_id,
+                    "enabled": trace_observer is not None,
+                    "persisted_event_count": (
+                        trace_observer.persisted_count
+                        if trace_observer is not None
+                        else 0
+                    ),
+                    "error_count": (
+                        trace_observer.error_count
+                        if trace_observer is not None
+                        else 0
+                    ),
+                    "last_error": (
+                        trace_observer.last_error
+                        if trace_observer is not None
+                        else "trace_store_unavailable"
+                    ),
+                    "last_persisted_sequence": (
+                        trace_observer.last_persisted_sequence
+                        if trace_observer is not None
+                        else None
+                    ),
+                },
                 "audit": {
                     "source": "execution_plan_run",
                     "execution_mode": "isolated_simulation",
@@ -1091,11 +1225,15 @@ def _run_cognitive_plan_impl(
             }
 
     except LLMPlanRuntimeValidationError as exc:
+        # Runtime validation is completed before the first simulation action.
+        # Mark this rejection explicitly so the persistent mutation gate is
+        # released instead of incorrectly recording an unknown execution.
         raise HTTPException(
             status_code=422,
             detail={
                 "error": "plan_validation_failed",
                 "message": str(exc),
+                "execution_started": False,
             },
         ) from exc
     except LLMPlanRuntimeExecutionError as exc:
@@ -1177,7 +1315,41 @@ def run_cognitive_plan(
     """
     raw_key = request.headers.get("Idempotency-Key")
     if raw_key is None:
-        return _run_cognitive_plan_impl(request, payload)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail={"error": "invalid_request", "message": "Request body must be a JSON object."})
+        if payload.get("observation") is None:
+            raise HTTPException(status_code=422, detail={"error": "observation_required", "message": "observation is required."})
+        if not isinstance(payload.get("goal_description"), str) or not payload["goal_description"].strip():
+            raise HTTPException(status_code=422, detail={"error": "goal_description_required", "message": "goal_description must be a non-empty string."})
+        if not isinstance(payload.get("target_state"), dict) or not payload["target_state"]:
+            raise HTTPException(status_code=422, detail={"error": "target_state_required", "message": "target_state must be a non-empty object."})
+        owner_store = _get_idempotency_store(request)
+        owner = f"plan-run-unkeyed:{uuid.uuid4().hex}"
+        try:
+            owner_store.acquire_mutation(owner)
+        except PlanRunExecutionBlocked as exc:
+            raise _raise_mutation_blocked(exc) from exc
+        try:
+            result = _run_cognitive_plan_impl(request, payload)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            try:
+                if detail.get("execution_started") is False:
+                    owner_store.release_mutation(owner)
+                else:
+                    owner_store.mark_mutation_unknown(owner)
+            except Exception:
+                logger.exception("Unable to persist unkeyed plan-run outcome state.")
+            raise
+        except Exception:
+            try:
+                owner_store.mark_mutation_unknown(owner)
+            except Exception:
+                logger.exception("Unable to persist unkeyed plan-run unknown state.")
+            raise
+        else:
+            owner_store.release_mutation(owner)
+            return result
 
     key = raw_key.strip()
     if not key or len(key) > 255:
@@ -1217,16 +1389,7 @@ def run_cognitive_plan(
         ) from exc
     fingerprint = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
 
-    store = getattr(request.app.state, "plan_run_idempotency_store", None)
-    if store is None:
-        configured_path = os.environ.get("HAI_PLAN_RUN_IDEMPOTENCY_DB")
-        database_path = (
-            Path(configured_path).expanduser()
-            if configured_path and configured_path.strip()
-            else Path(__file__).resolve().parents[2] / "data" / "execution_plan_run_idempotency.sqlite3"
-        )
-        store = PlanRunIdempotencyStore(database_path)
-        request.app.state.plan_run_idempotency_store = store
+    store = _get_idempotency_store(request)
 
     try:
         claim = store.claim(idempotency_key=key, request_fingerprint=fingerprint)
@@ -1240,6 +1403,8 @@ def run_cognitive_plan(
             status_code=409,
             detail={"error": "idempotency_outcome_unknown", "message": str(exc), "retry_safe": False, "reconciliation_required": True},
         ) from exc
+    except PlanRunExecutionBlocked as exc:
+        raise _raise_mutation_blocked(exc) from exc
 
     if claim.status == "completed":
         result = dict(claim.response or {})
@@ -1314,10 +1479,68 @@ def run_cognitive_plan(
 def reset_execution(request: Request) -> dict[str, Any]:
     """Reset simulation state while retaining historical telemetry."""
     runtime = _get_runtime(request)
+    store = _get_idempotency_store(request)
+    owner = f"reset:{uuid.uuid4().hex}"
+    try:
+        store.acquire_mutation(owner)
+        try:
+            with runtime.lock:
+                state = runtime.reset()
+        except Exception:
+            store.mark_mutation_unknown(owner)
+            raise
+        else:
+            store.release_mutation(owner)
+    except PlanRunExecutionBlocked as exc:
+        raise _raise_mutation_blocked(exc) from exc
     return {
         "status": "ok",
         "message": (
             "Simulation state reset. Telemetry history was retained."
         ),
-        "state": runtime.reset(),
+        "state": state,
+    }
+
+
+@router.post("/reconcile")
+def reconcile_execution(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Clear a persistent gate after an explicit operator state review."""
+    if payload.get("confirm_no_execution_in_progress") is not True:
+        raise HTTPException(status_code=422, detail={
+            "error": "reconciliation_confirmation_required",
+            "message": "Confirm no execution is active only after verifying the server/process state.",
+        })
+    observed_state = payload.get("observed_state")
+    if not isinstance(observed_state, dict):
+        raise HTTPException(status_code=422, detail={
+            "error": "observed_state_required", "message": "observed_state must be a JSON object."
+        })
+    notes = payload.get("notes")
+    if not isinstance(notes, str) or not notes.strip():
+        raise HTTPException(status_code=422, detail={
+            "error": "reconciliation_notes_required", "message": "Provide non-empty notes describing the state review."
+        })
+    runtime = _get_runtime(request)
+    store = _get_idempotency_store(request)
+    current_state = runtime.get_state()
+    if observed_state != current_state:
+        raise HTTPException(status_code=409, detail={
+            "error": "reconciliation_state_mismatch",
+            "message": "observed_state does not match the current simulation state.",
+            "current_state": current_state,
+            "reconciliation_required": True,
+        })
+    try:
+        outcome = store.reconcile(notes=notes.strip())
+    except Exception as exc:
+        logger.exception("Unable to persist execution reconciliation.")
+        raise HTTPException(status_code=503, detail={
+            "error": "reconciliation_storage_failed",
+            "message": "The reconciliation could not be persisted."
+        }) from exc
+    return {
+        "status": "ok",
+        "message": "State reviewed. Historical unresolved keys remain non-replayable.",
+        "state": current_state,
+        "reconciliation": outcome,
     }

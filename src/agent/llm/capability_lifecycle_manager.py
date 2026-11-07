@@ -235,12 +235,15 @@ class CapabilityLifecycleManager:
             hook_attached = self._planner_sync_hook_attached()
             planner_name_set = set(planner_names)
 
-            active_names = tuple(
-                record.action_name
+            # Derive this list from the registry alone. Filtering it through
+            # Agent.actions here would hide active capabilities whose action
+            # mapping has gone missing or has been replaced.
+            active_records = tuple(
+                record
                 for record in snapshot.records.values()
                 if record.status == CapabilityStatus.ACTIVE
-                and self.agent.actions.get(record.action_name) is record.action
             )
+            active_names = tuple(record.action_name for record in active_records)
             inactive_names = {
                 record.action_name
                 for record in snapshot.records.values()
@@ -248,8 +251,12 @@ class CapabilityLifecycleManager:
             }
 
             missing = tuple(
-                name for name in active_names
-                if name not in planner_name_set
+                record.action_name
+                for record in active_records
+                if (
+                    self.agent.actions.get(record.action_name) is not record.action
+                    or record.action_name not in planner_name_set
+                )
             )
             inactive_in_planner = tuple(
                 name for name in planner_names
