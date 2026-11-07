@@ -20,7 +20,8 @@ from api.database_engines import EngineError, map_postgres_type, parse_profiles
 from api.database_runtime_registry import DatabaseRuntimeRegistry, RegistryError
 from api.main import create_app
 from api.security.authorization import AuthorizationPolicy
-from tests.test_table_report_job_e2e import _context
+from tests.engine_conformance import ConformanceSuite, Harness
+from tests.test_table_report_job_e2e import _context  # noqa: F401
 from tests.test_table_reports_api import PERMISSION, READ, _Attach, _principal
 
 CONNECT = "database:connection:manage"
@@ -147,7 +148,8 @@ def pg(monkeypatch, tmp_path):
         made.append(r)
         return r
     try:
-        yield SimpleNamespace_(registry=registry, schema=schema, admin=cur, profiles=profiles)
+        yield SimpleNamespace_(registry=registry, schema=schema, admin=cur, profiles=profiles,
+                               reader=reader)
     finally:
         for r in made:
             r.shutdown()
@@ -176,37 +178,6 @@ def test_select_only_role_connects_and_schema_is_discovered_with_mapped_types(pg
 
 
 @live
-def test_session_is_read_only(pg):
-    reg = pg.registry()
-    reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
-    conn = reg._connections["pgsales"]
-    with conn.manager.connection("pgsales") as c:
-        cur = c.cursor()
-        cur.execute("SHOW transaction_read_only")
-        assert cur.fetchone()[0] == "on"
-        with pytest.raises(Exception):
-            cur.execute(f"CREATE TABLE {pg.schema}.x (a int)")
-
-
-@live
-def test_question_to_report_matches_sql_including_numeric_and_filters(pg):
-    reg = pg.registry(_plan(filters={"product": "gadget"}))
-    reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
-    reg.activate("pgsales", {"sales": {
-        "columns": ["id", "region", "product", "amount"], "filterable_columns": ["region", "product"],
-        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
-    outcome = reg.service("pgsales").ask("Penjualan gadget per wilayah", execution_context=_context())
-    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
-    pg.admin.execute(f"SELECT region, SUM(amount), COUNT(id) FROM {pg.schema}.sales "
-                     f"WHERE product='gadget' GROUP BY region")
-    expected = {r: (float(s), n) for r, s, n in pg.admin.fetchall()}
-    got = {r["region"]: (float(r["revenue"]), r["orders"]) for r in outcome.rows}
-    assert got.keys() == expected.keys()
-    for region, (rev, n) in expected.items():
-        assert got[region][0] == pytest.approx(rev) and got[region][1] == n
-
-
-@live
 def test_superuser_and_write_capable_roles_are_refused(pg):
     reg = pg.registry()
     with pytest.raises(RegistryError, match="superuser"):
@@ -214,29 +185,6 @@ def test_superuser_and_write_capable_roles_are_refused(pg):
     with pytest.raises(RegistryError, match="can modify data"):
         reg.connect("a2", engine="postgresql", source="pg_writer", actor_id="alice")
     assert reg.list() == []
-
-
-@live
-def test_connection_errors_do_not_leak_host_user_or_password(pg):
-    reg = pg.registry()
-    with pytest.raises(RegistryError) as info:
-        reg.connect("a3", engine="postgresql", source="pg_wrongpw", actor_id="alice")
-    text = str(info.value)
-    assert "127.0.0.1" not in text and "rd_" not in text and ADMIN_PW not in text
-    assert "salesdb" not in text
-
-
-@live
-def test_postgres_connection_survives_restart(pg):
-    reg = pg.registry()
-    reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
-    reg.activate("pgsales", {"sales": {"columns": ["id", "region", "amount"], "key_column": "id"}},
-                 actor_id="bob")
-    reg.shutdown()
-    again = pg.registry()
-    (item,) = again.list()
-    assert item["status"] == "active" and item["database"] == "postgresql"
-    assert item["file"] == "pg_reader"
 
 
 @live
@@ -260,19 +208,55 @@ def test_api_exposes_profile_names_only_and_connects_by_profile(pg, tmp_path):
                            json={"name": "x2", "profile": "nope"}).status_code == 422
 
 
+def _harness(pg, registry=None):
+    def probe(connection):
+        cur = connection.cursor()
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone()[0] == "on"
+        with pytest.raises(Exception):
+            cur.execute(f"CREATE TABLE {pg.schema}.x (a int)")
+
+    def sql(query):
+        pg.admin.execute(query)
+        return pg.admin.fetchall()
+    return Harness(
+        engine="postgresql", registry=registry or pg.registry, reader="pg_reader",
+        writer="pg_writer", privileged="pg_admin", wrong_password="pg_wrongpw", sql=sql,
+        q_sales=f"{pg.schema}.sales", q_order=f'{pg.schema}."Order"', order_name="Order",
+        quote=lambda column: f'"{column}"', assert_read_only=probe,
+        leak_tokens=["127.0.0.1", "salesdb", ADMIN_PW, pg.reader])
+
+
 @live
-def test_mixed_case_reserved_word_table_and_columns_can_be_reported(pg):
-    plan = json.dumps({"supported": True, "table": "Order", "group_by": ["group"],
-                       "metrics": [{"output": "total", "operation": "sum", "column": "amount"}],
-                       "filters": {"user": "u1"}})
-    reg = pg.registry(plan)
-    reg.connect("pgsales", engine="postgresql", source="pg_reader", actor_id="alice")
-    reg.activate("pgsales", {"Order": {
-        "columns": ["id", "group", "user", "amount"], "filterable_columns": ["user"],
-        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
-    outcome = reg.service("pgsales").ask("total per group", execution_context=_context())
-    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
-    pg.admin.execute(f'SELECT "group", SUM(amount) FROM {pg.schema}."Order" '
-                     f"WHERE \"user\"='u1' GROUP BY \"group\"")
-    expected = {g: float(t) for g, t in pg.admin.fetchall()}
-    assert {r["group"]: float(r["total"]) for r in outcome.rows} == pytest.approx(expected)
+class TestPostgresConformance(ConformanceSuite):
+    """The shared engine contract (see tests/engine_conformance.py)."""
+
+    @pytest.fixture
+    def harness(self, pg):
+        return _harness(pg)
+
+
+@live
+def test_the_conformance_suite_rejects_an_engine_that_skips_the_role_check(pg, tmp_path):
+    """The suite must fail a faulty engine, otherwise it proves nothing."""
+    from api.database_engines import PostgresEngine
+
+    class SkipsRoleCheck(PostgresEngine):
+        def _check_role(self, connection, profile):
+            return None  # superusers and writers would slip through
+
+    def faulty_registry(*answers):
+        r = DatabaseRuntimeRegistry(
+            data_root=tmp_path, work_dir=tmp_path / "faulty", authorization_policy=AuthorizationPolicy(),
+            llm_provider_factory=lambda: _Provider(*answers), profiles=pg.profiles,
+            engines={"postgresql": SkipsRoleCheck(pg.profiles)})
+        faulty_registry.made.append(r)
+        return r
+    faulty_registry.made = []
+    try:
+        with pytest.raises(pytest.fail.Exception):
+            ConformanceSuite().test_4_privileged_and_write_capable_accounts_are_refused(
+                _harness(pg, faulty_registry))
+    finally:
+        for r in faulty_registry.made:
+            r.shutdown()

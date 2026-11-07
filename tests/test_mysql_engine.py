@@ -23,7 +23,8 @@ from api.database_engines import (
 from api.database_runtime_registry import DatabaseRuntimeRegistry, RegistryError
 from api.main import create_app
 from api.security.authorization import AuthorizationPolicy
-from tests.test_table_report_job_e2e import _context
+from tests.engine_conformance import ConformanceSuite, Harness
+from tests.test_table_report_job_e2e import _context  # noqa: F401
 from tests.test_table_reports_api import PERMISSION, READ, _Attach, _principal
 
 CONNECT = "database:connection:manage"
@@ -196,24 +197,6 @@ def test_session_is_read_only_and_uses_tls(my):
 
 
 @live
-def test_question_to_report_matches_sql_with_decimal_and_filters(my):
-    reg = my.registry(_plan(filters={"product": "gadget"}))
-    reg.connect("mysales", engine="mysql", source="my_reader", actor_id="alice")
-    reg.activate("mysales", {"sales": {
-        "columns": ["id", "region", "product", "amount"], "filterable_columns": ["region", "product"],
-        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
-    outcome = reg.service("mysales").ask("Penjualan gadget per wilayah", execution_context=_context())
-    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
-    my.admin.execute(f"SELECT region, SUM(amount), COUNT(id) FROM {my.db}.sales "
-                     f"WHERE product='gadget' GROUP BY region")
-    expected = {r: (float(s), n) for r, s, n in my.admin.fetchall()}
-    got = {r["region"]: (float(r["revenue"]), r["orders"]) for r in outcome.rows}
-    assert got.keys() == expected.keys()
-    for region, (rev, n) in expected.items():
-        assert got[region][0] == pytest.approx(rev) and got[region][1] == n
-
-
-@live
 def test_root_and_write_capable_accounts_are_refused(my):
     reg = my.registry()
     with pytest.raises(RegistryError, match="more than SELECT"):
@@ -221,15 +204,6 @@ def test_root_and_write_capable_accounts_are_refused(my):
     with pytest.raises(RegistryError, match="INSERT"):
         reg.connect("a2", engine="mysql", source="my_writer", actor_id="alice")
     assert reg.list() == []
-
-
-@live
-def test_connection_errors_do_not_leak_host_user_database_or_password(my):
-    with pytest.raises(RegistryError) as info:
-        my.registry().connect("a3", engine="mysql", source="my_wrongpw", actor_id="alice")
-    text = str(info.value)
-    for leaked in ("127.0.0.1", my.reader, my.db, ROOT_PW):
-        assert leaked not in text
 
 
 @live
@@ -259,17 +233,24 @@ def test_mysql_connection_survives_restart_and_api_connects_by_profile(my):
 
 
 @live
-def test_reserved_word_table_and_columns_can_be_reported(my):
-    plan = json.dumps({"supported": True, "table": "order", "group_by": ["group"],
-                       "metrics": [{"output": "total", "operation": "sum", "column": "amount"}],
-                       "filters": {"user": "u1"}})
-    reg = my.registry(plan)
-    reg.connect("mysales", engine="mysql", source="my_reader", actor_id="alice")
-    reg.activate("mysales", {"order": {
-        "columns": ["id", "group", "user", "amount"], "filterable_columns": ["user"],
-        "key_column": "id", "required_non_null_columns": ["amount"]}}, actor_id="bob")
-    outcome = reg.service("mysales").ask("total per group", execution_context=_context())
-    assert outcome.status == "succeeded", (outcome.error_code, outcome.reason)
-    my.admin.execute(f"SELECT `group`, SUM(amount) FROM {my.db}.`order` WHERE `user`='u1' GROUP BY `group`")
-    expected = {g: float(t) for g, t in my.admin.fetchall()}
-    assert {r["group"]: float(r["total"]) for r in outcome.rows} == pytest.approx(expected)
+class TestMySQLConformance(ConformanceSuite):
+    """The shared engine contract (see tests/engine_conformance.py)."""
+
+    @pytest.fixture
+    def harness(self, my):
+        def probe(connection):
+            cur = connection.cursor()
+            cur.execute("SELECT @@session.transaction_read_only")
+            assert cur.fetchone()[0] == 1
+            with pytest.raises(Exception):
+                cur.execute(f"CREATE TABLE {my.db}.x (a INT)")
+
+        def sql(query):
+            my.admin.execute(query)
+            return my.admin.fetchall()
+        return Harness(
+            engine="mysql", registry=my.registry, reader="my_reader", writer="my_writer",
+            privileged="my_root", wrong_password="my_wrongpw", sql=sql,
+            q_sales=f"{my.db}.sales", q_order=f"{my.db}.`order`", order_name="order",
+            quote=lambda column: f"`{column}`", assert_read_only=probe,
+            leak_tokens=["127.0.0.1", my.reader, my.db, ROOT_PW])
