@@ -111,7 +111,7 @@ export default function DatabaseCreation() {
         <Link to="/data-reports" className="at-back"><ArrowLeft size={14} /> Data Reports</Link>
         <h1>Buat database</h1>
         <p>
-          Minta agent membuat database baru beserta tabelnya. Agent tidak menulis SQL: ia memilih rancangan
+          Minta agent membuat database baru beserta tabelnya, atau menambah tabel baru ke database yang sudah ada. Agent tidak menulis SQL: ia memilih rancangan
           terstruktur yang Anda periksa dulu. Hanya nama berawalan khusus yang bisa dibuat; database yang sudah
           ada tidak pernah ditimpa atau dihapus.
         </p>
@@ -146,7 +146,7 @@ export default function DatabaseCreation() {
                 onChange={(e) => setQuestion(e.target.value)}
                 rows={3}
                 required
-                placeholder="Contoh: buat database toko dengan tabel bahan (nama, harga beli, tanggal masuk)"
+                placeholder="Contoh: buat database hai_toko dengan tabel bahan (nama, harga beli, tanggal masuk). Atau: tambah tabel pegawai di database hai_toko"
               />
             </label>
             <small>
@@ -163,7 +163,11 @@ export default function DatabaseCreation() {
         <section className="at-panel" aria-label="Rencana database">
           <h2>Periksa dulu. Belum ada yang dibuat.</h2>
           <div className="at-config-summary">
-            <span>Database baru: <b>{plan.plan.database}</b> (server {plan.profile})</span>
+            {plan.mode === "add_tables" ? (
+              <span>Menambah tabel ke database yang <b>sudah ada</b>: <b>{plan.plan.database}</b> (server {plan.profile}). Tabel dan data yang ada tidak disentuh.</span>
+            ) : (
+              <span>Database baru: <b>{plan.plan.database}</b> (server {plan.profile})</span>
+            )}
             {plan.plan.tables.length === 0 && <span>Tanpa tabel.</span>}
             {plan.plan.tables.map((t) => (
               <span key={t.name}>
@@ -190,8 +194,10 @@ export default function DatabaseCreation() {
 
       {result && (
         <section className="at-panel" aria-live="polite">
-          <b>Berhasil.</b> Database {result.database} dibuat
-          {result.tables.length ? ` dengan tabel ${result.tables.join(", ")}` : ""}.
+          <b>Berhasil.</b>{" "}
+          {result.mode === "add_tables"
+            ? `Tabel ${result.tables.join(", ")} ditambahkan ke database ${result.database}.`
+            : `Database ${result.database} dibuat${result.tables.length ? ` dengan tabel ${result.tables.join(", ")}` : ""}.`}
           <div className="at-form-row">
             {connected ? (
               <span>Terhubung. Buka <Link to="/data-reports">Data Reports</Link> untuk menyetujui tabelnya

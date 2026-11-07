@@ -93,6 +93,21 @@ describe("DatabaseCreation", () => {
     expect(api.runDatabasePlan).toHaveBeenCalledTimes(1);
   });
 
+  it("says plainly when tables are added to a database that already exists", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlan.mockResolvedValue({
+      ...PLAN, mode: "add_tables", confirm_phrase: "TAMBAH TABEL hai_toko" });
+    api.runDatabasePlan.mockResolvedValue({
+      status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+    renderPage();
+    const card = (await planIt(user)).textContent;
+    expect(card).toMatch(/Menambah tabel ke database yang sudah ada: hai_toko/);
+    expect(card).toMatch(/tidak disentuh/);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "TAMBAH TABEL hai_toko");
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    expect(await screen.findByText(/Tabel tb_bahan ditambahkan ke database hai_toko/)).toBeTruthy();
+  });
+
   it("shows a refusal (name already taken) instead of a plan", async () => {
     const user = userEvent.setup();
     api.createDatabasePlan.mockResolvedValue({ status: "refused", reason: "A database named 'hai_toko' already exists", plan_id: null });

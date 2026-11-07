@@ -253,7 +253,7 @@ itself is added to every table), you review it, and our code builds the `CREATE`
 | Own role | `data-schema-creator`. Nothing else grants it, and it grants nothing else. |
 | Own account | A third account that holds only `CREATE` on the pattern `hai\_%`. It cannot DROP, ALTER, read, or touch an existing database such as `dbsales`. The server refuses an account that can do more. |
 | Name prefix | Only names starting with the profile's prefix (default `hai_`) can be created or even connected this way. |
-| Never overwrite | A name that exists is refused, in the preview and again at run time. There is no drop. |
+| Never overwrite | If the database does not exist it is created. If it already exists (made earlier, name starting with the prefix), only **new tables are added** to it, with the phrase `TAMBAH TABEL hai_xxx`; existing tables and data are never touched, and a table name that already exists is refused. Both are re-checked at run time. There is no drop. |
 | Preview, phrase, fresh login | The tables are shown first; you type `BUAT DATABASE hai_xxx`; Keycloak asks you to sign in again (same as changing data). No second approver is needed because nothing existing can be harmed. |
 | Audit | `<work dir>/audit/creations-<profile>.jsonl` records who created what and the statements. |
 

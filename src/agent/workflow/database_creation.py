@@ -68,7 +68,9 @@ class DatabaseDesigner:
 
     def _system_prompt(self) -> str:
         return (
-            "You design ONE new database. You never write SQL.\n"
+            "You design tables in ONE database. You never write SQL. The database may not exist yet "
+            "(it is then created) or may already exist (the tables are then ADDED to it; existing tables "
+            "are never changed, and a table name that already exists is refused).\n"
             f"The database name MUST start with '{self.prefix}' and use only lowercase letters, digits "
             "and underscores. Reply with ONLY one JSON object:\n"
             '{"supported": true, "database": "' + self.prefix + 'name", "title": "...", "tables": ['
@@ -76,7 +78,8 @@ class DatabaseDesigner:
             f"Column types, only these: {sorted(COLUMN_TYPES)}. Do NOT add an id column: a numeric primary "
             f"key named id is added automatically. At most {MAX_TABLES} tables and {MAX_COLUMNS} columns "
             "per table; table and column names are lowercase letters, digits and underscores. A database "
-            "with no tables is allowed if the user asks for only the database.\n"
+            "with no tables is allowed if the user asks for only the database. If the user only wants "
+            "more tables in a database that exists, list just the new tables.\n"
             'If the request cannot be done: {"supported": false, "reason": "..."}.'
         )
 
@@ -146,9 +149,11 @@ class DatabaseDesigner:
         return DatabaseDesign(database, tuple(tables), title)
 
 
-def build_statements(design: DatabaseDesign) -> list[str]:
-    """CREATE statements. Every name was validated against a strict pattern and is quoted."""
-    statements = [f"CREATE DATABASE `{design.database}` CHARACTER SET utf8mb4"]
+def build_statements(design: DatabaseDesign, *, database_exists: bool = False) -> list[str]:
+    """CREATE statements. Every name was validated against a strict pattern and is quoted.
+
+    When the database already exists only its new tables are created: nothing existing is touched."""
+    statements = [] if database_exists else [f"CREATE DATABASE `{design.database}` CHARACTER SET utf8mb4"]
     for table in design.tables:
         columns = ["`id` INT NOT NULL AUTO_INCREMENT"]
         columns += [f"`{c.name}` {COLUMN_TYPES[c.type]} {'NULL' if c.nullable else 'NOT NULL'}"
@@ -175,39 +180,56 @@ class DatabaseCreationService:
                            for t in design.tables]}
 
     @staticmethod
-    def confirm_phrase(design: DatabaseDesign) -> str:
-        return f"BUAT DATABASE {design.database}"
+    def confirm_phrase(design: DatabaseDesign, mode: str = "create_database") -> str:
+        return (f"TAMBAH TABEL {design.database}" if mode == "add_tables"
+                else f"BUAT DATABASE {design.database}")
 
-    def _exists(self, connection, database: str) -> bool:
+    @staticmethod
+    def _ask(connection, sql: str, params: tuple) -> list[tuple]:
         cursor = connection.cursor()
         try:
-            cursor.execute("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
-                           (database,))
-            return cursor.fetchone() is not None
+            cursor.execute(sql, params)
+            return list(cursor.fetchall())
         finally:
             cursor.close()
 
-    def preview(self, design: DatabaseDesign) -> list[str]:
-        """The statements that would run. Refuses when the name is taken. Creates nothing."""
+    def _inspect(self, connection, design: DatabaseDesign) -> tuple[str, list[str]]:
+        """("create_database" | "add_tables", the statements), or CreationRefused."""
+        exists = bool(self._ask(
+            connection, "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
+            (design.database,)))
+        if not exists:
+            return "create_database", build_statements(design)
+        if not design.tables:
+            raise CreationRefused(f"A database named '{design.database}' already exists and no tables were "
+                                  "asked for; nothing is overwritten. Ask for tables to add, or choose another name.")
+        have = {str(r[0]).lower() for r in self._ask(
+            connection, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+            (design.database,))}
+        clash = sorted(t.name for t in design.tables if t.name.lower() in have)
+        if clash:
+            raise CreationRefused(
+                f"The database '{design.database}' already has the table(s) {', '.join(clash)}; existing tables "
+                "are never changed. Use other table names.")
+        return "add_tables", build_statements(design, database_exists=True)
+
+    def preview(self, design: DatabaseDesign) -> tuple[str, list[str]]:
+        """The mode and the statements that would run. Refuses what would overwrite. Creates nothing."""
         connection = self._connect()
         try:
-            if self._exists(connection, design.database):
-                raise CreationRefused(f"A database named '{design.database}' already exists; "
-                                      "nothing is overwritten. Choose another name.")
+            return self._inspect(connection, design)
         finally:
             connection.close()
-        return build_statements(design)
 
     def execute(self, design: DatabaseDesign, *, actor: str, plan_id: str, question: str) -> dict[str, Any]:
-        statements = build_statements(design)
         record: dict[str, Any] = {"plan_id": plan_id, "actor": actor, "database": design.database,
-                                  "tables": [t.name for t in design.tables], "statements": statements,
-                                  "profile": self.profile, "question": question[:500]}
+                                  "tables": [t.name for t in design.tables], "profile": self.profile,
+                                  "question": question[:500]}
         connection = self._connect()
         done = 0
         try:
-            if self._exists(connection, design.database):  # re-checked: the name may have been taken meanwhile
-                raise CreationRefused(f"A database named '{design.database}' already exists.")
+            mode, statements = self._inspect(connection, design)  # re-checked: things may have changed
+            record.update(mode=mode, statements=statements)
             cursor = connection.cursor()
             try:
                 for sql in statements:  # DDL commits by itself; there is no transaction to roll back
@@ -226,7 +248,8 @@ class DatabaseCreationService:
                 pass
         record.update(status="created", statements_done=done)
         self._audit(record)
-        return {"database": design.database, "tables": [t.name for t in design.tables], "profile": self.profile}
+        return {"database": design.database, "tables": [t.name for t in design.tables],
+                "profile": self.profile, "mode": mode}
 
     def audit(self, event: str, **fields: Any) -> None:
         self._audit({"event": event, **fields})

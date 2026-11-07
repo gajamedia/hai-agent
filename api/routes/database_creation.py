@@ -35,7 +35,8 @@ def _plans(request: Request) -> ChangePlanStore:
 
 def _view(stored, store) -> dict[str, Any]:
     return {"plan_id": stored.plan_id, "profile": stored.database, "question": stored.question,
-            "plan": stored.summary, "statements": stored.preview["statements"],
+            "plan": stored.summary, "mode": stored.preview["mode"],
+            "statements": stored.preview["statements"],
             "confirm_phrase": stored.confirm_phrase, "state": stored.state,
             "expires_in_seconds": store.seconds_left(stored)}
 
@@ -69,7 +70,7 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
     if result.design is None:
         return {"status": "unsupported", "reason": result.reason, "plan_id": None}
     try:
-        statements = service.preview(result.design)
+        mode, statements = service.preview(result.design)
     except CreationRefused as exc:
         return {"status": "refused", "reason": str(exc), "plan_id": None}
     except Exception as exc:
@@ -80,8 +81,9 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
         stored = store.create(
             owner=principal.actor_id, database=service.profile, question=result.question,
             request=result.design, expected_rows=len(result.design.tables),
-            summary=service.summarize(result.design), preview={"statements": statements},
-            confirm_phrase=service.confirm_phrase(result.design), requires_approval=False, service=service)
+            summary=service.summarize(result.design), preview={"statements": statements, "mode": mode},
+            confirm_phrase=service.confirm_phrase(result.design, mode), requires_approval=False,
+            service=service)
     except ChangePlanConflict as exc:
         raise _err(429, "too_many_plans", str(exc)) from exc
     service.audit("planned", plan_id=stored.plan_id, actor=principal.actor_id, plan=stored.summary)

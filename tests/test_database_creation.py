@@ -107,8 +107,9 @@ def test_statements_use_only_the_closed_type_set_and_add_the_key():
 
 # ------------------------------------------------------------------ the service (fake connection)
 class FakeConnection:
-    def __init__(self, existing=(), fail_on=None):
+    def __init__(self, existing=(), fail_on=None, tables=()):
         self.existing, self.fail_on, self.executed, self.closed = set(existing), fail_on, [], False
+        self.tables = list(tables)
 
     def cursor(self):
         return FakeCursor(self)
@@ -119,18 +120,21 @@ class FakeConnection:
 
 class FakeCursor:
     def __init__(self, connection):
-        self.c, self.row = connection, None
+        self.c, self.row, self.rows = connection, None, []
 
     def execute(self, sql, params=()):
         if sql.startswith("SELECT SCHEMA_NAME"):
-            self.row = (params[0],) if params[0] in self.c.existing else None
+            self.rows = [(params[0],)] if params[0] in self.c.existing else []
+            return
+        if sql.startswith("SELECT TABLE_NAME"):
+            self.rows = [(t,) for t in self.c.tables]
             return
         if self.c.fail_on and self.c.fail_on in sql:
             raise RuntimeError("boom")
         self.c.executed.append(sql)
 
-    def fetchone(self):
-        return self.row
+    def fetchall(self):
+        return self.rows
 
     def close(self):
         pass
@@ -142,14 +146,44 @@ def _service(tmp_path, **kw):
                                    audit_path=tmp_path / "a.jsonl"), conn
 
 
-def test_a_name_that_exists_is_refused_in_the_preview_and_again_at_run_time(tmp_path):
+def test_an_existing_database_with_no_new_tables_asked_is_refused(tmp_path):
     service, conn = _service(tmp_path, existing={"hai_toko"})
-    design = service.designer.validate(GOOD)
+    design = service.designer.validate({"database": "hai_toko"})
     with pytest.raises(CreationRefused, match="already exists"):
         service.preview(design)
     with pytest.raises(CreationRefused):
         service.execute(design, actor="a", plan_id="p", question="q")
     assert conn.executed == []
+
+
+def test_tables_are_added_to_an_existing_database_without_touching_it(tmp_path):
+    service, conn = _service(tmp_path, existing={"hai_toko"}, tables=["tb_lama"])
+    design = service.designer.validate(GOOD)
+    mode, statements = service.preview(design)
+    assert mode == "add_tables" and len(statements) == 1 and statements[0].startswith("CREATE TABLE `hai_toko`.`tb_bahan`")
+    assert service.confirm_phrase(design, mode) == "TAMBAH TABEL hai_toko"
+    assert service.execute(design, actor="alice", plan_id="p", question="q")["mode"] == "add_tables"
+    assert [s.split()[0:2] for s in conn.executed] == [["CREATE", "TABLE"]]
+    audit = json.loads((tmp_path / "a.jsonl").read_text("utf-8").strip())
+    assert audit["mode"] == "add_tables" and audit["statements_done"] == 1
+
+
+def test_a_table_name_that_already_exists_is_refused_and_nothing_is_changed(tmp_path):
+    service, conn = _service(tmp_path, existing={"hai_toko"}, tables=["TB_BAHAN"])   # case-insensitive
+    design = service.designer.validate(GOOD)
+    with pytest.raises(CreationRefused, match="already has the table"):
+        service.preview(design)
+    with pytest.raises(CreationRefused):
+        service.execute(design, actor="a", plan_id="p", question="q")
+    assert conn.executed == []
+
+
+def test_a_new_database_is_created_and_the_phrase_says_so(tmp_path):
+    service, _ = _service(tmp_path)
+    design = service.designer.validate(GOOD)
+    mode, statements = service.preview(design)
+    assert mode == "create_database" and len(statements) == 2
+    assert service.confirm_phrase(design, mode) == "BUAT DATABASE hai_toko"
 
 
 def test_execute_runs_the_statements_in_order_and_audits_them(tmp_path):
@@ -284,15 +318,23 @@ def test_a_new_database_is_created_then_connected_and_written_to(my_create):
     service = reg.database_creator()
     result = service.designer.plan("buat toko")
     assert result.design.database == db
-    assert len(service.preview(result.design)) == 2 and not _exists(env, db)       # preview creates nothing
+    assert len(service.preview(result.design)[1]) == 2 and not _exists(env, db)    # preview creates nothing
     out = service.execute(result.design, actor="alice", plan_id="p", question="q")
     assert out["tables"] == ["tb_bahan"] and _exists(env, db)
-    with pytest.raises(CreationRefused):                                            # never overwrites
+    with pytest.raises(CreationRefused, match="already has the table"):            # never overwrites a table
         service.preview(result.design)
+    # later: a new table in the SAME, existing database (the database is not created again)
+    more = service.designer.validate({"database": db, "tables": [
+        {"name": "tb_supplier", "columns": [{"name": "nama", "type": "text"}]}]})
+    mode, statements = service.preview(more)
+    assert mode == "add_tables" and len(statements) == 1
+    assert service.execute(more, actor="alice", plan_id="p3", question="q")["mode"] == "add_tables"
+    env.admin.execute(f"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{db}' ORDER BY 1")
+    assert [r[0] for r in env.admin.fetchall()] == ["tb_bahan", "tb_supplier"]
 
     # connect to it through the profile (prefix database only), approve a table for writing, insert a row
     info = reg.connect("toko", engine="mysql", source=f"my_all/{db}", actor_id="alice")
-    assert {t["name"] for t in info["schema"]["tables"]} == {"tb_bahan"}
+    assert {t["name"] for t in info["schema"]["tables"]} == {"tb_bahan", "tb_supplier"}
     reg.activate("toko", {"tb_bahan": {
         "columns": ["id", "nama", "harga_beli"], "filterable_columns": ["id", "nama"], "key_column": "id",
         "writable": {"operations": ["insert", "update"], "columns": ["nama", "harga_beli"]}}}, actor_id="bob")
@@ -343,7 +385,9 @@ def test_http_flow_needs_the_permission_a_fresh_login_and_the_exact_phrase(my_cr
     env = my_create
     db = f"hai_h{env.tag}"
     env.made.append(db)
-    reg = env.registry(json.dumps({**GOOD, "database": db}), json.dumps({**GOOD, "database": db}))
+    extra = {"database": db, "tables": [{"name": "tb_supplier", "columns": [{"name": "nama", "type": "text"}]}]}
+    reg = env.registry(json.dumps({**GOOD, "database": db}), json.dumps({**GOOD, "database": db}),
+                       json.dumps(extra))
     app = create_app(authorization_policy_factory=lambda _a: AuthorizationPolicy(),
                      database_runtime_registry_factory=lambda _a: reg)
     app.add_middleware(_AsUser)
@@ -365,6 +409,10 @@ def test_http_flow_needs_the_permission_a_fresh_login_and_the_exact_phrase(my_cr
         assert wrong.status_code == 422 and not _exists(env, db)
         done = call("POST", run, json={"confirm": body["confirm_phrase"]})
         assert done.status_code == 200 and done.json()["database"] == db and _exists(env, db)
-        # asking for the same name again is refused before anything runs
+        # the same tables again are refused before anything runs
         again = call("POST", "/plans", json={"question": "buat toko lagi"}).json()
-        assert again["status"] == "refused" and "already exists" in again["reason"]
+        assert again["status"] == "refused" and "already has the table" in again["reason"]
+        # new tables in the existing database are planned as an addition, with their own phrase
+        more = call("POST", "/plans", json={"question": "tambah tabel supplier"}).json()
+        assert more["status"] == "planned" and more["mode"] == "add_tables"
+        assert more["confirm_phrase"] == f"TAMBAH TABEL {db}" and len(more["statements"]) == 1
