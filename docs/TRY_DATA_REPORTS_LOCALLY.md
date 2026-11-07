@@ -304,3 +304,22 @@ Planning a report sends the question and the approved table catalog (never rows)
 - The agent command line tools are started without this server's secrets in their environment (no
   `HAI_*`, `KC_*`, `*_PASSWORD`, `*_SECRET` variables), with no keyboard attached, and are killed together
   with everything they started when the timeout ends.
+
+## 8. Find the databases installed on this computer
+
+```powershell
+python scripts\discover_databases.py                 # look and report only
+python scripts\discover_databases.py --add           # also register new MySQL / PostgreSQL servers
+python scripts\discover_databases.py --sqlite-dir D:\data --host 10.0.0.5
+```
+
+It probes only `127.0.0.1` and the addresses you pass with `--host` (never a network range), recognises
+MySQL/MariaDB, PostgreSQL and SQL Server by their first bytes on the standard ports, and lists Windows
+database services and SQLite files. It sends no login and no query.
+
+* `--add` writes a profile into `profiles.json` (host, port, database name, account names, the name of the
+  password variable). It never asks for or writes a password. The next step it prints creates the read-only
+  account (`setup_mysql_readonly_user.py` asks for the administrator password once and does not keep it).
+* SQL Server is only reported: the agent has no SQL Server engine yet.
+* A SQLite file can be used only inside `HAI_DATABASE_ROOT`; the report says which ones are.
+* A server on a non-standard port is not found; add it by hand as in section 5.
