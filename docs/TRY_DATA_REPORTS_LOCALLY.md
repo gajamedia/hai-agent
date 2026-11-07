@@ -95,6 +95,14 @@ Not supported, and refused with a reason instead of being silently ignored: OR, 
 calculations inside a condition, anything that changes data. Only approved columns can be shown, sorted by or
 filtered on. The agent still never writes SQL: free-form SQL from an LLM is deliberately not accepted.
 
+### Change what is approved, or disconnect
+
+An active connection has an **Ubah persetujuan** button: the form opens with the current tables, columns and
+"boleh difilter" ticks already set. Tick another table, add a column, or tick *boleh difilter* on a price or
+date column, then **Setujui**. The connection stays active; the new selection replaces the old one. The
+plug icon (**Putuskan**) removes the connection and what the agent learned about it; the database itself is
+untouched. Several connections can exist at once; each question uses the one you pick.
+
 ## 5. Use your own MySQL instead of the sample file
 
 MySQL is chosen **by profile name**, never by typing a host or password into the page: those live on the

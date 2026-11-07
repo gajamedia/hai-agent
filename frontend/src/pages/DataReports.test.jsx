@@ -180,6 +180,24 @@ describe("DataReports", () => {
     expect(await screen.findByRole("checkbox", { name: "sales" })).toBeTruthy();
   });
 
+  it("lets an active connection's approval be changed, starting from what is approved now", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }],
+    });
+    api.getDatabaseSchema.mockResolvedValue({
+      ...SCHEMA, approved: { sales: { columns: ["id", "amount"], filterable_columns: ["amount"] } },
+    });
+    api.approveDatabaseTables.mockResolvedValue({ status: "active" });
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Ubah persetujuan" }));
+    expect((await screen.findByRole("checkbox", { name: "sales" })).checked).toBe(true);
+    await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
+    const [, tables] = api.approveDatabaseTables.mock.calls[0];
+    expect(tables.sales.columns).toEqual(["id", "amount"]);
+    expect(tables.sales.filterable_columns).toEqual(["amount"]);
+  });
+
   it("connects by server profile name without asking for a file or credentials", async () => {
     const user = userEvent.setup();
     api.listDatabaseProfiles.mockResolvedValue({ profiles: [{ name: "crm_pg", type: "postgresql" }] });

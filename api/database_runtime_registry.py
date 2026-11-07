@@ -460,7 +460,13 @@ class DatabaseRuntimeRegistry:
 
     def schema(self, name: str) -> dict[str, Any]:
         with self._lock:
-            return self._get(name).schema.to_dict()
+            conn = self._get(name)
+            data = conn.schema.to_dict()
+            # What is approved right now, so the page can show it and let the user change it.
+            data["approved"] = {t: {"columns": list(v.get("columns", [])),
+                                    "filterable_columns": list(v.get("filterable_columns", []))}
+                                for t, v in (conn.selection or {}).items()}
+            return data
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:

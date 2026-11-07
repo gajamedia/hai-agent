@@ -20,7 +20,15 @@ import "./autonomous-testing.css";
 // The server discovers the schema; the user only picks which tables/columns the
 // agent may use and which columns may be filtered.
 function ApprovalForm({ connection, schema, busy, onApprove }) {
-  const [selection, setSelection] = useState({});
+  // Starts from what is approved now, so changing an active connection adds to it
+  // instead of starting from nothing.
+  const [selection, setSelection] = useState(() =>
+    Object.fromEntries(
+      Object.entries(schema.approved || {}).map(([table, v]) => [
+        table, { columns: v.columns, filterable: v.filterable_columns || [] },
+      ]),
+    ),
+  );
 
   const toggleTable = (table, columns) =>
     setSelection((cur) => {
@@ -438,9 +446,9 @@ export default function DataReports() {
                   <b>{c.name}</b> ·{" "}
                   {STATUS_TEXT(c)}
                 </span>
-                {c.status !== "active" && c.status !== "unavailable" && (
+                {c.status !== "unavailable" && (
                   <button type="button" className="at-button at-button-secondary" disabled={busy} onClick={() => review(c.name)}>
-                    Setujui
+                    {c.status === "active" ? "Ubah persetujuan" : "Setujui"}
                   </button>
                 )}
                 <button
@@ -458,7 +466,7 @@ export default function DataReports() {
         </section>
         <section className="at-panel">
           {schema ? (
-            <ApprovalForm connection={selected} schema={schema} busy={busy} onApprove={approve} />
+            <ApprovalForm key={selected} connection={selected} schema={schema} busy={busy} onApprove={approve} />
           ) : (
             <>
               <div className="at-section-heading"><Send size={18} /><h2>Tanya laporan</h2></div>
