@@ -255,3 +255,18 @@ class TestMySQLConformance(ConformanceSuite):
             q_sales=f"{my.db}.sales", q_order=f"{my.db}.`order`", order_name="order",
             quote=lambda column: f"`{column}`", assert_read_only=probe,
             leak_tokens=[HOST, my.reader, my.db, ROOT_PW])
+
+
+def test_a_profiles_file_saved_with_a_utf8_bom_is_accepted(tmp_path):
+    """Windows PowerShell 5.1 (Set-Content -Encoding utf8) and Notepad add a BOM."""
+    from api.database_engines import load_profiles
+    path = tmp_path / "profiles.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"crm": GOOD}).encode("utf-8"))
+    assert load_profiles(path)["crm"].type == "mysql"
+
+
+def test_a_profiles_file_without_a_bom_still_loads(tmp_path):
+    from api.database_engines import load_profiles
+    path = tmp_path / "profiles.json"
+    path.write_text(json.dumps({"crm": GOOD}), encoding="utf-8")
+    assert load_profiles(path)["crm"].host == "h"

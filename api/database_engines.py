@@ -184,7 +184,7 @@ def parse_profiles(data: Any) -> dict[str, Any]:
 
 def load_profiles(path: str | Path) -> dict[str, Any]:
     try:
-        return parse_profiles(json.loads(Path(path).expanduser().read_text(encoding="utf-8")))
+        return parse_profiles(json.loads(Path(path).expanduser().read_text(encoding="utf-8-sig")))
     except (OSError, ValueError) as exc:
         if isinstance(exc, EngineError):
             raise
