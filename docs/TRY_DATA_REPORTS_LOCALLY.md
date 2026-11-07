@@ -34,6 +34,9 @@ sign in again. The repository's realm file already includes `basic`.
 
 Creates `data\reports\sales.sqlite3` (120 synthetic orders; no personal data).
 
+Do not skip this step: the backend refuses to start if `HAI_DATABASE_ROOT` is not an existing folder,
+and the page answers "database file not found" if `sales.sqlite3` is not inside it.
+
 ## 2. Start the backend
 
 ```powershell
@@ -66,6 +69,76 @@ Open http://localhost:5173, sign in, and choose **Data Reports** in the sidebar.
 4. *Jalankan* -> the table appears, then *Unduh XLSX* / *Unduh PDF*.
 5. Open the downloaded file in Excel or Acrobat. Check that the number columns are right-aligned
    (real numbers), the header is bold, and there is no "file is corrupt" message.
+
+## 5. Use your own MySQL instead of the sample file
+
+MySQL is chosen **by profile name**, never by typing a host or password into the page: those live on the
+server. The page only shows a **Sumber** list once at least one profile exists.
+
+**a. The driver** is installed with the project (`pip install ".[mysql]"` if it is missing).
+
+**b. Create a read-only account.** In MySQL Shell or Workbench, as an administrator:
+
+```sql
+CREATE USER 'hai_reader'@'127.0.0.1' IDENTIFIED BY '<a password>';
+CREATE USER 'hai_reader'@'localhost' IDENTIFIED BY '<the same password>';
+GRANT SELECT ON your_database.* TO 'hai_reader'@'127.0.0.1';
+GRANT SELECT ON your_database.* TO 'hai_reader'@'localhost';
+```
+
+Rules the server enforces (it refuses the connection otherwise): the account may hold **only SELECT**
+(`root` and any account with INSERT, UPDATE, DELETE, CREATE, ... are refused), privileges must be granted
+to the account directly (not through a role), and the link is always encrypted (MySQL 8 offers TLS by
+default; a server without TLS cannot be used).
+
+**c. Describe the connection** in `data\reports\profiles.json` (git-ignored). It holds no password, only
+the *name* of the variable that does:
+
+```json
+{
+  "local_mysql": {
+    "type": "mysql",
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "your_database",
+    "user": "hai_reader",
+    "password_env": "HAI_MYSQL_LOCAL_PASSWORD",
+    "ssl": "require"
+  }
+}
+```
+
+**d. Add two lines to your `.env`:**
+
+```
+HAI_DATABASE_PROFILES=C:\Projects\Python\AI\new-hAI-agent\data\reports\profiles.json
+HAI_MYSQL_LOCAL_PASSWORD=<the password of hai_reader>
+```
+
+**e. Check it before opening the browser.** This reads your `.env` the way the server does and, unlike
+the web page, prints the real reason when something is wrong (and never the password):
+
+```powershell
+python scripts\check_database_profile.py local_mysql
+```
+
+You want `Result: this profile will work in the web app.` Common failures it explains:
+
+| It says | Fix |
+|---|---|
+| `Access denied for user 'hai_reader'@'<host>'` | The account exists for a different host than the one named in the message. Create it for that host (list accounts with `SELECT user, host FROM mysql.user;`). |
+| `refused by the safety rules ... more than SELECT` | Use a dedicated account that has only `GRANT SELECT`, not `root`. |
+| `environment variable ... is not set` | Add `HAI_MYSQL_LOCAL_PASSWORD=...` to `.env`. |
+| `not reachable` | MySQL is not running, or the host/port in the profile is wrong. |
+| `TLS handshake failed` | The server does not offer encryption; enable TLS on the server. |
+| `database driver is not installed` | `pip install ".[mysql]"` |
+
+**f. Restart the backend** (it reads `.env` at start), reload the page, open **Koneksi**, choose
+**Sumber -> local_mysql (mysql)**, give the connection a name, and press **Hubungkan**. The rest is the
+same as for the sample file: approve tables and columns, ask, review the plan, run, download.
+
+Tables or columns whose names contain characters other than letters, digits and underscores (a space or a
+hyphen) are hidden, and the page tells you how many. Reserved words such as `order` or `group` work.
 
 ## Troubleshooting
 
