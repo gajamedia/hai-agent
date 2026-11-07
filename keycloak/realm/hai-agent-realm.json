@@ -92,6 +92,18 @@
         {
           "name": "autonomous-testing-reconciler",
           "description": "Reconcile stale interrupted autonomous-testing batches without replay"
+        },
+        {
+          "name": "data-reports-user",
+          "description": "Create and run database reports and request new database engines."
+        },
+        {
+          "name": "database-connection-manager",
+          "description": "Connect databases and approve which tables the agent may use."
+        },
+        {
+          "name": "database-engine-reviewer",
+          "description": "Review requests for new database engines."
         }
       ]
     }
@@ -111,6 +123,7 @@
       "authorizationServicesEnabled": false,
       "fullScopeAllowed": true,
       "defaultClientScopes": [
+        "basic",
         "roles",
         "profile",
         "email"
@@ -145,6 +158,7 @@
         "post.logout.redirect.uris": "http://localhost:5173/*##http://127.0.0.1:5173/*##http://localhost:5174/*##http://127.0.0.1:5174/*"
       },
       "defaultClientScopes": [
+        "basic",
         "roles",
         "profile",
         "email"

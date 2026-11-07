@@ -46,6 +46,25 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("POST", r"^/api/v1/autonomous-testing/batches/[^/]+/reconcile$", "autonomous-testing:batch:reconcile"),
     ("GET", r"^/api/v1/autonomous-testing/batches/[^/]+/(?:results|reconciliation)$", "autonomous-testing:batch:read"),
     ("GET", r"^/api/v1/autonomous-testing/batches/[^/]+$", "autonomous-testing:batch:read"),
+    # Data reports: plan, run, cancel and download all need the report permission.
+    # Reading the business data itself is enforced again, per read, by the gateway.
+    ("POST", r"^/api/v1/table-reports$", "report:table:run"),
+    ("POST", r"^/api/v1/table-reports/plans$", "report:table:run"),
+    ("POST", r"^/api/v1/table-reports/plans/[^/]+/run$", "report:table:run"),
+    ("DELETE", r"^/api/v1/table-reports/plans/[^/]+$", "report:table:run"),
+    ("GET", r"^/api/v1/table-reports/reports/[^/]+/download$", "report:table:run"),
+    # Connecting databases and approving tables.
+    ("GET", r"^/api/v1/database-connections$", "database:connection:manage"),
+    ("POST", r"^/api/v1/database-connections$", "database:connection:manage"),
+    ("GET", r"^/api/v1/database-connections/profiles$", "database:connection:manage"),
+    ("GET", r"^/api/v1/database-connections/[^/]+/schema$", "database:connection:manage"),
+    ("POST", r"^/api/v1/database-connections/[^/]+/approve$", "database:connection:manage"),
+    ("DELETE", r"^/api/v1/database-connections/[^/]+$", "database:connection:manage"),
+    # Engine requests: anyone who may ask can list (the handler narrows it to their own
+    # unless they are a reviewer); only reviewers can change a request.
+    ("POST", r"^/api/v1/database-engine-requests$", "database:engine:request"),
+    ("GET", r"^/api/v1/database-engine-requests$", "database:engine:request"),
+    ("PATCH", r"^/api/v1/database-engine-requests/[^/]+$", "database:engine:review"),
 )
 
 _COMPILED_RULES = tuple(

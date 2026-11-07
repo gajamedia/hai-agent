@@ -68,6 +68,18 @@ def _role_map_for_keycloak(api_client_id: str) -> dict[str, tuple[str, ...]]:
         f"{prefix}lifecycle-revoker": (p["lifecycle_revoke"],),
         f"{prefix}environment-workspace-reader": (p["environment_workspace_read"],),
         f"{prefix}canonical-capability-invoker": (api["canonical_capability_invoke"],),
+        # Data reports. Running a report needs the report permission AND the data read
+        # permission; managing connections and reviewing engine requests are separate.
+        f"{prefix}data-reports-user": (
+            api["table_report_run"],
+            api["business_database_read"],
+            api["database_engine_request"],
+        ),
+        f"{prefix}database-connection-manager": (api["database_connection_manage"],),
+        f"{prefix}database-engine-reviewer": (
+            api["database_engine_review"],
+            api["database_engine_request"],  # reviewers also list requests
+        ),
     }
 
 

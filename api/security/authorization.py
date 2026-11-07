@@ -146,6 +146,11 @@ API_ROUTE_PERMISSIONS = MappingProxyType({
     "autonomous_batch_reconcile": "autonomous-testing:batch:reconcile",
     "database_onboarding_read": "database:onboarding:read",
     "database_onboarding_write": "database:onboarding:write",
+    "table_report_run": "report:table:run",
+    "business_database_read": "business:database:read",
+    "database_connection_manage": "database:connection:manage",
+    "database_engine_request": "database:engine:request",
+    "database_engine_review": "database:engine:review",
 })
 
 CAPABILITY_PERMISSIONS = MappingProxyType({
