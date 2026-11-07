@@ -184,6 +184,11 @@ Planning a report sends the question and the approved table catalog (never rows)
 - `HAI_LLM_PROVIDER=auto` (default): OpenCode first, Claude Code only if OpenCode fails. A provider that
   *hangs* only fails when its timeout ends, so the first provider is capped at `HAI_LLM_FAILOVER_SECONDS`
   (default 60, never more than `OPENCODE_TIMEOUT`). Worst case before the second answers: about one minute.
+  A provider that just failed (an account that hit its usage limit, a stalled model) is then skipped for
+  `HAI_LLM_PROVIDER_COOLDOWN_SECONDS` (default 300), so only the first request pays that minute; it is
+  still tried as a last resort if the other provider also fails, and one success clears it.
+- **If your OpenCode account is rate limited**, do not rely on `auto`: it still spends a minute per cooldown
+  window and keeps sending requests to a limited account. Set `HAI_LLM_PROVIDER=claude-code`.
 - `HAI_LLM_PROVIDER=claude-code` or `opencode`: use one provider only.
 - If OpenCode never answers, check its model: with `OPENCODE_MODEL` empty it uses its built-in free model,
   which can stall. List the models you can use with `opencode models`, put one in `OPENCODE_MODEL`

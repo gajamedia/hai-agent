@@ -172,3 +172,112 @@ def test_a_fallback_is_logged_with_how_long_the_failed_provider_took(caplog, mon
     with caplog.at_level("WARNING", logger="agent.llm.fallback_provider"):
         FallbackLLMProvider([primary, backup]).complete(_request())
     assert "opencode failed after 95 s" in caplog.text and "ClaudeCodeTimeoutError" in caplog.text
+
+
+# ------------------------------------------------------------------------- cooldown
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _cooldown_pair(cooldown=300.0):
+    clock = _Clock()
+    primary = _Stub("opencode", error=OpenCodeConfigurationError("usage limit reached"))
+    backup = _Stub("claude-code", result="from claude")
+    return FallbackLLMProvider([primary, backup], cooldown_seconds=cooldown, clock=clock), primary, backup, clock
+
+
+def test_a_provider_that_just_failed_is_skipped_so_only_the_first_request_pays():
+    fb, primary, backup, clock = _cooldown_pair()
+    assert fb.complete(_request()).content == "from claude"
+    assert primary.calls == 1                       # the first request paid for the failure ...
+    for _ in range(5):
+        clock.now += 10
+        assert fb.complete(_request()).content == "from claude"
+    assert primary.calls == 1 and backup.calls == 6  # ... the next ones went straight to Claude
+
+
+def test_the_failed_provider_is_tried_again_after_the_cooldown_and_a_success_clears_it():
+    fb, primary, backup, clock = _cooldown_pair(cooldown=60)
+    fb.complete(_request())
+    clock.now += 61
+    primary.error, primary.result = None, "opencode is back"
+    assert fb.complete(_request()).content == "opencode is back" and primary.calls == 2
+    assert fb.complete(_request()).content == "opencode is back" and primary.calls == 3   # no longer resting
+
+
+def test_a_failure_after_the_cooldown_starts_a_new_cooldown():
+    fb, primary, backup, clock = _cooldown_pair(cooldown=60)
+    fb.complete(_request())
+    clock.now += 61
+    fb.complete(_request())                          # tried again, fails again
+    assert primary.calls == 2
+    clock.now += 30
+    fb.complete(_request())
+    assert primary.calls == 2                        # resting again
+
+
+def test_a_resting_provider_is_still_the_last_resort_when_the_others_fail():
+    fb, primary, backup, clock = _cooldown_pair()
+    fb.complete(_request())                          # opencode now resting
+    backup.error = ClaudeCodeTimeoutError("claude down")
+    primary.error, primary.result = None, "opencode recovered"
+    assert fb.complete(_request()).content == "opencode recovered"   # tried despite resting
+    assert primary.calls == 2
+
+
+def test_when_every_provider_is_resting_they_are_all_tried_in_order():
+    clock = _Clock()
+    a = _Stub("opencode", error=OpenCodeConfigurationError("a"))
+    b = _Stub("claude-code", error=ClaudeCodeTimeoutError("b"))
+    fb = FallbackLLMProvider([a, b], cooldown_seconds=300, clock=clock)
+    with pytest.raises(AllProvidersFailedError):
+        fb.complete(_request())
+    clock.now += 5
+    with pytest.raises(AllProvidersFailedError) as info:
+        fb.complete(_request())
+    assert a.calls == 2 and b.calls == 2             # not refused just because both are resting
+    assert [n for n, _ in info.value.failures] == ["opencode", "claude-code"]
+
+
+def test_cooldown_is_off_by_default_and_changes_nothing():
+    primary = _Stub("opencode", error=OpenCodeConfigurationError("x"))
+    backup = _Stub("claude-code", result="ok")
+    fb = FallbackLLMProvider([primary, backup])
+    for _ in range(3):
+        fb.complete(_request())
+    assert primary.calls == 3
+
+
+def test_programming_errors_are_still_not_masked_with_a_cooldown():
+    fb = FallbackLLMProvider([_Stub("opencode", error=TypeError("bug")), _Stub("claude-code", result="x")],
+                             cooldown_seconds=300)
+    with pytest.raises(TypeError):
+        fb.complete(_request())
+
+
+def test_the_skip_is_logged_once_per_request(caplog):
+    fb, primary, backup, clock = _cooldown_pair()
+    fb.complete(_request())
+    with caplog.at_level("WARNING", logger="agent.llm.fallback_provider"):
+        fb.complete(_request())
+    assert "opencode failed recently; skipping it for 300 s" in caplog.text
+
+
+def test_invalid_cooldown_values_are_rejected():
+    for bad in (-1, True):
+        with pytest.raises(ValueError):
+            FallbackLLMProvider([_Stub("a", result="x")], cooldown_seconds=bad)
+
+
+def test_auto_mode_enables_the_cooldown_from_the_environment(monkeypatch):
+    from api import dependencies as d
+    monkeypatch.setattr(d, "discover_claude_executable", lambda: "claude")
+    monkeypatch.setenv("HAI_LLM_PROVIDER", "auto")
+    monkeypatch.delenv("HAI_LLM_PROVIDER_COOLDOWN_SECONDS", raising=False)
+    assert d.create_llm_provider().cooldown_seconds == 300
+    monkeypatch.setenv("HAI_LLM_PROVIDER_COOLDOWN_SECONDS", "45")
+    assert d.create_llm_provider().cooldown_seconds == 45

@@ -67,7 +67,12 @@ def create_llm_provider():
         return claude()
     if discover_claude_executable() is None:
         return opencode()
-    return FallbackLLMProvider([opencode(first_of_two=True), claude()])
+    return FallbackLLMProvider(
+        [opencode(first_of_two=True), claude()],
+        # After a failure (an account at its usage limit, a stuck model) skip that provider for a
+        # while, so only the first request pays for it instead of every request.
+        cooldown_seconds=_positive_timeout("HAI_LLM_PROVIDER_COOLDOWN_SECONDS", "300"),
+    )
 
 
 def create_runtime() -> AgentCognitiveRuntime:
