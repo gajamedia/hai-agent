@@ -40,3 +40,9 @@ demo03_plan_run_error.json
 data/e2e/
 data/execution_traces.jsonl*
 *pybak*
+
+# One-off audit/patch scripts (generated during development; not part of the product)
+scripts/Collect-*
+scripts/Apply-*
+scripts/apply-*
+scripts/P3_5_*
