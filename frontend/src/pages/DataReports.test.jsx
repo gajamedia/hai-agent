@@ -571,3 +571,165 @@ describe("DataReports", () => {
     expect(document.body.textContent).not.toMatch(/Daftar baris dari/);
   });
 });
+
+describe("DataReports relations", () => {
+  const TWO = {
+    tables: [
+      { name: "tb_bahan", columns: [
+        { name: "id", declared_type: "INTEGER", primary_key: true },
+        { name: "id_jenis", declared_type: "INTEGER", primary_key: false },
+        { name: "id_gudang", declared_type: "INTEGER", primary_key: false }] },
+      { name: "tb_jenisbahan", columns: [{ name: "id", declared_type: "INTEGER", primary_key: true }] },
+      { name: "tb_gudang", columns: [{ name: "id", declared_type: "INTEGER", primary_key: true }] },
+    ],
+    foreign_keys: [{ table: "tb_bahan", column: "id_jenis", ref_table: "tb_jenisbahan", ref_column: "id" }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.listDatabaseConnections.mockResolvedValue({ connections: [] });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
+    api.connectDatabase.mockResolvedValue({ name: "sales", schema: TWO });
+    api.approveDatabaseTables.mockResolvedValue({});
+  });
+
+  const connect = async (user) => {
+    renderPage();
+    await user.type(screen.getByLabelText(/Nama koneksi/), "sales");
+    await user.type(screen.getByLabelText(/Nama file/), "sales.sqlite3");
+    await user.click(screen.getByRole("button", { name: /Hubungkan/ }));
+  };
+
+  it("offers the database foreign key and sends it, plus one the user declares", async () => {
+    const user = userEvent.setup();
+    await connect(user);
+    for (const table of ["tb_bahan", "tb_jenisbahan", "tb_gudang"]) {
+      await user.click(await screen.findByRole("checkbox", { name: table }));
+    }
+    const fk = screen.getByRole("checkbox", { name: /tb_bahan.id_jenis = tb_jenisbahan.id/ });
+    expect(fk.checked).toBe(true);
+
+    const add = screen.getByLabelText("Tambah relasi");
+    await user.selectOptions(within(add).getByLabelText("Tabel"), "tb_bahan");
+    await user.selectOptions(within(add).getByLabelText("Kolom Tabel"), "id_gudang");
+    await user.selectOptions(within(add).getByLabelText("dengan tabel"), "tb_gudang");
+    await user.selectOptions(within(add).getByLabelText("Kolom dengan tabel"), "id");
+    await user.click(within(add).getByRole("button", { name: "Tambah relasi" }));
+    expect(screen.getByText(/dibuat manual/)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
+    const [, , , relations] = api.approveDatabaseTables.mock.calls[0];
+    expect(relations).toEqual([
+      { table: "tb_bahan", column: "id_jenis", ref_table: "tb_jenisbahan", ref_column: "id" },
+      { table: "tb_bahan", column: "id_gudang", ref_table: "tb_gudang", ref_column: "id" },
+    ]);
+  });
+
+  it("sends no relation the user unticked", async () => {
+    const user = userEvent.setup();
+    await connect(user);
+    for (const table of ["tb_bahan", "tb_jenisbahan"]) {
+      await user.click(await screen.findByRole("checkbox", { name: table }));
+    }
+    await user.click(screen.getByRole("checkbox", { name: /tb_bahan.id_jenis = tb_jenisbahan.id/ }));
+    await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
+    expect(api.approveDatabaseTables.mock.calls[0]).toHaveLength(2); // no relations argument
+  });
+});
+
+describe("DataReports relation suggestions and join hint", () => {
+  const SCHEMA_GUESS = {
+    tables: [
+      { name: "tb_bahan", columns: [
+        { name: "id", declared_type: "INTEGER", primary_key: true },
+        { name: "id_jenis", declared_type: "INTEGER", primary_key: false }] },
+      { name: "tb_jenisbahan", columns: [{ name: "id", declared_type: "INTEGER", primary_key: true }] },
+    ],
+    foreign_keys: [],
+    suggested_relations: [{
+      table: "tb_bahan", column: "id_jenis", ref_table: "tb_jenisbahan", ref_column: "id",
+      reason: "nama kolom id_jenis mirip nama tabel tb_jenisbahan",
+    }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.listDatabaseConnections.mockResolvedValue({ connections: [] });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
+    api.connectDatabase.mockResolvedValue({ name: "sales", schema: SCHEMA_GUESS });
+    api.approveDatabaseTables.mockResolvedValue({});
+  });
+
+  it("shows a suggestion from the column name, unticked, and sends it only when ticked", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(screen.getByLabelText(/Nama koneksi/), "sales");
+    await user.type(screen.getByLabelText(/Nama file/), "sales.sqlite3");
+    await user.click(screen.getByRole("button", { name: /Hubungkan/ }));
+    for (const table of ["tb_bahan", "tb_jenisbahan"]) {
+      await user.click(await screen.findByRole("checkbox", { name: table }));
+    }
+    const guess = screen.getByRole("checkbox", { name: /tb_bahan.id_jenis = tb_jenisbahan.id/ });
+    expect(guess.checked).toBe(false);
+    expect(screen.getByText(/saran dari nama: nama kolom id_jenis mirip/)).toBeTruthy();
+
+    await user.click(guess);
+    await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
+    expect(api.approveDatabaseTables.mock.calls[0][3]).toEqual([
+      { table: "tb_bahan", column: "id_jenis", ref_table: "tb_jenisbahan", ref_column: "id" },
+    ]);
+  });
+
+  it("points to the relation form when the question needed a join", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["tb_bahan", "tb_jenisbahan"] }],
+    });
+    api.createReportPlan.mockResolvedValueOnce({
+      status: "unsupported", reason: "join belum didukung", plan_id: null, needs_join: true,
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "bahan dan jenisnya");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText("join belum didukung")).toBeTruthy();
+    expect(screen.getByText(/Relasi antar tabel/, { selector: "b" })).toBeTruthy();
+
+    api.createReportPlan.mockResolvedValueOnce({
+      status: "unsupported", reason: "no date filters", plan_id: null, needs_join: false,
+    });
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText("no date filters")).toBeTruthy();
+    expect(screen.queryByText(/Relasi antar tabel/, { selector: "b" })).toBeNull();
+  });
+});
+
+describe("DataReports relation found by the AI", () => {
+  it("explains the guess in plain words before the plan is run", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["tb_bahan", "tb_jenisbahan"] }],
+    });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
+    api.createReportPlan.mockResolvedValueOnce({
+      status: "planned", plan_id: "p9", database: "sales",
+      plan: {
+        kind: "list", table: "tb_bahan", format: "json", columns: ["tb_bahan.kode", "tb_jenisbahan.nama"],
+        limit: 100, order_by: [], filters: {}, conditions: [],
+        joins: [{ table: "tb_jenisbahan", type: "left", on: ["tb_jenisbahan.id", "tb_bahan.id_jenis"] }],
+        proposed_relations: [
+          { table: "tb_bahan", column: "id_jenis", ref_table: "tb_jenisbahan", ref_column: "id" },
+        ],
+      },
+    });
+    renderPage();
+    await user.type(await screen.findByLabelText(/Pertanyaan/), "bahan dan jenisnya");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    const notice = await screen.findByLabelText("Relasi usulan AI");
+    expect(within(notice).getByText(/AI menduga hubungan antar tabel/)).toBeTruthy();
+    expect(notice.textContent).toMatch(/kolom id_jenis di tabel tb_bahan sama dengan kolom id di tabel tb_jenisbahan/);
+    expect(screen.getByRole("button", { name: "Jalankan" })).toBeTruthy();
+  });
+});

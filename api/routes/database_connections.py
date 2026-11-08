@@ -70,8 +70,9 @@ def connect_database(request: Request, payload: dict[str, Any]):
     source = payload.get("filename" if has_file else "profile")
     database = payload.get("database")
     if database is not None:
-        # A database made by this application (name starts with the profile's prefix); the engine
-        # refuses any other name, so this can never point a profile at an unrelated database.
+        # A database made by this application (name starts with the profile's prefix), or any plain name
+        # when HAI_ALLOW_ANY_DATABASE_NAME is on (read-only account only). The engine refuses everything
+        # else, so a profile can never be pointed at a database without that explicit choice.
         if has_file or not isinstance(database, str) or "/" in database or not isinstance(source, str):
             raise _err(422, "invalid_request", "database can only accompany a profile, as a plain name.")
         source = f"{source}/{database}"
@@ -144,9 +145,10 @@ def connection_schema(name: str, request: Request):
 def approve_tables(name: str, request: Request, payload: dict[str, Any]):
     """Step 2: the user approves tables/columns; only then can reports run."""
     principal, registry = _guard(request)
-    if set(payload) - {"tables"}:
-        raise _err(422, "invalid_request", "Only 'tables' is accepted.")
-    return _call(registry.activate, name, payload.get("tables"), actor_id=principal.actor_id)
+    if set(payload) - {"tables", "relations"}:
+        raise _err(422, "invalid_request", "Only 'tables' and 'relations' are accepted.")
+    return _call(registry.activate, name, payload.get("tables"), actor_id=principal.actor_id,
+                 relations=payload.get("relations"))
 
 
 @router.post("/{name}/refresh")

@@ -151,7 +151,7 @@ def test_store_contains_only_metadata_and_the_approved_selection(setup):
         cols = [c[1] for c in db.execute("PRAGMA table_info(connections)")]
         (selection,) = db.execute("SELECT selection_json FROM connections").fetchone()
     assert set(cols) == {"name", "filename", "engine", "connected_by", "connected_at", "approved_by",
-                         "approved_at", "selection_json", "fingerprint"}
+                         "approved_at", "selection_json", "fingerprint", "relations_json"}
     assert json.loads(selection) == SELECTION
 
 

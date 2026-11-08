@@ -169,6 +169,14 @@ def test_unsupported_questions_get_no_plan_id(world):
     client, *_ = world[0](reason)
     body = _create(client(), "bulan lalu").json()
     assert body["status"] == "unsupported" and body["plan_id"] is None and "date" in body["reason"]
+    assert body["needs_join"] is False
+
+
+def test_a_missing_join_is_flagged_so_the_page_can_point_to_the_relation_form(world):
+    reason = json.dumps({"supported": False, "reason": "perlu join", "needs_join": True})
+    client, *_ = world[0](reason)
+    body = _create(client(), "bahan dan jenisnya").json()
+    assert body["status"] == "unsupported" and body["needs_join"] is True
 
 
 def test_permissions_are_required_for_every_phase(world):

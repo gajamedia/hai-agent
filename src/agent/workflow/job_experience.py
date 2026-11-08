@@ -83,7 +83,7 @@ class ConnectionExperience:
                         "DELETE FROM job_runs WHERE connection = ? AND id NOT IN ("
                         "SELECT id FROM job_runs WHERE connection = ? ORDER BY id DESC LIMIT ?)",
                         (self.connection, self.connection, self._store.max_runs))
-                    if status == "succeeded":
+                    if status == "succeeded" and not plan.get("joins"):  # joined filters are table.column
                         for column, value in (plan.get("filters") or {}).items():
                             if isinstance(value, str) and 0 < len(value) <= MAX_VALUE_CHARS:
                                 self._remember(db, table, column, value, now)

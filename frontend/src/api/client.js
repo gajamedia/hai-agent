@@ -243,10 +243,10 @@ export async function refreshDatabaseConnection(name, signal) {
   return jsonPost(`${API_V1}/database-connections/${encodeURIComponent(name)}/refresh`, {}, signal);
 }
 
-export async function approveDatabaseTables(name, tables, signal) {
+export async function approveDatabaseTables(name, tables, signal, relations) {
   return jsonPost(
     `${API_V1}/database-connections/${encodeURIComponent(name)}/approve`,
-    { tables },
+    relations?.length ? { tables, relations } : { tables },
     signal,
   );
 }

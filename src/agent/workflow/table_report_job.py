@@ -21,7 +21,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from agent.llm.business_database_adapter import CONDITION_OPERATORS, MAX_CONDITIONS, MAX_IN_VALUES
+from agent.llm.business_database_adapter import (
+    CONDITION_OPERATORS, JOIN_TYPES, MAX_CONDITIONS, MAX_IN_VALUES, MAX_JOINS, join_output_names,
+    split_qualified,
+)
 from agent.workflow.analytics import ANALYTICAL_TASK_TYPE, analytical_column_order, order_columns
 from agent.workflow.contracts import TaskStatus, WorkflowStatus
 from agent.workflow.invocation import TRUSTED_CAPABILITY_TASK_TYPE
@@ -63,6 +66,9 @@ class TableReportRequest:
     # Comparisons beyond equality: (column, operator, value). value is a scalar, a (low, high) or
     # list for between/in, and None for is_null / is_not_null. All are ANDed with the filters.
     conditions: tuple[tuple[str, str, Any], ...] = ()
+    # Joins: (table, "inner" | "left", "table.column", "table.column"). When present every column in this
+    # request is written table.column and ``table`` is the table the report starts from.
+    joins: tuple[tuple[str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.table.strip() or not self.columns:
@@ -84,6 +90,17 @@ class TableReportRequest:
             if len(self.order_by) > MAX_ORDER_BY or any(
                     len(item) != 2 or item[1] not in {"asc", "desc"} for item in self.order_by):
                 raise ValueError(f"order_by must have at most {MAX_ORDER_BY} (column, asc|desc) items")
+        if self.joins:
+            if len(self.joins) > MAX_JOINS or any(
+                    len(j) != 4 or j[1] not in JOIN_TYPES for j in self.joins):
+                raise ValueError(f"at most {MAX_JOINS} joins of type inner or left are allowed")
+            for name in (*self.select_columns, *self.group_by, *(m[2] for m in self.metrics),
+                         *self.columns):
+                split_qualified(name)
+            join_output_names(list(self.columns))
+            if self.kind == "aggregate" and {m[0] for m in self.metrics} & set(
+                    join_output_names(list(self.columns))):
+                raise ValueError("a metric output name clashes with a result column name")
         referenced = set(self.group_by) | {m[2] for m in self.metrics}
         referenced |= set(self.required_non_null_columns) | set(self.unique_key_columns)
         referenced |= set(self.numeric_columns) | set(self.categorical_columns)
@@ -159,6 +176,11 @@ def _build_list_task_specs(request: TableReportRequest) -> list[TaskSpec]:
         "columns": list(request.select_columns),
         "limit": request.limit + 1,
     }
+    # In a joined listing the rows come back under the plain column name (or table_column when two
+    # tables share a name); the report must use those names.
+    shown = join_output_names(request.select_columns) if request.joins else list(request.select_columns)
+    if request.joins:
+        read_arguments["joins"] = [{"table": t, "type": kind, "on": [a, b]} for t, kind, a, b in request.joins]
     if request.order_by:
         read_arguments["order_by"] = [("-" if direction == "desc" else "") + column
                                       for column, direction in request.order_by]
@@ -166,16 +188,18 @@ def _build_list_task_specs(request: TableReportRequest) -> list[TaskSpec]:
     analytical = {
         "source_task_key": "read",
         "dataset_schema": {
-            "columns": [{"name": c, "data_type": "any", "nullable": True} for c in request.select_columns],
+            "columns": [{"name": c, "data_type": "any", "nullable": True} for c in shown],
             "allow_extra_columns": False,
             "min_rows": 1,
             "max_rows": request.limit + 1,
         },
         "quality_rules": {"required_non_null_columns": [], "unique_key_columns": []},
-        "detail": {"columns": list(request.select_columns), "limit": request.limit},
+        "detail": {"columns": shown, "limit": request.limit},
     }
     return [
-        TaskSpec("read", TRUSTED_CAPABILITY_TASK_TYPE, f"Read table {request.table}",
+        TaskSpec("read", TRUSTED_CAPABILITY_TASK_TYPE,
+                 f"Read tables {', '.join([request.table, *(j[0] for j in request.joins)])}"
+                 if request.joins else f"Read table {request.table}",
                  input_data={"action": READ_ACTION, "arguments": read_arguments}),
         TaskSpec("analyze", ANALYTICAL_TASK_TYPE, "Validate and collect rows",
                  depends_on=("read",), input_data=analytical),
@@ -190,15 +214,19 @@ def build_task_specs(request: TableReportRequest) -> list[TaskSpec]:
     if request.kind == "list":
         return _build_list_task_specs(request)
     required = set(request.required_non_null_columns)
+    # Over joined tables the rows come back under plain names (see join_output_names); the analysis
+    # uses those names, and a joined row may legitimately hold NULLs (left join).
+    alias = (dict(zip(request.columns, join_output_names(list(request.columns))))
+             if request.joins else {name: name for name in request.columns})
     columns = [
-        {"name": name, "data_type": data_type, "nullable": name not in required}
+        {"name": alias[name], "data_type": data_type, "nullable": name not in required}
         for name, data_type in request.columns.items()
     ]
     descriptive: dict[str, Any] | None = None
     if request.numeric_columns or request.categorical_columns:
         descriptive = {
-            "numeric_columns": list(request.numeric_columns),
-            "categorical_columns": list(request.categorical_columns),
+            "numeric_columns": [alias[c] for c in request.numeric_columns],
+            "categorical_columns": [alias[c] for c in request.categorical_columns],
         }
     analytical: dict[str, Any] = {
         "source_task_key": "read",
@@ -209,13 +237,13 @@ def build_task_specs(request: TableReportRequest) -> list[TaskSpec]:
             "max_rows": request.row_limit - 1,  # truncation guard, see module docstring
         },
         "quality_rules": {
-            "required_non_null_columns": list(request.required_non_null_columns),
-            "unique_key_columns": list(request.unique_key_columns),
+            "required_non_null_columns": [alias[c] for c in request.required_non_null_columns],
+            "unique_key_columns": [alias[c] for c in request.unique_key_columns],
         },
         "aggregation": {
-            "group_by": list(request.group_by),
+            "group_by": [alias[c] for c in request.group_by],
             "aggregations": [
-                {"output_column": out, "operation": op, "source_column": src}
+                {"output_column": out, "operation": op, "source_column": alias[src]}
                 for out, op, src in request.metrics
             ],
         },
@@ -227,10 +255,14 @@ def build_task_specs(request: TableReportRequest) -> list[TaskSpec]:
         "columns": list(request.columns),
         "limit": request.row_limit,
     }
+    if request.joins:
+        read_arguments["joins"] = [{"table": t, "type": kind, "on": [a, b]} for t, kind, a, b in request.joins]
     title = _apply_scope(request, read_arguments)
     return [
         TaskSpec(
-            "read", TRUSTED_CAPABILITY_TASK_TYPE, f"Read table {request.table}",
+            "read", TRUSTED_CAPABILITY_TASK_TYPE,
+            f"Read tables {', '.join([request.table, *(j[0] for j in request.joins)])}"
+            if request.joins else f"Read table {request.table}",
             input_data={"action": READ_ACTION, "arguments": read_arguments},
         ),
         TaskSpec("analyze", ANALYTICAL_TASK_TYPE, "Validate and aggregate rows",

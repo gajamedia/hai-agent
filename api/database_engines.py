@@ -20,7 +20,7 @@ from typing import Any, Mapping
 from agent.database import ConnectionManager
 from agent.database.sqlite_readonly import register_sqlite_read_only_profile
 from agent.database.sqlite_schema import (
-    SQLiteColumn, SQLiteSchema, SQLiteTable, discover_sqlite_schema,
+    ForeignKey, SQLiteColumn, SQLiteSchema, SQLiteTable, discover_sqlite_schema,
 )
 
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")  # profile schema names only
@@ -31,6 +31,29 @@ MAX_TABLES = 200
 # Only names it cannot represent (spaces, hyphens, non-ASCII) are hidden.
 def _usable(name: str) -> bool:
     return bool(_NAME.match(name))
+
+
+def _collect_foreign_keys(query, tables: Mapping[str, list]) -> tuple[ForeignKey, ...]:
+    """Foreign keys over one column between discovered tables. ``query()`` returns rows of
+    (constraint, table, column, ref_table, ref_column). Never fatal: a server that hides them just
+    offers none, and the user can still declare relations by hand."""
+    try:
+        rows = list(query())
+    except Exception:  # noqa: BLE001
+        return ()
+    per_constraint: dict[Any, list[tuple]] = {}
+    for row in rows:
+        per_constraint.setdefault((row[0], row[1]), []).append(row)
+    found: list[ForeignKey] = []
+    for group in per_constraint.values():
+        if len(group) != 1:
+            continue  # several columns together: not offered
+        _, table, column, ref_table, ref_column = group[0]
+        if (table in tables and ref_table in tables
+                and column in {c.name for c in tables[table]}
+                and ref_column in {c.name for c in tables[ref_table]}):
+            found.append(ForeignKey(table, column, ref_table, ref_column))
+    return tuple(sorted(found, key=lambda k: (k.table, k.column, k.ref_table, k.ref_column)))
 
 
 def _skipped_warning(count: int) -> list[str]:
@@ -421,8 +444,18 @@ class PostgresEngine:
             tables.setdefault(table, []).append(SQLiteColumn(
                 name=column, declared_type=data_type, nullable=(nullable == "YES"),
                 primary_key=(table, column) in pks))
-        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))
-        return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
+        fks = _collect_foreign_keys(lambda: self._rows(
+            connection,
+            "SELECT con.conname, cl.relname, a.attname, rcl.relname, ra.attname "
+            "FROM pg_constraint con JOIN pg_class cl ON cl.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = cl.relnamespace JOIN pg_class rcl ON rcl.oid = con.confrelid "
+            "JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey) "
+            "JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = ANY(con.confkey) "
+            "WHERE con.contype = 'f' AND n.nspname = %s", (profile.schema,)), tables)
+        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))[:MAX_TABLES]
+        kept = {t.name for t in items}
+        fks = tuple(k for k in fks if k.table in kept and k.ref_table in kept)
+        return SQLiteSchema(profile_name=name, tables=items, foreign_keys=fks), skipped
 
 
 # --------------------------------------------------------------------- MySQL
@@ -508,6 +541,27 @@ def check_mysql_creator_grants(grants: list[str], prefix: str) -> None:
 
 
 _DB_OVERRIDE = re.compile(r"^[a-z][a-z0-9_]{1,56}$")
+_ANY_DB_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+def any_database_allowed() -> bool:
+    """HAI_ALLOW_ANY_DATABASE_NAME=true: READING may name any database on a server profile (default off).
+
+    Meant for databases this application did not create. Only the read-only account ever connects to
+    such a database: it is still checked to hold SELECT and nothing more, and the server decides what it
+    can see. Writing and creating stay limited to the profile's own database and the creator prefix.
+    """
+    return os.environ.get("HAI_ALLOW_ANY_DATABASE_NAME", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_database(profile, database: str, *, for_write: bool):
+    """The profile pointed at another database, or EngineError when that name is not allowed."""
+    if (profile.creator_user and _DB_OVERRIDE.match(database)
+            and database.startswith(profile.creator_prefix) and database != profile.creator_prefix):
+        return replace(profile, database=database)
+    if not for_write and any_database_allowed() and _ANY_DB_NAME.match(database):
+        return replace(profile, database=database)
+    raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
 
 
 class MySQLEngine:
@@ -569,20 +623,19 @@ class MySQLEngine:
             schema, skipped = self._discover(connection, name, profile)
         return schema, _skipped_warning(skipped)
 
-    def _resolve(self, source: str):
-        """A profile name, or "profile/database" for a database made by the creator (prefix only)."""
+    def _resolve(self, source: str, *, for_write: bool = False):
+        """A profile name, or "profile/database": a prefixed database, or any name when allowed (reading only)."""
         name, _, database = source.partition("/")
         profile = self.profiles.get(name)
         if profile is None or not database:
             return profile
-        if (not profile.creator_user or not _DB_OVERRIDE.match(database)
-                or not database.startswith(profile.creator_prefix)
-                or database == profile.creator_prefix):
-            raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
-        return replace(profile, database=database)
+        return _resolve_database(profile, database, for_write=for_write)
 
     def has_writer(self, source: str) -> bool:
-        profile = self._resolve(source)
+        try:
+            profile = self._resolve(source, for_write=True)
+        except EngineError:
+            return False        # a database chosen only for reading never gets a writer
         return bool(profile and profile.writer_user and profile.writer_password_env)
 
     def has_creator(self, name: str) -> bool:
@@ -628,7 +681,7 @@ class MySQLEngine:
         The account is verified once, here: it must hold only data-changing privileges on the
         profile's one database. The reader connections are never reused for writing.
         """
-        profile = self._resolve(source)
+        profile = self._resolve(source, for_write=True)
         if profile is None or not self.has_writer(source):
             raise EngineError("this database profile has no writer account configured")
         if not os.environ.get(profile.writer_password_env):
@@ -684,8 +737,15 @@ class MySQLEngine:
             tables.setdefault(table, []).append(SQLiteColumn(
                 name=column, declared_type=str(data_type), nullable=(nullable == "YES"),
                 primary_key=(key == "PRI")))
-        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))
-        return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
+        fks = _collect_foreign_keys(lambda: PostgresEngine._rows(
+            connection,
+            "SELECT constraint_name, table_name, column_name, referenced_table_name, referenced_column_name "
+            "FROM information_schema.key_column_usage WHERE table_schema = %s "
+            "AND referenced_table_name IS NOT NULL", (profile.database,)), tables)
+        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))[:MAX_TABLES]
+        kept = {t.name for t in items}
+        fks = tuple(k for k in fks if k.table in kept and k.ref_table in kept)
+        return SQLiteSchema(profile_name=name, tables=items, foreign_keys=fks), skipped
 
 
 # ----------------------------------------------------------------- SQL Server
@@ -789,24 +849,23 @@ class SQLServerEngine:
                 f"UID={user or profile.user};PWD={_odbc_value(password)};Encrypt=yes;"
                 f"TrustServerCertificate={trust};APP=hai-agent-reports")
 
-    def _resolve(self, source: str):
-        """A profile name, or "profile/database" for a database made by the creator (prefix only)."""
+    def _resolve(self, source: str, *, for_write: bool = False):
+        """A profile name, or "profile/database": a prefixed database, or any name when allowed (reading only)."""
         name, _, database = source.partition("/")
         profile = self.profiles.get(name)
         if profile is None or not database:
             return profile
-        if (not profile.creator_user or not _DB_OVERRIDE.match(database)
-                or not database.startswith(profile.creator_prefix)
-                or database == profile.creator_prefix):
-            raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
-        return replace(profile, database=database)
+        return _resolve_database(profile, database, for_write=for_write)
 
     def has_creator(self, name: str) -> bool:
         profile = self.profiles.get(name)
         return bool(profile and profile.creator_user and profile.creator_password_env)
 
     def has_writer(self, source: str) -> bool:
-        profile = self._resolve(source)
+        try:
+            profile = self._resolve(source, for_write=True)
+        except EngineError:
+            return False        # a database chosen only for reading never gets a writer
         return bool(profile and profile.writer_user and profile.writer_password_env)
 
     # SELECT TOP (n) ... FROM [t] WITH (UPDLOCK, ROWLOCK): the rows the change will touch stay locked
@@ -816,7 +875,7 @@ class SQLServerEngine:
         """A function opening write-capable connections (a transaction each) for the profile's writer login.
 
         Verified once, here: only data rights on the profile's database. The reader is never reused to write."""
-        profile = self._resolve(source)
+        profile = self._resolve(source, for_write=True)
         if profile is None or not self.has_writer(source):
             raise EngineError("this database profile has no writer account configured")
         if not os.environ.get(profile.writer_password_env):
@@ -953,8 +1012,19 @@ class SQLServerEngine:
             tables.setdefault(table, []).append(SQLiteColumn(
                 name=column, declared_type=str(data_type), nullable=(nullable == "YES"),
                 primary_key=(table, column) in pks))
-        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))
-        return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
+        fks = _collect_foreign_keys(lambda: PostgresEngine._rows(
+            connection,
+            "SELECT fk.name, pt.name, pc.name, rt.name, rc.name FROM sys.foreign_key_columns fkc "
+            "JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id "
+            "JOIN sys.tables pt ON pt.object_id = fkc.parent_object_id "
+            "JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id "
+            "JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id "
+            "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id "
+            "JOIN sys.schemas s ON s.schema_id = pt.schema_id WHERE s.name = ?", (profile.schema,)), tables)
+        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))[:MAX_TABLES]
+        kept = {t.name for t in items}
+        fks = tuple(k for k in fks if k.table in kept and k.ref_table in kept)
+        return SQLiteSchema(profile_name=name, tables=items, foreign_keys=fks), skipped
 
 
 __all__ = ["EngineError", "MySQLEngine", "check_mysql_writer_grants", "check_mysql_creator_grants", "MySQLProfile", "PostgresEngine", "PostgresProfile",

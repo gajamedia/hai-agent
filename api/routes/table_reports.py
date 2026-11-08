@@ -157,11 +157,13 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
     if not plan.ok:
         return JSONResponse(status_code=200, content={
             "status": "unsupported", "question": plan.question, "reason": plan.reason,
-            "provider": plan.provider, "plan_id": None})
+            "provider": plan.provider, "plan_id": None,
+            "needs_join": bool(getattr(plan, "needs_join", False))})
     store = _plans(request)
     try:
         stored = store.create(owner=principal.actor_id, database=name, question=plan.question,
-                              plan_result=plan, summary=service.summarize(plan.request),
+                              plan_result=plan,
+                              summary=service.summarize(plan.request, getattr(plan, "proposed_relations", ())),
                               service=service)
     except PlanConflict as exc:
         raise _error(429, "too_many_plans", str(exc)) from exc

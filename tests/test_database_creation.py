@@ -306,6 +306,27 @@ def test_only_prefixed_databases_can_be_chosen_on_a_profile_with_a_creator():
             engine._resolve(bad)
 
 
+def test_any_database_name_can_be_read_only_when_the_switch_is_on(monkeypatch):
+    engine = MySQLEngine(parse_profiles({
+        "plain": {**BASE, "writer": {"user": "w", "password_env": "W"}}}))
+    monkeypatch.delenv("HAI_ALLOW_ANY_DATABASE_NAME", raising=False)
+    with pytest.raises(EngineError):
+        engine._resolve("plain/dbsales2")                        # off by default
+    monkeypatch.setenv("HAI_ALLOW_ANY_DATABASE_NAME", "true")
+    assert engine._resolve("plain/dbsales2").database == "dbsales2"
+    assert engine._resolve("plain/Sales_DB").database == "Sales_DB"
+    for bad in ("plain/x;DROP", "plain/a b", "plain/a`b", "plain/a.b", "plain/"):
+        if bad.endswith("/"):
+            assert engine._resolve(bad).database == "dbsales"    # empty name = the profile's own
+            continue
+        with pytest.raises(EngineError):
+            engine._resolve(bad)
+    # such a database is only ever read: no writer, whatever the profile has
+    assert engine.has_writer("plain") and not engine.has_writer("plain/dbsales2")
+    with pytest.raises(EngineError):
+        engine.open_writer("plain/dbsales2")
+
+
 # ------------------------------------------------------------------ live: the whole path on MySQL
 @pytest.fixture
 def my_create(monkeypatch, tmp_path):

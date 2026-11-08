@@ -39,12 +39,26 @@ class SQLiteTable:
 
 
 @dataclass(frozen=True)
+class ForeignKey:
+    """A single-column foreign key the database itself declares: table.column -> ref_table.ref_column."""
+    table: str
+    column: str
+    ref_table: str
+    ref_column: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class SQLiteSchema:
     profile_name: str
     tables: tuple[SQLiteTable, ...]
+    foreign_keys: tuple[ForeignKey, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return {"profile_name": self.profile_name, "tables": [item.to_dict() for item in self.tables]}
+        return {"profile_name": self.profile_name, "tables": [item.to_dict() for item in self.tables],
+                "foreign_keys": [item.to_dict() for item in self.foreign_keys]}
 
 
 def _quoted_identifier(value: str) -> str:
@@ -65,6 +79,7 @@ def discover_sqlite_schema(manager: ConnectionManager, *, profile_name: str) -> 
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             ).fetchall()
             tables: list[SQLiteTable] = []
+            foreign_keys: list[ForeignKey] = []
             for row in rows:
                 name = row[0]
                 if not isinstance(name, str) or not name:
@@ -84,11 +99,20 @@ def discover_sqlite_schema(manager: ConnectionManager, *, profile_name: str) -> 
                 if not parsed:
                     raise SQLiteSchemaDiscoveryError("SQLite returned a table without columns")
                 tables.append(SQLiteTable(name=name, columns=parsed))
+                # id, seq, table, from, to, ...; a key over several columns is not offered (seq > 0)
+                keys = connection.execute(f"PRAGMA foreign_key_list({_quoted_identifier(name)})").fetchall()
+                counts: dict[object, int] = {}
+                for key in keys:
+                    counts[key[0]] = counts.get(key[0], 0) + 1
+                for key in keys:
+                    if counts[key[0]] == 1 and key[4]:
+                        foreign_keys.append(ForeignKey(name, str(key[3]), str(key[2]), str(key[4])))
     except SQLiteSchemaDiscoveryError:
         raise
     except Exception as exc:
         raise SQLiteSchemaDiscoveryError("SQLite schema discovery failed") from exc
-    return SQLiteSchema(profile_name=profile_name, tables=tuple(tables))
+    return SQLiteSchema(profile_name=profile_name, tables=tuple(tables),
+                        foreign_keys=tuple(foreign_keys))
 
 
 def build_readonly_table_specs(
@@ -129,6 +153,6 @@ def build_readonly_table_specs(
 
 
 __all__ = [
-    "SQLiteAllowlistError", "SQLiteColumn", "SQLiteSchema", "SQLiteSchemaDiscoveryError",
+    "ForeignKey", "SQLiteAllowlistError", "SQLiteColumn", "SQLiteSchema", "SQLiteSchemaDiscoveryError",
     "SQLiteTable", "build_readonly_table_specs", "discover_sqlite_schema",
 ]

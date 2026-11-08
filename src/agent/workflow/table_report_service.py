@@ -35,9 +35,13 @@ class AskOutcome:
 
 
 class TableReportService:
-    def __init__(self, *, planner: Any, runner: Any, experience: Any = None) -> None:
+    def __init__(self, *, planner: Any, runner: Any, experience: Any = None,
+                 relation_approver: Any = None) -> None:
         self.planner = planner
         self.runner = runner
+        # Called as relation_approver(relations, execution_context) when a plan that uses relations the AI
+        # found is run: running the plan is the person's approval of them.
+        self.relation_approver = relation_approver
         self.experience = experience  # optional ConnectionExperience (best effort)
 
     def plan(self, question: str, report_format: str | None = None) -> Any:
@@ -56,7 +60,7 @@ class TableReportService:
         return plan
 
     @staticmethod
-    def summarize(req: Any) -> dict[str, Any]:
+    def summarize(req: Any, proposed: Any = ()) -> dict[str, Any]:
         summary = {
             "kind": req.kind, "table": req.table, "group_by": list(req.group_by),
             "metrics": [{"output": o, "operation": op, "column": c} for o, op, c in req.metrics],
@@ -68,12 +72,23 @@ class TableReportService:
         if req.kind == "list":
             summary.update(columns=list(req.select_columns), limit=req.limit,
                            order_by=[{"column": c, "direction": d} for c, d in req.order_by])
+        if req.joins:
+            summary["joins"] = [{"table": t, "type": k, "on": [a, b]} for t, k, a, b in req.joins]
+        if proposed:
+            summary["proposed_relations"] = [
+                {"table": r.table, "column": r.column, "ref_table": r.ref_table, "ref_column": r.ref_column}
+                for r in proposed]
         return summary
 
     def ask(self, question: str, *, execution_context: Any,
             report_format: str | None = None) -> AskOutcome:
         """Plan and run in one call."""
         plan = self.plan(question, report_format)
+        if plan.ok and getattr(plan, "proposed_relations", ()):
+            # Nobody has looked at the relation the AI found; only the review-then-run flow may use it.
+            return AskOutcome("unsupported", question, provider=plan.provider, attempts=plan.attempts,
+                              reason="This question needs tables to be combined in a way nobody approved yet. "
+                                     "Make a plan, check it, and run it to approve the relation.")
         return self.run_plan(plan.question, plan, execution_context=execution_context)
 
     def run_plan(self, question: str, plan: Any, *, execution_context: Any) -> AskOutcome:
@@ -82,7 +97,16 @@ class TableReportService:
             return AskOutcome("unsupported", question, reason=plan.reason,
                               provider=plan.provider, attempts=plan.attempts)
         req = plan.request
-        summary = self.summarize(req)
+        proposed = tuple(getattr(plan, "proposed_relations", ()) or ())
+        summary = self.summarize(req, proposed)
+        if proposed:
+            try:
+                if self.relation_approver is None:
+                    raise ValueError("relations found by the AI cannot be approved here")
+                self.relation_approver(proposed, execution_context)
+            except ValueError as exc:
+                return AskOutcome("failed", question, reason=str(exc), error_code="relation_not_approved",
+                                  plan=summary, provider=plan.provider, attempts=plan.attempts)
         outcome = self.runner.run(
             goal=question, idempotency_key=f"ask-{uuid.uuid4().hex}",
             request=req, execution_context=execution_context)

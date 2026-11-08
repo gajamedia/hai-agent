@@ -9,9 +9,11 @@ permissions apply: those come from the trusted catalog. Anything the LLM
 returns is validated; an invalid answer is sent back once with the exact error,
 and after that the planner reports failure instead of guessing.
 
-Questions that need things this job type cannot do (filters, joins, time
-series) are answered with ``supported=False`` and a reason, not forced into a
-wrong report.
+Joins (listings and totals) are possible only along ``TableRelation`` s the user
+approved (the database's foreign keys, or relations the user declared). Questions
+that need things this job type cannot do (time series, joins outside the approved
+relations) are answered with ``supported=False`` and a
+reason, not forced into a wrong report.
 """
 
 import json
@@ -21,7 +23,10 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from agent.llm.business_database_adapter import CONDITION_OPERATORS, MAX_CONDITIONS, MAX_IN_VALUES
+from agent.llm.business_database_adapter import (
+    CONDITION_OPERATORS, JOIN_TYPES, MAX_CONDITIONS, MAX_IN_VALUES, MAX_JOINS, join_output_names,
+    split_qualified,
+)
 from agent.llm.contracts import LLMMessage
 from agent.workflow.dataset import SUPPORTED_DATA_TYPES
 from agent.workflow.table_report_job import (
@@ -95,6 +100,32 @@ class TableCatalogEntry:
 
 
 @dataclass(frozen=True)
+class TableRelation:
+    """Two columns of two approved tables that may be joined (``source``: the database's own foreign
+    key, or one the user declared because the database does not define it)."""
+
+    table: str
+    column: str
+    ref_table: str
+    ref_column: str
+    source: str = "foreign_key"
+
+    def __post_init__(self) -> None:
+        if self.table == self.ref_table:
+            raise ValueError("a relation must connect two different tables")
+        if self.source not in {"foreign_key", "manual", "ai"}:
+            raise ValueError("relation source must be foreign_key, manual or ai")
+
+    @property
+    def left(self) -> str:
+        return f"{self.table}.{self.column}"
+
+    @property
+    def right(self) -> str:
+        return f"{self.ref_table}.{self.ref_column}"
+
+
+@dataclass(frozen=True)
 class TablePlanResult:
     question: str
     request: TableReportRequest | None
@@ -102,6 +133,11 @@ class TablePlanResult:
     attempts: int = 0
     provider: str | None = None
     errors: tuple[str, ...] = field(default_factory=tuple)
+    # unsupported only because the question needs several tables that cannot be combined (no approved relation)
+    needs_join: bool = False
+    # relations the AI found for this question; they are used by the plan but NOT approved until a person
+    # runs the plan (see TableReportService.run_plan)
+    proposed_relations: tuple["TableRelation", ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -197,7 +233,10 @@ def validate_conditions(entry: TableCatalogEntry, raw: Any) -> tuple[tuple[str, 
 class TableReportPlanner:
     def __init__(self, llm_service: Any, catalog: Sequence[TableCatalogEntry],
                  *, max_attempts: int = 2, experience: Any = None,
-                 today: Callable[[], date] = date.today) -> None:
+                 today: Callable[[], date] = date.today,
+                 relations: Sequence[TableRelation] = (),
+                 relation_hints: Sequence[TableRelation] = (),
+                 propose_relations: bool = True) -> None:
         if not catalog:
             raise ValueError("catalog must not be empty")
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
@@ -207,13 +246,22 @@ class TableReportPlanner:
         if len(self.catalog) != len(catalog):
             raise ValueError("duplicate table in catalog")
         self.max_attempts = max_attempts
+        for rel in relations:
+            for table, column in ((rel.table, rel.column), (rel.ref_table, rel.ref_column)):
+                if table not in self.catalog or column not in self.catalog[table].columns:
+                    raise ValueError(
+                        f"relation {rel.left} = {rel.right} uses a table or column that is not in the catalog")
+        self.relations = tuple(relations)
+        # Guesses from column names (never approved) that help the AI propose a relation, and whether it may.
+        self.relation_hints = tuple(relation_hints)
+        self.propose_relations = propose_relations
         # Optional ConnectionExperience: verified filter values and past plans.
         self.experience = experience
         self._today = today
 
     def _apply_experience(self, request: TableReportRequest) -> TableReportRequest:
         """Correct string filter values to their verified spelling (case/space only)."""
-        if self.experience is None or not request.filters:
+        if self.experience is None or not request.filters or request.joins:
             return request
         fixed = {
             column: (self.experience.canonical_value(request.table, column, value)
@@ -239,7 +287,11 @@ class TableReportPlanner:
                 data = _extract_json(response.content)
                 if data.get("supported") is False:
                     reason = str(data.get("reason") or "The question cannot be answered.").strip()
-                    return TablePlanResult(question, None, reason, attempt, provider, tuple(errors))
+                    result = TablePlanResult(question, None, reason, attempt, provider, tuple(errors),
+                                             needs_join=data.get("needs_join") is True)
+                    if result.needs_join and self.propose_relations and len(self.catalog) > 1:
+                        return self._plan_with_proposed_relations(question, result)
+                    return result
                 request = self._apply_experience(self._validate(data))
                 return TablePlanResult(question, request, None, attempt, provider, tuple(errors))
             except PlanValidationError as exc:
@@ -249,6 +301,85 @@ class TableReportPlanner:
         return TablePlanResult(question, None,
                                f"Could not produce a valid plan: {errors[-1]}",
                                self.max_attempts, provider, tuple(errors))
+
+    # ------------------------------------------------- relations found by the AI
+    def _propose_relations(self, question: str) -> tuple[TableRelation, ...]:
+        """Ask the AI how the tables in the catalog are connected, and keep only what can be verified.
+
+        A proposal must use approved tables and columns of the same type, and one side must be the key
+        column of its table (a foreign key points at a key). Anything else is dropped. One attempt only:
+        if the AI does not answer, the plain "unsupported" answer stands."""
+        import logging
+        catalog = [{"table": e.table, "columns": dict(e.columns), "key_column": e.key_column}
+                   for e in self.catalog.values()]
+        hints = [{"a": r.left, "b": r.right} for r in self.relation_hints]
+        system = (
+            "You find how the tables of a database are connected, so a question that needs several tables can "
+            "be answered. Choose ONLY from this catalog; never invent tables or columns.\n"
+            f"CATALOG:\n{json.dumps(catalog, ensure_ascii=False)}\n"
+            f"GUESSES FROM COLUMN NAMES (may be wrong, check them against the question): {json.dumps(hints)}\n"
+            "A relation says: column `column` of table `table` holds the same value as the key_column of table "
+            "`ref_table` (a foreign key, for example items.id_category = categories.id). Propose only the "
+            "relations the question needs, at most 3, and only when the names make the connection clear. "
+            "ref_column MUST be the key_column of ref_table. Answer ONLY with JSON (no markdown):\n"
+            '{"relations": [{"table": "...", "column": "...", "ref_table": "...", "ref_column": "..."}]}\n'
+            'or {"relations": []} when no connection is clear.')
+        try:
+            response = self.llm.complete([LLMMessage("system", system),
+                                          LLMMessage("user", f"Question:\n{question}")], temperature=0)
+            raw = _extract_json(response.content).get("relations")
+        except Exception:  # noqa: BLE001 - this step must never turn an answer into an error
+            logging.getLogger(__name__).info("Relation proposal failed.", exc_info=True)
+            return ()
+        if not isinstance(raw, list):
+            return ()
+        known = {frozenset({r.left, r.right}) for r in self.relations}
+        found: list[TableRelation] = []
+        for item in raw[:3]:
+            if not isinstance(item, Mapping) or set(item) - {"table", "column", "ref_table", "ref_column"}:
+                continue
+            parts = [item.get(k) for k in ("table", "column", "ref_table", "ref_column")]
+            if not all(isinstance(p, str) for p in parts):
+                continue
+            table, column, ref_table, ref_column = parts
+            left, right = self.catalog.get(table), self.catalog.get(ref_table)
+            if (left is None or right is None or left is right or column not in left.columns
+                    or ref_column not in right.columns or left.columns[column] != right.columns[ref_column]):
+                continue
+            left_key, right_key = left.key_column == column, right.key_column == ref_column
+            if not (left_key or right_key):
+                continue
+            if left_key and not right_key:  # written the other way round: the key side is the reference
+                table, column, ref_table, ref_column = ref_table, ref_column, table, column
+            key = frozenset({f"{table}.{column}", f"{ref_table}.{ref_column}"})
+            if key in known:
+                continue
+            known.add(key)
+            found.append(TableRelation(table, column, ref_table, ref_column, "ai"))
+        return tuple(found)
+
+    def _plan_with_proposed_relations(self, question: str, original: TablePlanResult) -> TablePlanResult:
+        """The question needs a join nobody approved: let the AI propose the relation, then plan again with it.
+
+        The result carries ``proposed_relations`` so the person sees them in the plan; they only become
+        approved when that plan is run."""
+        proposed = self._propose_relations(question)
+        if not proposed:
+            return original
+        inner = TableReportPlanner(
+            self.llm, list(self.catalog.values()), max_attempts=self.max_attempts, experience=self.experience,
+            today=self._today, relations=(*self.relations, *proposed), propose_relations=False)
+        result = inner.plan(question)
+        if not result.ok:
+            return original
+        pairs = {(r.left, r.right): r for r in proposed} | {(r.right, r.left): r for r in proposed}
+        used: list[TableRelation] = []
+        for _, _, first, second in result.request.joins:
+            rel = pairs.get((first, second))
+            if rel is not None and rel not in used:
+                used.append(rel)
+        return replace(result, proposed_relations=tuple(used),
+                       attempts=original.attempts + result.attempts, errors=original.errors + result.errors)
 
     # ------------------------------------------------------------ internals
     @staticmethod
@@ -301,8 +432,9 @@ class TableReportPlanner:
              "list_limit_max": e.row_limit - 1}
             for e in self.catalog.values()
         ]
+        joinable = bool(self.relations)
         return (
-            "You plan a single-table report. Choose ONLY from this catalog; "
+            "You plan a table report. Choose ONLY from this catalog; "
             "never invent tables or columns.\n"
             f"CATALOG:\n{json.dumps(catalog, ensure_ascii=False)}\n\n"
             f"Allowed operations: {', '.join(ALLOWED_OPERATIONS)} "
@@ -313,11 +445,15 @@ class TableReportPlanner:
             "optionally with up to 3 EQUALITY filters (column = value) on that table's "
             "filterable_columns only. Use the filter value exactly as the user wrote it.\n"
             "NOT supported: OR conditions, filters or conditions on columns not in filterable_columns, "
-            "joins, several tables, raw SQL (you never write SQL), calculations inside a condition, "
+            + ("joins that are not in RELATIONS, "
+               if joinable else "joins, several tables, ")
+            + "raw SQL (you never write SQL), calculations inside a condition, "
             "forecasts, anything that changes data.\n"
             f"Today is {self._today().isoformat()}.\n"
             "If the question needs anything unsupported, answer "
-            '{"supported": false, "reason": "<short reason, in the question\'s language>"}.\n'
+            '{"supported": false, "reason": "<short reason, in the question\'s language>"}. '
+            'Add "needs_join": true when the ONLY obstacle is that the question needs columns of several '
+            "tables that cannot be combined.\n"
             "Otherwise answer ONLY with this JSON (no markdown):\n"
             '{"supported": true, "table": "...", "group_by": ["col"], '
             '"metrics": [{"output": "snake_case_name", "operation": "sum", "column": "col"}], '
@@ -343,6 +479,33 @@ class TableReportPlanner:
             'plain numbers: "30 ribu" is 30000, "2 juta" is 2000000, "1,5 juta" is 1500000. For a month or a '
             "year use between its first and last day (use today's date to resolve \"this month\" or "
             '"last year"). Plain equality can stay in "filters".'
+            + (self._join_prompt() if joinable else "")
+        )
+
+    def _join_prompt(self) -> str:
+        relations = [{"a": r.left, "b": r.right} for r in self.relations]
+        return (
+            "\nJOINS: a listing (kind list) may combine tables, but ONLY along these approved RELATIONS "
+            f"(each pair of columns may be matched): {json.dumps(relations)}\n"
+            f"Use up to {MAX_JOINS} joins, each to a table that has a relation with the table the listing "
+            'starts from or with a table already joined. Answer with: {"supported": true, "kind": "list", '
+            '"table": "start_table", "joins": [{"table": "other_table", "type": "left"}], '
+            '"columns": ["start_table.col", "other_table.col"], "filters": {"table.col": "value"}, '
+            '"conditions": [{"column": "table.col", "operator": "eq", "value": 1}], '
+            '"order_by": [{"column": "table.col", "direction": "asc"}], "limit": 100, "title": "...", '
+            '"format": "json"}. In a joined listing EVERY column (columns, filters, conditions, order_by) is '
+            'written table.col and columns may not be "all". Use type "left" when rows without a match must '
+            'stay (for example items without a category), otherwise "inner" (the default). Leave "on" out: '
+            "the relation is found from the tables; give it as \"on\": [\"a.col\", \"b.col\"] only when "
+            "two tables are connected by more than one relation. Do not join when one table has all the "
+            "columns that were asked for.\n"
+            'A total, count or average over joined tables is kind "aggregate" with the same "joins": '
+            '{"supported": true, "table": "start_table", "joins": [{"table": "other_table", "type": "inner"}], '
+            '"group_by": ["other_table.col"], "metrics": [{"output": "snake_case_name", "operation": "sum", '
+            '"column": "start_table.col"}], "filters": {...}, "title": "...", "format": "json"}. Every column '
+            "is written table.col; a count without a column counts the start table's rows. Use the start "
+            "table that holds the values being summed or counted. Use type \"left\" when groups or rows "
+            "without a match must still appear."
         )
 
     @staticmethod
@@ -412,6 +575,215 @@ class TableReportPlanner:
         except ValueError as exc:
             raise PlanValidationError(str(exc)) from exc
 
+    def _join_scope(self, entry, raw):
+        """The joined tables and, for each, the approved relation that connects it."""
+        if not self.relations:
+            raise PlanValidationError("Joins are not available: no relation between tables is approved.")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_JOINS:
+            raise PlanValidationError(f"joins must be a list of 1-{MAX_JOINS} items.")
+        scope = [entry]
+        joins: list[tuple[str, str, str, str]] = []
+        for item in raw:
+            if not isinstance(item, Mapping) or set(item) - {"table", "type", "on"}:
+                raise PlanValidationError('Each join must be {"table": ..., "type": "inner"|"left"}.')
+            table, kind, on = item.get("table"), item.get("type", "inner"), item.get("on")
+            joined = self.catalog.get(table) if isinstance(table, str) else None
+            if joined is None:
+                raise PlanValidationError(f"Unknown join table {table!r}. Choose one of: {sorted(self.catalog)}.")
+            if any(joined.table == e.table for e in scope):
+                raise PlanValidationError(f"{table!r} is already in the query; a table can be joined once.")
+            if kind not in JOIN_TYPES:
+                raise PlanValidationError("A join type must be inner or left.")
+            present = {e.table for e in scope}
+            candidates = [(r.left, r.right) if r.table == table else (r.right, r.left)
+                          for r in self.relations
+                          if (r.table == table and r.ref_table in present)
+                          or (r.ref_table == table and r.table in present)]
+            if on is not None:
+                if not isinstance(on, list) or len(on) != 2 or any(not isinstance(x, str) for x in on):
+                    raise PlanValidationError('"on" must be ["table.col", "table.col"].')
+                pair = (on[0], on[1]) if on[0].startswith(f"{table}.") else (on[1], on[0])
+                if pair not in candidates:
+                    raise PlanValidationError(
+                        f"{on} is not an approved relation; approved for {table!r}: "
+                        f"{[list(c) for c in candidates]}.")
+                chosen = pair
+            elif len(candidates) == 1:
+                chosen = candidates[0]
+            elif not candidates:
+                raise PlanValidationError(
+                    f"No approved relation connects {table!r} to {sorted(present)}. "
+                    f"Approved relations: {[[r.left, r.right] for r in self.relations]}. "
+                    "If the question cannot be answered with them, answer supported false.")
+            else:
+                raise PlanValidationError(
+                    f'{table!r} has several relations {[list(c) for c in candidates]}; give "on".')
+            scope.append(joined)
+            joins.append((table, kind, chosen[0], chosen[1]))
+        return scope, joins
+
+    @staticmethod
+    def _resolver(scope):
+        by_table = {e.table: e for e in scope}
+
+        def resolve(name, what):
+            try:
+                table, column = split_qualified(name)
+            except ValueError:
+                raise PlanValidationError(f"{what} {name!r} must be written table.column.") from None
+            found = by_table.get(table)
+            if found is None or column not in found.columns:
+                raise PlanValidationError(
+                    f"Unknown {what} {name!r}; use columns of {sorted(by_table)} written table.column.")
+            return found, column
+        return resolve
+
+    def _join_conditions(self, resolve, data):
+        """Equality filters and conditions of a joined report; each column is table.column."""
+        raw_filters = data.get("filters") or {}
+        if not isinstance(raw_filters, Mapping) or len(raw_filters) > MAX_FILTERS:
+            raise PlanValidationError(f"filters must be an object with at most {MAX_FILTERS} items.")
+        filters: dict[str, Any] = {}
+        for name, value in raw_filters.items():
+            found, column = resolve(name, "filter column")
+            self._validate_filters(found, {column: value})
+            filters[name] = value
+        raw_conditions = data.get("conditions") or []
+        if not isinstance(raw_conditions, list) or len(raw_conditions) > MAX_CONDITIONS:
+            raise PlanValidationError(f"conditions must be a list of at most {MAX_CONDITIONS} items.")
+        conditions: list[tuple[str, str, Any]] = []
+        for item in raw_conditions:
+            if not isinstance(item, Mapping):
+                raise PlanValidationError('Each condition must be {"column": ..., "operator": ..., "value": ...}.')
+            found, column = resolve(item.get("column"), "condition column")
+            (checked,) = validate_conditions(found, [{**item, "column": column}])
+            conditions.append((item["column"], checked[1], checked[2]))
+        return filters, tuple(conditions)
+
+    def _validate_join_aggregate(self, entry, data):
+        """Totals, counts and averages over the start table plus joined tables."""
+        scope, joins = self._join_scope(entry, data.get("joins"))
+        resolve = self._resolver(scope)
+        group_by = data.get("group_by")
+        if (not isinstance(group_by, list) or not group_by or len(group_by) > MAX_GROUP_BY
+                or len(set(map(str, group_by))) != len(group_by)):
+            raise PlanValidationError(f"group_by must be 1-{MAX_GROUP_BY} distinct table.column names.")
+        for name in group_by:
+            resolve(name, "group_by column")
+        raw_metrics = data.get("metrics")
+        if not isinstance(raw_metrics, list) or not 1 <= len(raw_metrics) <= MAX_METRICS:
+            raise PlanValidationError(f"metrics must contain 1-{MAX_METRICS} items.")
+        metrics: list[tuple[str, str, str]] = []
+        used = list(group_by)
+        outputs: set[str] = set()
+        for item in raw_metrics:
+            if not isinstance(item, Mapping):
+                raise PlanValidationError("Each metric must be an object.")
+            output, operation, column = item.get("output"), item.get("operation"), item.get("column")
+            if not isinstance(output, str) or not _OUTPUT_NAME.match(output):
+                raise PlanValidationError(
+                    f"Metric output {output!r} must be snake_case (a-z, 0-9, _), max 40 chars.")
+            if output in outputs:
+                raise PlanValidationError(f"Duplicate output name {output!r}.")
+            if operation not in ALLOWED_OPERATIONS:
+                raise PlanValidationError(
+                    f"Operation {operation!r} is not allowed; use one of {list(ALLOWED_OPERATIONS)}.")
+            if column is None and operation == "count":
+                if entry.key_column is None:
+                    raise PlanValidationError("The start table has no key column; give a column for count.")
+                column = f"{entry.table}.{entry.key_column}"
+            found, bare = resolve(column, "metric column")
+            if operation in {"sum", "avg"} and found.columns[bare] not in NUMERIC_TYPES:
+                raise PlanValidationError(f"{operation} needs a numeric column but {column!r} is {found.columns[bare]}.")
+            outputs.add(output)
+            metrics.append((output, operation, column))
+            if column not in used:
+                used.append(column)
+        try:
+            names = join_output_names(used)
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
+        clash = outputs & set(names)
+        if clash:
+            raise PlanValidationError(f"Metric output name(s) {sorted(clash)} clash with column names; rename them.")
+        filters, conditions = self._join_conditions(resolve, data)
+        fmt = data.get("format", "json")
+        if fmt not in REPORT_FORMATS:
+            raise PlanValidationError(f"format must be one of {list(REPORT_FORMATS)}.")
+        title = data.get("title")
+        title = title.strip()[:200] if isinstance(title, str) and title.strip() else (
+            f"Report: {' + '.join(e.table for e in scope)}")
+        types = {f"{e.table}.{c}": t for e in scope for c, t in e.columns.items()}
+        metric_columns = {m[2] for m in metrics}
+        try:
+            return TableReportRequest(
+                table=entry.table, columns={n: types[n] for n in used}, group_by=tuple(group_by),
+                metrics=tuple(metrics), title=title, report_format=fmt,
+                row_limit=min(e.row_limit for e in scope),
+                numeric_columns=tuple(n for n in used if types[n] in NUMERIC_TYPES and n in metric_columns),
+                categorical_columns=tuple(n for n in group_by if types[n] == "string"),
+                filters=filters, conditions=conditions, joins=tuple(joins))
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
+
+    def _validate_join_list(self, entry, data):
+        """A listing over the start table plus joined tables; every column is written table.column."""
+        scope, joins = self._join_scope(entry, data.get("joins"))
+        resolve = self._resolver(scope)
+
+        raw_columns = data.get("columns")
+        if (not isinstance(raw_columns, list) or not raw_columns or len(raw_columns) > MAX_LIST_COLUMNS
+                or len(set(map(str, raw_columns))) != len(raw_columns)):
+            raise PlanValidationError(
+                f"columns must be 1-{MAX_LIST_COLUMNS} distinct table.column names "
+                '("all" is not allowed with joins).')
+        for name in raw_columns:
+            resolve(name, "column")
+        try:
+            join_output_names(raw_columns)
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
+
+        raw_order = data.get("order_by") or []
+        if not isinstance(raw_order, list) or len(raw_order) > MAX_ORDER_BY:
+            raise PlanValidationError(f"order_by must be a list of at most {MAX_ORDER_BY} items.")
+        order: list[tuple[str, str]] = []
+        for item in raw_order:
+            if not isinstance(item, Mapping):
+                raise PlanValidationError('Each order_by item must be {"column": ..., "direction": "asc"|"desc"}.')
+            resolve(item.get("column"), "order_by column")
+            direction = str(item.get("direction", "asc")).lower()
+            if direction not in {"asc", "desc"}:
+                raise PlanValidationError("order_by direction must be asc or desc.")
+            if any(item["column"] == c for c, _ in order):
+                raise PlanValidationError(f"order_by lists {item['column']!r} twice.")
+            order.append((item["column"], direction))
+
+        maximum = min(e.row_limit for e in scope) - 1
+        limit = data.get("limit", min(DEFAULT_LIST_LIMIT, maximum))
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
+            raise PlanValidationError(f"limit must be a whole number between 1 and {maximum}.")
+
+        filters, conditions = self._join_conditions(resolve, data)
+
+        fmt = data.get("format", "json")
+        if fmt not in REPORT_FORMATS:
+            raise PlanValidationError(f"format must be one of {list(REPORT_FORMATS)}.")
+        title = data.get("title")
+        title = title.strip()[:200] if isinstance(title, str) and title.strip() else (
+            f"Rows: {' + '.join(e.table for e in scope)}")
+        used = set(raw_columns) | {c for c, _ in order}
+        types = {f"{e.table}.{c}": t for e in scope for c, t in e.columns.items()}
+        try:
+            return TableReportRequest(
+                table=entry.table, columns={n: t for n, t in types.items() if n in used},
+                group_by=(), metrics=(), title=title, report_format=fmt,
+                row_limit=min(e.row_limit for e in scope), filters=filters, conditions=conditions,
+                kind="list", select_columns=tuple(raw_columns), order_by=tuple(order), limit=limit,
+                joins=tuple(joins))
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
+
     def _validate(self, data: Mapping[str, Any]) -> TableReportRequest:
         table = data.get("table")
         entry = self.catalog.get(table) if isinstance(table, str) else None
@@ -420,6 +792,12 @@ class TableReportPlanner:
                 f"Unknown table {table!r}. Choose one of: {sorted(self.catalog)}.")
         columns = entry.columns
         kind = data.get("kind", "aggregate")
+        if data.get("joins"):
+            if kind == "list":
+                return self._validate_join_list(entry, data)
+            if kind != "aggregate":
+                raise PlanValidationError(f"kind must be 'aggregate' or 'list', got {kind!r}.")
+            return self._validate_join_aggregate(entry, data)
         if kind == "list":
             return self._validate_list(entry, data)
         if kind != "aggregate":
@@ -494,5 +872,5 @@ class TableReportPlanner:
             raise PlanValidationError(str(exc)) from exc
 
 
-__all__ = ["TableCatalogEntry", "TablePlanResult", "TableReportPlanner", "PlanValidationError",
+__all__ = ["TableRelation", "TableCatalogEntry", "TablePlanResult", "TableReportPlanner", "PlanValidationError",
            "ALLOWED_OPERATIONS", "REPORT_FORMATS"]

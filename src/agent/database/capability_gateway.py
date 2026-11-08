@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from agent.core.action import Action
 from agent.llm.authenticated_capability_execution_gateway import (
@@ -71,6 +71,7 @@ def build_business_database_gateway(
     fsync_trace: bool = True,
     identifier_quote: str | None = None,
     dialect: str = "limit",
+    relations: Any = (),
 ) -> BusinessDatabaseGatewayAssembly:
     """Compose an explicitly configured read-only database capability.
 
@@ -121,6 +122,7 @@ def build_business_database_gateway(
         paramstyle=paramstyle,
         identifier_quote=identifier_quote,
         dialect=dialect,
+        relations=relations,
     )
 
     registry = TrustedCapabilityRegistry()

@@ -91,8 +91,36 @@ and empty / not empty. Up to 5, all combined with AND. Examples: *"tampilkan bah
 its first and last day. A condition on a column that is not filterable is refused with a reason, so tick
 *boleh difilter* for the price/date columns you want to compare.
 
-Not supported, and refused with a reason instead of being silently ignored: OR, several tables or joins,
-calculations inside a condition, anything that changes data. Only approved columns can be shown, sorted by or
+### Combining tables (join)
+
+A question can combine up to three tables, for example *"tampilkan kode bahan, nama bahan dan jenis
+bahan"* over `tb_bahan` and `tb_jenisbahan`. The agent only joins along a **relation you approved**. In the
+approval form, once two or more tables are ticked, a *Relasi antar tabel* box lists the database's own foreign
+keys (ticked the first time) and lets you add a relation the database does not define (table.column =
+table.column); untick any you do not want. Rows with no match are kept when the question implies it
+(left join). Each joined column must itself be approved, and filtering or sorting on it needs *boleh
+difilter* on that table. If two tables share a column name the result columns are called `table_column`.
+Totals work too: *"total stok per jenis bahan"* sums a column of one table grouped by a column of
+another. A count without a column counts the rows of the table the question starts from, and a left join
+keeps a group with no match (shown with an empty name).
+
+**You do not have to know about relations.** If a question needs two approved tables that have no approved
+relation, the agent asks the AI how they are connected (it sees only table and column names, and its answer is
+checked: approved tables and columns, columns of the same type, and one side must be the table's key column).
+The plan then says in plain words, for example *"isi kolom id_jenis di tabel tb_bahan sama dengan kolom id di
+tabel tb_jenisbahan"*. Nothing is approved by planning. If it is right, press **Jalankan**: that approves the
+relation, it is remembered (marked *ditemukan AI*), and later questions use it without asking again. It can be
+unticked in **Ubah persetujuan**. Only tables and columns that are already approved can be related, so this never
+exposes new data. The one-shot endpoint (`POST /table-reports`) does not use such guesses: it refuses and asks
+for the plan-and-run flow.
+
+If the database defines no foreign keys, the form also lists **suggestions** guessed from names (for example
+`tb_bahan.id_jenis` for the table `tb_jenisbahan`). They are never ticked for you: tick the ones that are
+right. When a question needs a join that is not approved, the "Belum didukung" message tells you to open
+**Ubah persetujuan** and approve the relation.
+
+Not supported, and refused with a reason instead of being silently ignored: OR, joins outside the approved
+relations, calculations inside a condition, anything that changes data. Only approved columns can be shown, sorted by or
 filtered on. The agent still never writes SQL: free-form SQL from an LLM is deliberately not accepted.
 
 ### Change what is approved, or disconnect
@@ -370,6 +398,21 @@ written to the profiles file (`HAI_DATABASE_PROFILES`, default `data/reports/pro
 Server list at once. Creating the limited accounts themselves is still a one-time job for an administrator
 (`scripts/setup_mysql_*_user.py`, `scripts/connect_sqlserver.py`); the web page never takes that password.
 Set `HAI_SERVER_REGISTRATION=false` to switch the form off (for example on a shared server).
+
+### Reading a database this application did not create
+
+By default the **Database** box on a MySQL / SQL Server profile only accepts names starting with the creator
+prefix (`hai_`). To read other existing databases (for example `dbsales`), put this in `.env` and restart the
+backend:
+
+```
+HAI_ALLOW_ANY_DATABASE_NAME=true
+```
+
+The **Database** box then accepts any plain name (letters, digits, `_`). Only the read-only account connects, it
+is still refused if it holds more than SELECT, and the server decides what it can see: grant it first, for example
+``GRANT SELECT ON `dbsales`.* TO 'your_reader'@'%'``. Changing data and creating databases stay limited to the
+profile's own database and the `hai_` prefix. PostgreSQL profiles are unaffected (one database per profile).
 
 ## Troubleshooting
 

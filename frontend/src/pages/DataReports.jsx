@@ -18,6 +18,10 @@ import {
 import { describeCondition } from "./conditions.js";
 import "./autonomous-testing.css";
 
+// A relation is the same pair of columns whichever side is written first.
+const relationKey = (r) => [`${r.table}.${r.column}`, `${r.ref_table}.${r.ref_column}`].sort().join(" = ");
+const relationText = (r) => `${r.table}.${r.column} = ${r.ref_table}.${r.ref_column}`;
+
 // The server discovers the schema; the user only picks which tables/columns the
 // agent may use and which columns may be filtered.
 function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
@@ -48,6 +52,53 @@ function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
     }
     return base;
   });
+
+  // Relations let the agent combine tables (join). The database's own foreign keys are offered, and a user can
+  // add a relation the database does not define. A first-time approval starts with the foreign keys ticked.
+  const [relations, setRelations] = useState(() => {
+    const approved = schema.approved_relations || [];
+    // Foreign keys start ticked until someone has approved relations once; after that, only their choice counts.
+    const fresh = preset || !approved.length;
+    const found = new Map();
+    for (const r of [...approved, ...(fresh ? schema.foreign_keys || [] : [])]) found.set(relationKey(r), r);
+    return [...found.values()];
+  });
+  const [offered, setOffered] = useState(() => {
+    const found = new Map();
+    // Suggestions are guesses from names, so they are listed last and never start ticked.
+    for (const r of [
+      ...(schema.suggested_relations || []), ...(schema.foreign_keys || []), ...(schema.approved_relations || []),
+    ]) {
+      found.set(relationKey(r), r);
+    }
+    return [...found.values()];
+  });
+  const [draft, setDraft] = useState({ table: "", column: "", ref_table: "", ref_column: "" });
+  const usable = (r) =>
+    Boolean(selection[r.table]?.columns.includes(r.column) && selection[r.ref_table]?.columns.includes(r.ref_column));
+  const toggleRelation = (r) =>
+    setRelations((cur) =>
+      cur.some((x) => relationKey(x) === relationKey(r))
+        ? cur.filter((x) => relationKey(x) !== relationKey(r))
+        : [...cur, r],
+    );
+  const columnsOf = (table) => selection[table]?.columns || [];
+  const draftReady = Object.values(draft).every(Boolean) && draft.table !== draft.ref_table;
+  const addRelation = () => {
+    if (!draftReady) return;
+    const relation = { ...draft };
+    setOffered((cur) => (cur.some((x) => relationKey(x) === relationKey(relation)) ? cur : [...cur, relation]));
+    setRelations((cur) => (cur.some((x) => relationKey(x) === relationKey(relation)) ? cur : [...cur, relation]));
+    setDraft({ table: "", column: "", ref_table: "", ref_column: "" });
+  };
+  const isForeignKey = (r) => (schema.foreign_keys || []).some((k) => relationKey(k) === relationKey(r));
+  const relationLabel = (r) => {
+    if (isForeignKey(r)) return "foreign key database";
+    const approved = (schema.approved_relations || []).find((k) => relationKey(k) === relationKey(r));
+    if (approved) return approved.source === "ai" ? "ditemukan AI, disetujui saat laporan dijalankan" : "dibuat manual";
+    const guess = (schema.suggested_relations || []).find((k) => relationKey(k) === relationKey(r));
+    return guess ? `saran dari nama: ${guess.reason}` : "dibuat manual";
+  };
 
   const toggleTable = (table, columns) =>
     setSelection((cur) => {
@@ -118,7 +169,10 @@ function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
           : {}),
       };
     }
-    onApprove(tables);
+    const chosen = relations
+      .filter(usable)
+      .map(({ table, column, ref_table, ref_column }) => ({ table, column, ref_table, ref_column }));
+    onApprove(tables, chosen);
   };
 
   return (
@@ -193,6 +247,56 @@ function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
           </fieldset>
         );
       })}
+      {Object.keys(selection).length > 1 && (
+        <fieldset className="at-config-summary" aria-label="Relasi antar tabel">
+          <b>Relasi antar tabel (agar agent bisa menggabungkan tabel)</b>
+          <small>
+            Centang relasi yang boleh dipakai. Agent hanya menggabungkan tabel lewat relasi yang Anda setujui di sini.
+          </small>
+          {!offered.some((r) => selection[r.table] && selection[r.ref_table]) && (
+            <small>Tidak ada foreign key atau saran dari nama kolom untuk tabel yang dipilih. Tambahkan relasi di bawah bila ada.</small>
+          )}
+          {offered.filter((r) => selection[r.table] && selection[r.ref_table]).map((r) => (
+            <label key={relationKey(r)} className="at-check">
+              <input
+                type="checkbox"
+                disabled={!usable(r)}
+                checked={relations.some((x) => relationKey(x) === relationKey(r)) && usable(r)}
+                onChange={() => toggleRelation(r)}
+              />
+              {relationText(r)} <small>{relationLabel(r)}</small>
+              {!usable(r) && <small> (pilih kedua tabel dan kolomnya dulu)</small>}
+            </label>
+          ))}
+          <div className="at-form-row" aria-label="Tambah relasi">
+            <b>Tambah relasi:</b>
+            {[["table", "column", "Tabel"], ["ref_table", "ref_column", "dengan tabel"]].map(([tKey, cKey, label]) => (
+              <span key={tKey} className="at-form-row">
+                <select
+                  aria-label={label}
+                  value={draft[tKey]}
+                  onChange={(e) => setDraft((d) => ({ ...d, [tKey]: e.target.value, [cKey]: "" }))}
+                >
+                  <option value="">{label}…</option>
+                  {Object.keys(selection).map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <select
+                  aria-label={`Kolom ${label}`}
+                  value={draft[cKey]}
+                  disabled={!draft[tKey]}
+                  onChange={(e) => setDraft((d) => ({ ...d, [cKey]: e.target.value }))}
+                >
+                  <option value="">kolom…</option>
+                  {columnsOf(draft[tKey]).map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </span>
+            ))}
+            <button type="button" className="at-button at-button-secondary" disabled={!draftReady} onClick={addRelation}>
+              Tambah relasi
+            </button>
+          </div>
+        </fieldset>
+      )}
       <button className="at-button at-button-primary" disabled={busy || !Object.keys(selection).length}>
         Setujui untuk {connection}
       </button>
@@ -323,9 +427,10 @@ export default function DataReports() {
     });
   };
 
-  const approve = (tables) =>
+  const approve = (tables, relations) =>
     guarded(async () => {
-      await approveDatabaseTables(selected, tables);
+      if (relations?.length) await approveDatabaseTables(selected, tables, undefined, relations);
+      else await approveDatabaseTables(selected, tables);
       setSchema(null);
       setPreset(false);
       setNotice("");
@@ -478,17 +583,21 @@ export default function DataReports() {
                 </select>
               </label>
             )}
-            {chosenProfile?.prefix && (
+            {(chosenProfile?.prefix || chosenProfile?.any_database) && (
               <label>
                 Database <small>opsional; kosong = database bawaan profil</small>
                 <input
                   value={database}
                   onChange={(e) => setDatabase(e.target.value)}
-                  placeholder={`${chosenProfile.prefix}nama_database`}
+                  placeholder={chosenProfile.any_database ? "nama_database" : `${chosenProfile.prefix}nama_database`}
                   aria-label="Database buatan agent"
                 />
-                <small>Untuk database yang dibuat agent, tulis namanya (diawali {chosenProfile.prefix}).
-                  Nama koneksi di atas hanya label; ia tidak memilih database.</small>
+                <small>
+                  {chosenProfile.any_database
+                    ? "Tulis nama database mana pun di server ini yang bisa dibaca akun baca-saja (juga yang tidak dibuat aplikasi ini)."
+                    : `Untuk database yang dibuat agent, tulis namanya (diawali ${chosenProfile.prefix}).`}
+                  {" "}Nama koneksi di atas hanya label; ia tidak memilih database.
+                </small>
               </label>
             )}
             {!source && (
@@ -612,11 +721,38 @@ export default function DataReports() {
                 <div className="at-config-summary" style={{ marginTop: 16 }} aria-label="Rencana laporan">
                   <b>Rencana (belum ada data yang dibaca)</b>
                   <span>Tabel: {plan.plan.table}</span>
+                  {plan.plan.proposed_relations?.length > 0 && (
+                    <div className="at-warning" aria-label="Relasi usulan AI">
+                      <AlertCircle size={16} />
+                      <div>
+                        <b>Periksa: AI menduga hubungan antar tabel</b>
+                        {plan.plan.proposed_relations.map((r) => (
+                          <p key={`${r.table}.${r.column}`}>
+                            Isi kolom <b>{r.column}</b> di tabel <b>{r.table}</b> sama dengan kolom <b>{r.ref_column}</b>{" "}
+                            di tabel <b>{r.ref_table}</b>.
+                          </p>
+                        ))}
+                        <p>
+                          Ini dugaan dari nama tabel dan kolom, bukan definisi database. Bila benar, tekan Jalankan:
+                          hubungan ini akan diingat untuk pertanyaan berikutnya (bisa dicabut di Ubah persetujuan).
+                          Bila ragu, periksa isi hasilnya dulu atau batalkan.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                  {plan.plan.joins?.length > 0 && (
+                    <span>
+                      Gabungkan tabel: {plan.plan.joins
+                        .map((j) => `${j.table} (${j.type === "left" ? "semua baris tabel utama" : "hanya yang cocok"}, ${j.on.join(" = ")})`)
+                        .join("; ")}
+                    </span>
+                  )}
                   <span>File: {String(plan.plan.format || "json").toUpperCase()}</span>
                   {plan.plan.kind === "list" ? (
                     <>
                       <span>Jenis: daftar baris (data apa adanya, tanpa ringkasan)</span>
                       <span>Kolom: {plan.plan.columns.join(", ")}</span>
+
                       <span>
                         Urutan: {plan.plan.order_by?.length
                           ? plan.plan.order_by
@@ -703,7 +839,18 @@ export default function DataReports() {
                   {result.status === "unsupported" && (
                     <div className="at-warning">
                       <AlertCircle size={16} />
-                      <div><b>Belum didukung</b><p>{result.reason}</p></div>
+                      <div>
+                        <b>Belum didukung</b>
+                        <p>{result.reason}</p>
+                        {result.needs_join && (
+                          <p>
+                            Untuk menggabungkan tabel, buka <b>Ubah persetujuan</b> pada database ini, pastikan
+                            kedua tabel disetujui, lalu centang relasinya di kotak <b>Relasi antar tabel</b>
+                            (foreign key, saran dari nama kolom, atau tambahkan sendiri). Setelah itu ulangi
+                            pertanyaannya.
+                          </p>
+                        )}
+                      </div>
                     </div>
                   )}
                   {result.status === "failed" && (

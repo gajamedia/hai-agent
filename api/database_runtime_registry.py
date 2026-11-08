@@ -31,7 +31,7 @@ from typing import Any, Callable, Mapping
 
 from agent.database import ConnectionManager
 from agent.database.capability_gateway import build_business_database_gateway
-from agent.llm.business_database_adapter import ReadOnlyTableSpec
+from agent.llm.business_database_adapter import ReadOnlyTableSpec, RelationBook
 from agent.llm.execution_security import ExecutionSecurityPolicy
 from agent.llm.service import LLMService
 from agent.llm.trusted_capability_invocation_port import (
@@ -45,15 +45,16 @@ from agent.workflow.reports import LocalArtifactStore, WorkflowReportTaskExecuto
 from agent.workflow.service import WorkflowApplicationService
 from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
-from agent.workflow.table_report_planner import TableCatalogEntry, TableReportPlanner
+from agent.workflow.table_report_planner import TableCatalogEntry, TableRelation, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
 from agent.workflow.database_creation import DIALECTS, DatabaseCreationService, DatabaseDesigner
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
+from api.relation_suggestions import suggest_relations
 from api.database_engines import (
-    EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, SQLServerEngine, map_mysql_type, map_postgres_type,
-    map_sqlite_type,
+    EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, SQLServerEngine, any_database_allowed,
+    map_mysql_type, map_postgres_type, map_sqlite_type,
 )
 
 logger = logging.getLogger("hai_agent.database_registry")
@@ -62,6 +63,7 @@ _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 MAX_TABLES = 20
 LIST_READ_LIMIT = 1001
 MAX_COLUMNS_PER_TABLE = 100
+MAX_RELATIONS = 30
 
 
 class RegistryError(ValueError):
@@ -70,6 +72,11 @@ class RegistryError(ValueError):
 
 class RegistryNotFound(RegistryError):
     pass
+
+
+def _relation_to_dict(rel: TableRelation) -> dict[str, str]:
+    return {"table": rel.table, "column": rel.column, "ref_table": rel.ref_table,
+            "ref_column": rel.ref_column, "source": rel.source}
 
 
 def resolve_in_root(root: Path, filename: Any) -> Path:
@@ -107,6 +114,8 @@ class _Connection:
     selection: Mapping[str, Any] | None = None
     warnings: tuple[str, ...] = ()
     changes: DataChangeService | None = None  # only when tables were approved for writing
+    relations: tuple[TableRelation, ...] = ()  # approved joins (database foreign keys or declared by a user)
+    relation_book: Any = None  # what the adapter of this connection may join along (grows on confirmation)
 
 
 class DatabaseRuntimeRegistry:
@@ -182,6 +191,9 @@ class DatabaseRuntimeRegistry:
                 if "engine" not in have:
                     db.execute("ALTER TABLE connections ADD COLUMN engine TEXT NOT NULL "
                                "DEFAULT 'sqlite'")
+                if "relations_json" not in have:
+                    db.execute("ALTER TABLE connections ADD COLUMN relations_json TEXT NOT NULL "
+                               "DEFAULT '[]'")
         finally:
             db.close()
 
@@ -205,13 +217,14 @@ class DatabaseRuntimeRegistry:
             with db:
                 db.execute(
                     "INSERT OR REPLACE INTO connections (name, filename, connected_by, "
-                    "connected_at, approved_by, approved_at, selection_json, fingerprint, engine) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "connected_at, approved_by, approved_at, selection_json, fingerprint, engine, "
+                    "relations_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (conn.name, conn.filename, conn.approved_by, conn.approved_at,
                      conn.tables_approved_by or conn.approved_by,
                      conn.tables_approved_at or conn.approved_at,
                      json.dumps(conn.selection, sort_keys=True),
-                     self._fingerprint(conn.engine, conn.schema, conn.selection), conn.engine))
+                     self._fingerprint(conn.engine, conn.schema, conn.selection), conn.engine,
+                     json.dumps([_relation_to_dict(r) for r in conn.relations], sort_keys=True)))
         finally:
             db.close()
 
@@ -235,6 +248,7 @@ class DatabaseRuntimeRegistry:
             degraded = {"name": name, "file": row["filename"], "database": engine}
             try:
                 selection = json.loads(row["selection_json"])
+                saved = json.loads(row["relations_json"] or "[]")  # validated again below
                 conn = self._open(name, engine, row["filename"], row["connected_by"],
                                   row["connected_at"])
             except Exception as exc:
@@ -247,7 +261,9 @@ class DatabaseRuntimeRegistry:
                     "reason": "approved tables or columns changed since approval"}
                 continue
             try:
-                self._activate_locked(conn, selection, row["approved_by"], row["approved_at"])
+                self._activate_locked(
+                    conn, selection, row["approved_by"], row["approved_at"],
+                    relations=self._check_relations(conn, selection, saved, trusted=True))
             except Exception as exc:
                 self._degraded[name] = {**degraded, "status": "needs_reapproval",
                                         "reason": str(exc)}
@@ -335,6 +351,8 @@ class DatabaseRuntimeRegistry:
                 item = {"name": n, "type": kind}
                 if getattr(engine, "has_creator", lambda _n: False)(n):
                     item["prefix"] = profile.creator_prefix     # databases made by the agent can be chosen
+                if kind in {"mysql", "sqlserver"} and any_database_allowed():
+                    item["any_database"] = True                 # any database the reader can see (read only)
                 out.append(item)
         return sorted(out, key=lambda item: item["name"])
 
@@ -473,15 +491,51 @@ class DatabaseRuntimeRegistry:
         return self.connect(name, engine="sqlite", source=filename, actor_id=actor_id)
 
     # ----------------------------------------------------------- activate
-    def activate(self, name: str, tables: Any, *, actor_id: str | None = None) -> dict[str, Any]:
+    def activate(self, name: str, tables: Any, *, actor_id: str | None = None,
+                 relations: Any = None) -> dict[str, Any]:
         with self._lock:
             conn = self._get(name)
             self._activate_locked(conn, tables, actor_id or conn.approved_by,
-                                  datetime.now(timezone.utc).isoformat(), persist=True)
+                                  datetime.now(timezone.utc).isoformat(), persist=True,
+                                  relations=relations)
             return self._describe(conn)
 
+    @staticmethod
+    def _check_relations(conn: _Connection, selection: Mapping[str, Any],
+                         raw: Any, *, trusted: bool = False) -> tuple[TableRelation, ...]:
+        """Relations the user approves for joining. Both columns must be approved columns of approved
+        tables. Whether a relation is the database's own foreign key is decided here from the schema,
+        never taken from the request."""
+        if raw in (None, []):
+            return ()
+        if not isinstance(raw, list) or len(raw) > MAX_RELATIONS:
+            raise RegistryError(f"relations must be a list of at most {MAX_RELATIONS} items")
+        declared = {frozenset({(k.table, k.column), (k.ref_table, k.ref_column)})
+                    for k in getattr(conn.schema, "foreign_keys", ())}
+        result: dict[frozenset, TableRelation] = {}
+        for item in raw:
+            if not isinstance(item, Mapping) or set(item) - {"table", "column", "ref_table", "ref_column",
+                                                              "source"}:
+                raise RegistryError("each relation must be {table, column, ref_table, ref_column}")
+            parts = [item.get(k) for k in ("table", "column", "ref_table", "ref_column")]
+            if not all(isinstance(x, str) for x in parts):
+                raise RegistryError("a relation needs table, column, ref_table and ref_column as text")
+            table, column, ref_table, ref_column = parts
+            for t, c in ((table, column), (ref_table, ref_column)):
+                if t not in selection or c not in selection[t].get("columns", []):
+                    raise RegistryError(f"relation uses {t}.{c}, which is not an approved column")
+            if table == ref_table:
+                raise RegistryError("a relation must connect two different tables")
+            key = frozenset({(table, column), (ref_table, ref_column)})
+            # "ai" (found by the AI, then approved by running a plan) is only believed when it comes from our
+            # own server code or our own store, never from a request.
+            source = ("foreign_key" if key in declared
+                      else "ai" if trusted and item.get("source") == "ai" else "manual")
+            result.setdefault(key, TableRelation(table, column, ref_table, ref_column, source))
+        return tuple(result.values())
+
     def _activate_locked(self, conn: _Connection, tables: Any, actor: str, at: str,
-                         *, persist: bool = False) -> None:
+                         *, persist: bool = False, relations: Any = None) -> None:
         name = conn.name
         map_type = self._engines[conn.engine].map_type
         if True:
@@ -532,9 +586,12 @@ class DatabaseRuntimeRegistry:
                 entries.append(entry)
                 if sel.get("writable"):
                     writables.append(self._writable_table(conn, table, sel, entry))
+            approved_relations = (relations if isinstance(relations, tuple)
+                                  else self._check_relations(conn, tables, relations))
             changes = self._build_changes(conn, writables) if writables else None
             conn.changes = changes
-            conn.service = self._build_service(conn, specs, entries)
+            conn.service = self._build_service(conn, specs, entries, approved_relations)
+            conn.relations = approved_relations
             conn.tables = tuple(specs)
             conn.selection = {t: dict(v) for t, v in tables.items()}
             conn.tables_approved_by, conn.tables_approved_at = actor, at
@@ -662,14 +719,18 @@ class DatabaseRuntimeRegistry:
             return able[0]
 
     def _build_service(self, conn: _Connection, specs: Mapping[str, ReadOnlyTableSpec],
-                       entries: list[TableCatalogEntry]) -> TableReportService:
+                       entries: list[TableCatalogEntry],
+                       relations: tuple[TableRelation, ...] = ()) -> TableReportService:
+        book = RelationBook(specs, [(r.table, r.column, r.ref_table, r.ref_column) for r in relations])
+        conn.relation_book = book
         assembly = build_business_database_gateway(
             connection_manager=conn.manager, profile_name=conn.name,
             authorization_policy=self.authorization_policy, table_specs=specs,
             trace_path=self.work_dir / f"trace-{conn.name}.jsonl",
             paramstyle=self._engines[conn.engine].paramstyle,
             identifier_quote=getattr(self._engines[conn.engine], "quote", None),
-            dialect=getattr(self._engines[conn.engine], "dialect", "limit"))
+            dialect=getattr(self._engines[conn.engine], "dialect", "limit"),
+            relations=book)
         port = TrustedCapabilityInvocationPort(
             gateway=assembly.gateway,
             specs={READ_ACTION: CapabilityInvocationSpec(
@@ -689,8 +750,42 @@ class DatabaseRuntimeRegistry:
         if self._llm is None:
             self._llm = LLMService(self.llm_provider_factory())
         experience = self._experience.bind(conn.name)
-        planner = TableReportPlanner(self._llm, entries, experience=experience)
-        return TableReportService(planner=planner, runner=runner, experience=experience)
+        # Guesses from column names for the AI to build on when a question needs a relation nobody approved.
+        columns = {t: set(s.columns) for t, s in specs.items()}
+        hints = [TableRelation(g["table"], g["column"], g["ref_table"], g["ref_column"], "manual")
+                 for g in suggest_relations(conn.schema, self._engines[conn.engine].map_type)
+                 if g["column"] in columns.get(g["table"], ()) and g["ref_column"] in columns.get(g["ref_table"], ())]
+        planner = TableReportPlanner(self._llm, entries, experience=experience, relations=relations,
+                                     relation_hints=hints)
+        name = conn.name
+        return TableReportService(
+            planner=planner, runner=runner, experience=experience,
+            relation_approver=lambda rels, context: self._confirm_relations(name, rels, context))
+
+    def _confirm_relations(self, name: str, relations: Any, context: Any) -> None:
+        """A person ran a plan that uses relations the AI found: from now on they are approved relations.
+
+        Only tables and columns that are already approved can be related, so this never exposes anything
+        new; it only lets approved tables be combined. The relation is remembered (source "ai") and can be
+        removed in the approval form."""
+        actor = getattr(getattr(context, "principal", None), "actor_id", "unknown")
+        with self._lock:
+            conn = self._get(name)
+            if conn.service is None or conn.relation_book is None or conn.selection is None:
+                raise RegistryError("this connection has no approved tables")
+            items = [{"table": r.table, "column": r.column, "ref_table": r.ref_table,
+                      "ref_column": r.ref_column, "source": "ai"} for r in relations]
+            checked = self._check_relations(conn, conn.selection, items, trusted=True)
+            have = {frozenset({r.left, r.right}) for r in conn.relations}
+            added = tuple(r for r in checked if frozenset({r.left, r.right}) not in have)
+            if not added:
+                return
+            conn.relation_book.add([(r.table, r.column, r.ref_table, r.ref_column) for r in added])
+            conn.relations = (*conn.relations, *added)
+            conn.service.planner.relations = conn.relations
+            self._save(conn)
+            logger.info("Relations approved by running a plan (connection %r, by %s): %s", name, actor,
+                        ", ".join(f"{r.left} = {r.right}" for r in added))
 
     # ------------------------------------------------------------- access
     def _get(self, name: Any) -> _Connection:
@@ -706,13 +801,17 @@ class DatabaseRuntimeRegistry:
                 "tables_approved_by": conn.tables_approved_by,
                 "status": "active" if conn.service else "connected_pending_approval",
                 "tables": list(conn.tables),
-                "writable_tables": sorted(conn.changes.planner.tables) if conn.changes else []}
+                "writable_tables": sorted(conn.changes.planner.tables) if conn.changes else [],
+                "relations": [_relation_to_dict(r) for r in conn.relations]}
 
     def schema(self, name: str) -> dict[str, Any]:
         with self._lock:
             conn = self._get(name)
             data = conn.schema.to_dict()
             # What is approved right now, so the page can show it and let the user change it.
+            data["approved_relations"] = [_relation_to_dict(r) for r in conn.relations]
+            # Guesses from names for relations the database does not declare; used only if a person ticks them.
+            data["suggested_relations"] = suggest_relations(conn.schema, self._engines[conn.engine].map_type)
             data["approved"] = {t: {"columns": list(v.get("columns", [])),
                                     "filterable_columns": list(v.get("filterable_columns", [])),
                                     "writable": v.get("writable")}
@@ -772,7 +871,8 @@ class DatabaseRuntimeRegistry:
             try:
                 if old.selection:
                     self._activate_locked(fresh, old.selection, old.tables_approved_by or old.approved_by,
-                                          old.tables_approved_at or old.approved_at)
+                                          old.tables_approved_at or old.approved_at,
+                                          relations=old.relations)
             except Exception:
                 fresh.manager.shutdown()
                 raise

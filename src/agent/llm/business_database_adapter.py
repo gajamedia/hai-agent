@@ -18,7 +18,12 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # How each SQL family limits rows: LIMIT n (SQLite/PostgreSQL/MySQL), SELECT TOP (n)
 # (SQL Server) and FETCH FIRST n ROWS ONLY (Oracle 12c+).
 _DIALECTS = frozenset({"limit", "top", "fetch_first"})
-_ALLOWED_ARGUMENTS = frozenset({"table", "columns", "filters", "conditions", "order_by", "limit"})
+_ALLOWED_ARGUMENTS = frozenset({"table", "columns", "filters", "conditions", "order_by", "limit", "joins"})
+
+# Joins are structured too: the caller names a table and one of the *approved relations*
+# (a pair of columns the application owner allowed to be joined). No ON clause is ever free text.
+MAX_JOINS = 2
+JOIN_TYPES = {"inner": "INNER JOIN", "left": "LEFT JOIN"}
 
 # Structured comparisons. The caller never supplies SQL: only a column (which must be allowlisted
 # as filterable), an operator from this closed set, and a value that is always sent as a bound
@@ -34,6 +39,41 @@ _COMPARISON_SQL = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lt
 # "!" is the LIKE escape character because it means nothing special in any dialect's string
 # literals, unlike a backslash (an escape in MySQL, a plain character elsewhere).
 _LIKE_ESCAPE = "!"
+
+
+class RelationBook:
+    """The relations joins may follow, as (table, column) pairs usable in either direction.
+
+    Owned by the application. It can grow while the program runs (a relation a person confirmed), but only
+    through ``add``, which accepts nothing that is not an approved table and column."""
+
+    def __init__(self, specs: Mapping[str, "ReadOnlyTableSpec"], relations: Any = ()) -> None:
+        import threading
+        self._specs = specs
+        self._lock = threading.Lock()
+        self._pairs: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+        self.add(relations)
+
+    def add(self, relations: Any) -> None:
+        new: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+        for item in relations or ():
+            if not isinstance(item, (tuple, list)) or len(item) != 4:
+                raise ValueError("a relation must be (table, column, other_table, other_column).")
+            left, right = (item[0], item[1]), (item[2], item[3])
+            for table, column in (left, right):
+                spec = self._specs.get(table)
+                if spec is None or column not in spec.columns:
+                    raise ValueError("a relation must use approved tables and columns.")
+            if left[0] == right[0]:
+                raise ValueError("a relation must connect two different tables.")
+            new.add((left, right))
+            new.add((right, left))
+        with self._lock:
+            self._pairs |= new
+
+    def allows(self, first: tuple[str, str], second: tuple[str, str]) -> bool:
+        with self._lock:
+            return (first, second) in self._pairs
 
 
 def _like_pattern(text: str, *, before: bool, after: bool) -> str:
@@ -78,6 +118,25 @@ def _validate_identifier(value: str, label: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"Invalid SQL identifier in {label}.")
     return value
+
+
+def split_qualified(name: Any) -> tuple[str, str]:
+    """``"table.column"`` -> (table, column); both parts must be plain identifiers."""
+    if not isinstance(name, str) or name.count(".") != 1:
+        raise ValueError("a column in a joined query must be written table.column")
+    table, column = name.split(".")
+    return _validate_identifier(table, "table"), _validate_identifier(column, "column")
+
+
+def join_output_names(columns: Any) -> list[str]:
+    """Names of the result columns of a joined query: the plain column name when it is unique among
+    the selected columns, otherwise ``table_column``. The adapter and the report share this rule."""
+    pairs = [split_qualified(c) for c in columns]
+    bare = [c for _, c in pairs]
+    names = [c if bare.count(c) == 1 else f"{t}_{c}" for t, c in pairs]
+    if len(set(names)) != len(names):
+        raise ValueError("selected columns would have the same name in the result")
+    return names
 
 
 @dataclass(frozen=True)
@@ -132,6 +191,7 @@ class BusinessDatabaseAdapter:
         paramstyle: str = "qmark",
         identifier_quote: str | None = None,
         dialect: str = "limit",
+        relations: Any = (),
     ) -> None:
         if identifier_quote not in {None, '"', "`", "["}:
             raise ValueError("identifier_quote must be None, '\"', '`' or '['.")
@@ -153,6 +213,9 @@ class BusinessDatabaseAdapter:
             if key != spec.table:
                 raise ValueError("table_specs keys must match each spec.table.")
             normalized[key] = spec
+        # Approved relations as (table, column, other_table, other_column); usable in either direction.
+        self._relations = (relations if isinstance(relations, RelationBook)
+                           else RelationBook(normalized, relations))
         self._connection_factory = connection_factory
         self._table_specs = dict(normalized)
         self._paramstyle = paramstyle
@@ -252,9 +315,10 @@ class BusinessDatabaseAdapter:
                     "Read-only business database resource cleanup failed."
                 ) from cleanup_error
 
-    def _condition_sql(self, item: Mapping[str, Any], bind: Callable[[Any], str]) -> str:
+    def _condition_sql(self, item: Mapping[str, Any], bind: Callable[[Any], str],
+                       qualify: Callable[[str], str] | None = None) -> str:
         column, operator, value = item["column"], item["operator"], item.get("value")
-        quoted = self._q(column)
+        quoted = qualify(column) if qualify else self._q(column)
         if operator in {"is_null", "is_not_null"}:
             if value is not None:
                 raise CapabilityRequestValidationError(f"'{operator}' takes no value.")
@@ -279,6 +343,133 @@ class BusinessDatabaseAdapter:
                                 after=operator in {"contains", "starts_with"})
         return f"{quoted} LIKE {bind(pattern)} ESCAPE '{_LIKE_ESCAPE}'"
 
+    def _build_join_select(self, arguments: Mapping[str, Any], base: str,
+                           base_spec: ReadOnlyTableSpec) -> tuple[str, tuple[Any, ...]]:
+        """SELECT over the base table plus up to MAX_JOINS approved relations.
+
+        Every column is written ``table.column``; each must be approved in its own table (filters and
+        sorting need that table's filterable / sortable approval). Each join must follow a relation
+        the owner approved. Values are bound parameters; identifiers come only from the allowlist."""
+        invalid = CapabilityRequestValidationError
+        joins = arguments["joins"]
+        if not isinstance(joins, (list, tuple)) or not 1 <= len(joins) <= MAX_JOINS:
+            raise invalid(f"joins must be a list of 1-{MAX_JOINS} items.")
+        in_query = [base]
+        join_sql: list[str] = []
+        for item in joins:
+            if not isinstance(item, Mapping) or set(item) - {"table", "type", "on"}:
+                raise invalid("Each join must be {table, type, on}.")
+            table, kind, on = item.get("table"), item.get("type", "inner"), item.get("on")
+            if not isinstance(table, str) or table not in self._table_specs:
+                raise invalid("A joined table is not allowlisted.")
+            if table in in_query:
+                raise invalid("A table can be joined only once.")
+            if kind not in JOIN_TYPES:
+                raise invalid("A join type must be inner or left.")
+            if not isinstance(on, (list, tuple)) or len(on) != 2:
+                raise invalid("A join needs on: [table.column, table.column].")
+            try:
+                first, second = split_qualified(on[0]), split_qualified(on[1])
+            except ValueError as exc:
+                raise invalid(str(exc)) from exc
+            if first[0] != table:
+                first, second = second, first
+            if first[0] != table or second[0] not in in_query or not self._relations.allows(first, second):
+                raise invalid("That join is not an approved relation.")
+            in_query.append(table)
+            join_sql.append(f" {JOIN_TYPES[kind]} {self._q(table)} ON "
+                            f"{self._q(first[0])}.{self._q(first[1])} = "
+                            f"{self._q(second[0])}.{self._q(second[1])}")
+
+        def column_of(name: Any, allowed: str) -> tuple[str, str]:
+            try:
+                table, column = split_qualified(name)
+            except ValueError as exc:
+                raise invalid(str(exc)) from exc
+            spec = self._table_specs.get(table)
+            if table not in in_query or spec is None or column not in spec.columns:
+                raise invalid("Requested column is not allowlisted.")
+            if allowed != "columns" and column not in getattr(spec, allowed):
+                raise invalid("A filter column is not allowlisted." if allowed == "filterable_columns"
+                              else "A sort column is not allowlisted.")
+            return table, column
+
+        def qualify(name: str) -> str:
+            table, column = split_qualified(name)
+            return f"{self._q(table)}.{self._q(column)}"
+
+        requested = arguments.get("columns")
+        if not isinstance(requested, (list, tuple)) or not requested:
+            raise invalid("columns must be a non-empty list.")
+        for name in requested:
+            column_of(name, "columns")
+        if len(set(requested)) != len(requested):
+            raise invalid("columns must not contain duplicates.")
+        try:
+            aliases = join_output_names(requested)
+        except ValueError as exc:
+            raise invalid(str(exc)) from exc
+
+        filters = arguments.get("filters", {})
+        if not isinstance(filters, Mapping):
+            raise invalid("filters must be a mapping.")
+        for key in filters:
+            column_of(key, "filterable_columns")
+        conditions = arguments.get("conditions", [])
+        if not isinstance(conditions, (list, tuple)) or len(conditions) > MAX_CONDITIONS:
+            raise invalid(f"conditions must be a list of at most {MAX_CONDITIONS} items.")
+        for item in conditions:
+            if not isinstance(item, Mapping) or set(item) - {"column", "operator", "value"}:
+                raise invalid("Each condition must be {column, operator, value}.")
+            column_of(item.get("column"), "filterable_columns")
+            if item.get("operator") not in CONDITION_OPERATORS:
+                raise invalid("A condition operator is not supported.")
+
+        order_by = arguments.get("order_by", [])
+        if not isinstance(order_by, (list, tuple)):
+            raise invalid("order_by must be a list.")
+        order_fragments: list[str] = []
+        for item in order_by:
+            if not isinstance(item, str) or not item:
+                raise invalid("Each order_by item must be a column string.")
+            descending = item.startswith("-")
+            name = item[1:] if descending else item
+            column_of(name, "sortable_columns")
+            order_fragments.append(f"{qualify(name)} {'DESC' if descending else 'ASC'}")
+
+        limit = arguments.get("limit", base_spec.default_limit)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= base_spec.max_limit:
+            raise invalid(f"limit must be an integer between 1 and {base_spec.max_limit}.")
+
+        parameters: list[Any] = []
+
+        def bind(value: Any) -> str:
+            parameters.append(value)
+            return self._placeholder(len(parameters))
+
+        top = f"TOP ({bind(limit)}) " if self._dialect == "top" else ""
+        select = ", ".join(f"{qualify(name)} AS {self._q(alias)}" for name, alias in zip(requested, aliases))
+        sql = f"SELECT {top}{select} FROM {self._q(base)}" + "".join(join_sql)
+        where: list[str] = []
+        for key, value in filters.items():
+            if value is None:
+                where.append(f"{qualify(key)} IS NULL")
+            else:
+                if isinstance(value, (dict, list, tuple, set)):
+                    raise invalid(f"Filter value for '{key}' must be a scalar.")
+                where.append(f"{qualify(key)} = {bind(value)}")
+        for item in conditions:
+            where.append(self._condition_sql(item, bind, qualify))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        if order_fragments:
+            sql += " ORDER BY " + ", ".join(order_fragments)
+        if self._dialect == "limit":
+            sql += f" LIMIT {bind(limit)}"
+        elif self._dialect == "fetch_first":
+            sql += f" FETCH FIRST {bind(limit)} ROWS ONLY"
+        return sql, tuple(parameters)
+
     def _build_select(
         self,
         arguments: Mapping[str, Any],
@@ -299,6 +490,8 @@ class BusinessDatabaseAdapter:
                 "Requested table is not allowlisted."
             )
         spec = self._table_specs[table]
+        if arguments.get("joins"):
+            return self._build_join_select(arguments, table, spec)
 
         requested_columns = arguments.get("columns", list(spec.columns))
         if not isinstance(requested_columns, (list, tuple)) or not requested_columns:
@@ -410,4 +603,5 @@ class BusinessDatabaseAdapter:
         return sql, tuple(parameters)
 
 
-__all__ = ["ReadOnlyTableSpec", "BusinessDatabaseAdapter"]
+__all__ = ["ReadOnlyTableSpec", "BusinessDatabaseAdapter", "RelationBook", "join_output_names", "split_qualified",
+           "MAX_JOINS", "JOIN_TYPES"]
