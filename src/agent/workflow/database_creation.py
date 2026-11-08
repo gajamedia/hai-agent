@@ -33,6 +33,28 @@ COLUMN_TYPES = {
 }
 
 
+_SQLSERVER_TYPES = {
+    "integer": "INT", "decimal": "DECIMAL(14,2)", "text": "NVARCHAR(255)", "long_text": "NVARCHAR(MAX)",
+    "date": "DATE", "datetime": "DATETIME2", "boolean": "BIT",
+}
+
+
+@dataclass(frozen=True)
+class Dialect:
+    """What differs between the servers: type names, the placeholder, and whether the row size is capped."""
+    name: str
+    types: Mapping[str, str]
+    placeholder: str
+    row_limit: int | None
+
+
+MYSQL = Dialect("mysql", COLUMN_TYPES, "%s", _ROW_LIMIT)
+# SQL Server moves long variable-length values off the row, so the 65,000-byte MySQL cap does not apply.
+SQLSERVER = Dialect("sqlserver", _SQLSERVER_TYPES, "?", None)
+DIALECTS = {"mysql": MYSQL, "sqlserver": SQLSERVER}
+_LOGIN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
 class CreationRefused(ValueError):
     """The database cannot be created (it exists, or the design is not allowed)."""
 
@@ -67,8 +89,8 @@ class DesignPlanResult:
 
 
 class DatabaseDesigner:
-    def __init__(self, llm: Any, *, prefix: str, max_attempts: int = 2) -> None:
-        self.llm, self.prefix, self.max_attempts = llm, prefix, max_attempts
+    def __init__(self, llm: Any, *, prefix: str, max_attempts: int = 2, dialect: Dialect = MYSQL) -> None:
+        self.llm, self.prefix, self.max_attempts, self.dialect = llm, prefix, max_attempts, dialect
 
     def _system_prompt(self) -> str:
         return (
@@ -82,8 +104,9 @@ class DatabaseDesigner:
             f"Column types, only these: {sorted(COLUMN_TYPES)}. Do NOT add an id column: a numeric primary "
             f"key named id is added automatically. At most {MAX_TABLES} tables and {MAX_COLUMNS} columns "
             "per table (a table needs at least one column; if the user names a kind of system such as HRIS, "
-            "choose the usual columns yourself). Use text only for short values; use long_text for notes, "
-            "because a row can hold about 65 short text columns. Table and column names are lowercase "
+            "choose the usual columns yourself). Use text only for short values; use long_text for notes"
+            + (", because a row can hold about 65 short text columns" if self.dialect.row_limit else "")
+            + ". Table and column names are lowercase "
             "letters, digits and underscores. A database "
             "with no tables is allowed if the user asks for only the database. If the user only wants "
             "more tables in a database that exists, list just the new tables.\n"
@@ -155,7 +178,7 @@ class DatabaseDesigner:
                 names.add(cname)
                 columns.append(ColumnDef(cname, ctype, nullable))
             row_bytes = 4 + sum(_ROW_BYTES[c.type] for c in columns)
-            if row_bytes > _ROW_LIMIT:
+            if self.dialect.row_limit and row_bytes > self.dialect.row_limit:
                 raise PlanValidationError(
                     f"Table {name!r} is too wide for MySQL (a row may hold about 65,000 bytes and each short text "
                     "column takes about 1,000). Use long_text for descriptions and notes, or split the table in two.")
@@ -165,10 +188,32 @@ class DatabaseDesigner:
         return DatabaseDesign(database, tuple(tables), title)
 
 
-def build_statements(design: DatabaseDesign, *, database_exists: bool = False) -> list[str]:
+def _build_sqlserver(design: DatabaseDesign, database_exists: bool, grant_reader: str) -> list[str]:
+    statements = [] if database_exists else [f"CREATE DATABASE [{design.database}]"]
+    if grant_reader and not database_exists:
+        if not _LOGIN.match(grant_reader):
+            raise CreationRefused("the reader account name is not a plain name")
+        # Run inside the new database, as its owner (the creator): the reader may read, nothing more.
+        statements.append(f"EXEC [{design.database}].sys.sp_executesql N'CREATE USER [{grant_reader}] "
+                          f"FOR LOGIN [{grant_reader}]'")
+        statements.append(f"EXEC [{design.database}].sys.sp_executesql N'ALTER ROLE [db_datareader] "
+                          f"ADD MEMBER [{grant_reader}]'")
+    for table in design.tables:
+        columns = ["[id] INT IDENTITY(1,1) NOT NULL"]
+        columns += [f"[{c.name}] {_SQLSERVER_TYPES[c.type]} {'NULL' if c.nullable else 'NOT NULL'}"
+                    for c in table.columns]
+        columns.append("PRIMARY KEY ([id])")
+        statements.append(f"CREATE TABLE [{design.database}].[dbo].[{table.name}] ({', '.join(columns)})")
+    return statements
+
+
+def build_statements(design: DatabaseDesign, *, database_exists: bool = False, dialect: Dialect = MYSQL,
+                     grant_reader: str = "") -> list[str]:
     """CREATE statements. Every name was validated against a strict pattern and is quoted.
 
     When the database already exists only its new tables are created: nothing existing is touched."""
+    if dialect.name == "sqlserver":
+        return _build_sqlserver(design, database_exists, grant_reader)
     statements = [] if database_exists else [f"CREATE DATABASE `{design.database}` CHARACTER SET utf8mb4"]
     for table in design.tables:
         columns = ["`id` INT NOT NULL AUTO_INCREMENT"]
@@ -182,9 +227,10 @@ def build_statements(design: DatabaseDesign, *, database_exists: bool = False) -
 
 class DatabaseCreationService:
     def __init__(self, *, designer: DatabaseDesigner, connect: Callable[[], Any], profile: str,
-                 audit_path: Path,
+                 audit_path: Path, grant_reader: str = "",
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.designer, self._connect, self.profile = designer, connect, profile
+        self.dialect, self.grant_reader = designer.dialect, grant_reader
         self.audit_path, self._clock = Path(audit_path), clock
         self._lock = threading.Lock()
 
@@ -201,33 +247,46 @@ class DatabaseCreationService:
                 else f"BUAT DATABASE {design.database}")
 
     @staticmethod
-    def _ask(connection, sql: str, params: tuple) -> list[tuple]:
+    def _ask(connection, sql: str, params: tuple = ()) -> list[tuple]:
         cursor = connection.cursor()
         try:
-            cursor.execute(sql, params)
+            cursor.execute(sql, params) if params else cursor.execute(sql)
             return list(cursor.fetchall())
         finally:
             cursor.close()
 
     def _inspect(self, connection, design: DatabaseDesign) -> tuple[str, list[str]]:
         """("create_database" | "add_tables", the statements), or CreationRefused."""
+        sqlserver = self.dialect.name == "sqlserver"
         exists = bool(self._ask(
-            connection, "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
+            connection, "SELECT name FROM sys.databases WHERE name = ?" if sqlserver
+            else "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
             (design.database,)))
         if not exists:
-            return "create_database", build_statements(design)
+            return "create_database", build_statements(design, dialect=self.dialect,
+                                                       grant_reader=self.grant_reader)
         if not design.tables:
             raise CreationRefused(f"A database named '{design.database}' already exists and no tables were "
                                   "asked for; nothing is overwritten. Ask for tables to add, or choose another name.")
-        have = {str(r[0]).lower() for r in self._ask(
-            connection, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
-            (design.database,))}
+        try:
+            have = {str(r[0]).lower() for r in (self._ask(
+                connection, f"SELECT TABLE_NAME FROM [{design.database}].INFORMATION_SCHEMA.TABLES "
+                            "WHERE TABLE_TYPE = 'BASE TABLE'") if sqlserver else self._ask(
+                connection, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+                (design.database,)))}
+        except CreationRefused:
+            raise
+        except Exception as exc:
+            if not sqlserver:
+                raise
+            raise CreationRefused(f"The creator account cannot open the existing database '{design.database}' "
+                                  "(it was not created by this application); choose another name.") from exc
         clash = sorted(t.name for t in design.tables if t.name.lower() in have)
         if clash:
             raise CreationRefused(
                 f"The database '{design.database}' already has the table(s) {', '.join(clash)}; existing tables "
                 "are never changed. Use other table names.")
-        return "add_tables", build_statements(design, database_exists=True)
+        return "add_tables", build_statements(design, database_exists=True, dialect=self.dialect)
 
     def preview(self, design: DatabaseDesign) -> tuple[str, list[str]]:
         """The mode and the statements that would run. Refuses what would overwrite. Creates nothing."""
@@ -279,5 +338,5 @@ class DatabaseCreationService:
                 handle.write(line + "\n")
 
 
-__all__ = ["COLUMN_TYPES", "ColumnDef", "CreationRefused", "DatabaseCreationService", "DatabaseDesign",
+__all__ = ["COLUMN_TYPES", "DIALECTS", "Dialect", "MYSQL", "SQLSERVER", "ColumnDef", "CreationRefused", "DatabaseCreationService", "DatabaseDesign",
            "DatabaseDesigner", "DesignPlanResult", "TableDef", "build_statements"]

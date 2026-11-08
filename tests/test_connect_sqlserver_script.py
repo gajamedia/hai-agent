@@ -26,10 +26,17 @@ class FakeCursor:
             self.row = ("11.0.3128.0", "Express Edition", self.db.windows_only, self.db.admin, "PC\me")
         elif sql.startswith("SELECT name FROM sys.databases"):
             self.rows = [("dbsales",)]
+        elif sql.startswith("SELECT permission_name"):
+            self.rows = [("CONNECT SQL",), ("CREATE ANY DATABASE",)]
+        elif sql.startswith("SELECT CAST(IS_SRVROLEMEMBER"):
+            self.rows = [(0,) * 8]
         elif sql.startswith("SELECT COUNT(*)"):
             self.row = (3,)
         elif sql.startswith("CREATE TABLE") and self.db.read_only:
             raise RuntimeError("CREATE TABLE permission denied")
+
+    def close(self):
+        pass
 
     def fetchone(self):
         return self.row
@@ -176,3 +183,47 @@ def test_the_registry_is_read_into_instances():
     got = tool.read_instances(W)
     assert got == [{"name": "SQLEXPRESS", "folder": "MSSQL11.SQLEXPRESS", "tcp_enabled": True,
                     "tcp_port": "1433", "login_mode": 2}]
+
+
+def _profile_file(tmp_path, **extra):
+    path = tmp_path / "profiles.json"
+    path.write_text(json.dumps({"local_sqlserver": {
+        "type": "sqlserver", "server": r"(local)\SQLEXPRESS", "database": "dbsales", "user": "hai_sql_reader",
+        "password_env": "HAI_LOCAL_SQLSERVER_PASSWORD", "ssl": "require", **extra}}), encoding="utf-8")
+    return path
+
+
+def test_create_creator_grants_one_permission_and_adds_a_creator_block(tmp_path):
+    path = _profile_file(tmp_path)
+    fake = FakePyodbc()
+    code, text = run(tmp_path, fake, ["--create-creator"])
+    assert code == 0 and "holds nothing else" in text
+    sql = [s for _, s in fake.shared["executed"]]
+    assert any("CREATE LOGIN [hai_sql_creator]" in s for s in sql)
+    assert any(s == "GRANT CREATE ANY DATABASE TO [hai_sql_creator]" for s in sql)
+    assert not any(("dbcreator" in s or "sysadmin" in s) for s in sql if not s.startswith("SELECT"))   # no role is granted
+    block = json.loads(path.read_text("utf-8"))["local_sqlserver"]["creator"]
+    assert block == {"user": "hai_sql_creator", "password_env": "HAI_LOCAL_SQLSERVER_CREATOR_PASSWORD",
+                     "prefix": "hai_"}
+    env = (tmp_path / ".env").read_text("utf-8")
+    password = env.split("HAI_LOCAL_SQLSERVER_CREATOR_PASSWORD=")[1].strip()
+    assert password not in path.read_text("utf-8") and password not in text
+    from api.database_engines import parse_profiles
+    assert parse_profiles(json.loads(path.read_text("utf-8")))["local_sqlserver"].creator_user == "hai_sql_creator"
+
+
+@pytest.mark.parametrize("shared,answers,extra_argv,needle", [
+    ({"windows_only": 1}, ("y",), [], "Windows logins only"),
+    ({"admin": 0}, ("y",), [], "not an administrator"),
+    ({}, ("n",), [], "Nothing changed"),
+    ({}, ("y",), ["--creator-user", "hai_sql_reader"], "different login"),
+    ({}, ("y",), ["--creator-user", "x]; DROP"], "letters, digits"),
+    ({}, ("y",), ["--profile", "nope_such"], "not a SQL Server profile"),
+])
+def test_create_creator_refuses_or_stops_without_changes(tmp_path, shared, answers, extra_argv, needle):
+    _profile_file(tmp_path)
+    fake = FakePyodbc(**shared)
+    code, text = run(tmp_path, fake, ["--create-creator", *extra_argv], answers=answers)
+    assert code != 0 and needle in text
+    assert not any(s.startswith(("CREATE", "GRANT", "IF", "ALTER")) for _, s in fake.shared["executed"])
+    assert not (tmp_path / ".env").exists()

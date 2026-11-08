@@ -108,6 +108,20 @@ describe("DatabaseCreation", () => {
     expect(await screen.findByText(/Tabel tb_bahan ditambahkan ke database hai_toko/)).toBeTruthy();
   });
 
+  it("lets the user pick between a MySQL and a SQL Server server, and sends the chosen profile", async () => {
+    const user = userEvent.setup();
+    api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [
+      { name: "local_mysql", prefix: "hai_", type: "mysql" },
+      { name: "local_sqlserver", prefix: "hai_", type: "sqlserver" }] });
+    renderPage();
+    await user.selectOptions(await screen.findByLabelText("Server"), "local_sqlserver");
+    expect(screen.getByRole("option", { name: "local_sqlserver (sqlserver)" })).toBeTruthy();
+    await user.type(screen.getByLabelText(/Perintah/), "buat toko");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    await screen.findByLabelText("Rencana database");
+    expect(api.createDatabasePlan).toHaveBeenCalledWith({ question: "buat toko", profile: "local_sqlserver" });
+  });
+
   it("shows a refusal (name already taken) instead of a plan", async () => {
     const user = userEvent.setup();
     api.createDatabasePlan.mockResolvedValue({ status: "refused", reason: "A database named 'hai_toko' already exists", plan_id: null });

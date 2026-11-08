@@ -359,4 +359,28 @@ How it stays read-only: SQL Server has no read-only session flag, so the engine 
 administrator or database owner, that holds anything beyond CONNECT and SELECT (or server-wide rights), or that
 can INSERT, UPDATE, DELETE or ALTER any table. Reports use only SELECT statements the agent builds itself.
 
-Not available for SQL Server yet: changing data and creating databases from the agent (MySQL only).
+### Creating databases and tables on SQL Server (the "Buat database" page)
+
+```powershell
+python scripts\connect_sqlserver.py --create-creator          # after --create-reader made the profile
+```
+
+This creates a login that holds ONE server permission, `CREATE ANY DATABASE` (never `sysadmin`, never the
+`dbcreator` role, which also allows altering other databases), stores its password in `.env` and adds a
+`creator` block to the profile. Restart the backend; the page lists the server as `local_sqlserver (sqlserver)`
+and works exactly like MySQL: a plan to review, the phrase `BUAT DATABASE hai_xxx` (or `TAMBAH TABEL hai_xxx`
+for tables in a database the agent made earlier), a fresh Keycloak login, an audit line.
+
+Differences from MySQL you should know:
+
+* SQL Server cannot limit `CREATE ANY DATABASE` to names starting with a prefix. The application enforces the
+  prefix (default `hai_`); a name outside it is refused before anything runs. The login owns only the databases
+  it creates and cannot open, alter or drop any other one (checked by the tests).
+* A new database automatically gives the profile's read-only login read access (`db_datareader`, nothing more),
+  so **Hubungkan database ini** works at once. The tables get an `IDENTITY` numeric key `id`.
+* Columns: `text` = `NVARCHAR(255)`, `long_text` = `NVARCHAR(MAX)`, `decimal` = `DECIMAL(14,2)`,
+  `datetime` = `DATETIME2`, `boolean` = `BIT`. Up to 500 columns per table; the 65,000-byte MySQL row cap does
+  not apply.
+* Adding tables to a database the agent did not make is refused (the creator has no access to it).
+
+Not available for SQL Server yet: changing data (insert, update, delete) from the agent (MySQL only).

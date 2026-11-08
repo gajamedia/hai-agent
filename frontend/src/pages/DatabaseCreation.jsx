@@ -135,7 +135,7 @@ export default function DatabaseCreation() {
                 Server
                 <select value={profile} onChange={(e) => setProfile(e.target.value)} required>
                   <option value="">Pilih...</option>
-                  {profiles.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+                  {profiles.map((p) => <option key={p.name} value={p.name}>{p.type ? `${p.name} (${p.type})` : p.name}</option>)}
                 </select>
               </label>
             )}

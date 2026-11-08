@@ -47,7 +47,7 @@ from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
-from agent.workflow.database_creation import DatabaseCreationService, DatabaseDesigner
+from agent.workflow.database_creation import DIALECTS, DatabaseCreationService, DatabaseDesigner
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
@@ -475,7 +475,7 @@ class DatabaseRuntimeRegistry:
         for engine in self._engines.values():
             for pname, profile in getattr(engine, "profiles", {}).items():
                 if getattr(engine, "has_creator", lambda _n: False)(pname):
-                    out.append({"name": pname, "prefix": profile.creator_prefix})
+                    out.append({"name": pname, "prefix": profile.creator_prefix, "type": engine.kind})
         return sorted(out, key=lambda item: item["name"])
 
     def database_creator(self, profile: Any = None) -> DatabaseCreationService:
@@ -492,7 +492,7 @@ class DatabaseRuntimeRegistry:
             cached = self._creators.get(profile)
             if cached is not None:
                 return cached
-            impl = self._engines["mysql"]
+            impl = next(e for e in self._engines.values() if profile in getattr(e, "profiles", {}))
             try:
                 factory = impl.open_creator(profile)
             except EngineError as exc:
@@ -501,7 +501,9 @@ class DatabaseRuntimeRegistry:
                 self._llm = LLMService(self.llm_provider_factory())
             prefix = impl.profiles[profile].creator_prefix
             service = DatabaseCreationService(
-                designer=DatabaseDesigner(self._llm, prefix=prefix), connect=factory, profile=profile,
+                designer=DatabaseDesigner(self._llm, prefix=prefix, dialect=DIALECTS[impl.kind]),
+                connect=factory, profile=profile,
+                grant_reader=impl.profiles[profile].user if impl.kind == "sqlserver" else "",
                 audit_path=self.work_dir / "audit" / f"creations-{profile}.jsonl")
             self._creators[profile] = service
             return service

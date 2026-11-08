@@ -169,11 +169,15 @@ class SQLServerProfile:
     driver: str = ""
     statement_timeout_ms: int = 15000
     type: str = "sqlserver"
+    # Optional second login that may only CREATE DATABASE (and so owns what it creates).
+    creator_user: str = ""
+    creator_password_env: str = ""
+    creator_prefix: str = "hai_"
 
 
 _COMMON = {"type", "host", "port", "database", "user", "password_env", "statement_timeout_ms"}
 _EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl", "writer", "creator"},
-          "sqlserver": {"server", "schema", "ssl", "driver"}}
+          "sqlserver": {"server", "schema", "ssl", "driver", "creator"}}
 _DEFAULT_PORT = {"postgresql": 5432, "mysql": 3306, "sqlserver": 0}
 _MSSQL_SERVER = re.compile(r"^[A-Za-z0-9_.\-\\()]{1,100}$")
 _MSSQL_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
@@ -211,9 +215,22 @@ def parse_profiles(data: Any) -> dict[str, Any]:
                     **common, schema=str(raw.get("schema", "public")),
                     sslmode=str(raw.get("sslmode", "require")))
             elif kind == "sqlserver":
+                creator = raw.get("creator") or {}
+                if creator and (not isinstance(creator, Mapping)
+                                or set(creator) - {"user", "password_env", "prefix"}
+                                or not creator.get("user") or not creator.get("password_env")
+                                or not _MSSQL_NAME.match(str(creator.get("user")))
+                                or not re.fullmatch(r"[a-z][a-z0-9]{0,15}_", str(creator.get("prefix", "hai_")))):
+                    raise EngineError(f"profile {name!r}: creator must be "
+                                      '{"user": "...", "password_env": "...", "prefix": "hai_"}')
+                if creator and str(creator["user"]).strip() == common["user"]:
+                    raise EngineError(f"profile {name!r}: the creator must be its own login")
                 profile = SQLServerProfile(
                     **common, schema=str(raw.get("schema", "dbo")), ssl=str(raw.get("ssl", "require")),
-                    driver=str(raw.get("driver", "")).strip())
+                    driver=str(raw.get("driver", "")).strip(),
+                    creator_user=str(creator.get("user", "")).strip(),
+                    creator_password_env=str(creator.get("password_env", "")).strip(),
+                    creator_prefix=str(creator.get("prefix", "hai_")))
             else:
                 writer = raw.get("writer") or {}
                 if writer and (not isinstance(writer, Mapping) or set(writer) - {"user", "password_env"}
@@ -665,11 +682,26 @@ _MSSQL_DB_ALLOWED = {"CONNECT", "SELECT", "REFERENCES", "VIEW DEFINITION", "VIEW
 _MSSQL_SERVER_ALLOWED = {"CONNECT SQL", "VIEW ANY DATABASE"}
 
 
+_MSSQL_FIXED_ROLES = ("sysadmin", "securityadmin", "serveradmin", "setupadmin", "processadmin", "diskadmin",
+                      "dbcreator", "bulkadmin")
+
+
+def _server_roles(connection) -> list[str]:
+    """Fixed server roles the connected login belongs to. fn_my_permissions does not show everything a role
+    implies (dbcreator, for one), so the roles are asked directly."""
+    sql = "SELECT " + ", ".join(f"CAST(IS_SRVROLEMEMBER('{r}') AS int)" for r in _MSSQL_FIXED_ROLES)
+    row = PostgresEngine._rows(connection, sql)[0]
+    return [role for role, member in zip(_MSSQL_FIXED_ROLES, row) if member == 1]
+
+
 def check_sqlserver_permissions(database_permissions: list[str], server_permissions: list[str],
-                                writable_tables: list[str]) -> None:
+                                writable_tables: list[str], server_roles: list[str] = ()) -> None:
     """Refuse any account that can do more than read. Session flags do not exist in SQL Server,
     so this check (and a SELECT-only account) is the read-only guarantee, next to the SELECT-only
     statements the adapter builds."""
+    if server_roles:
+        raise EngineError("the login belongs to the server role(s) " + ", ".join(server_roles)
+                          + "; use a login with read access to one database only")
     excess = {p.upper() for p in database_permissions} - _MSSQL_DB_ALLOWED
     if excess:
         raise EngineError("the database account holds more than SELECT ("
@@ -681,6 +713,21 @@ def check_sqlserver_permissions(database_permissions: list[str], server_permissi
     if writable_tables:
         raise EngineError("the database account can modify data (" + ", ".join(writable_tables[:5])
                           + "); grant it SELECT only")
+
+
+def check_sqlserver_creator_permissions(server_permissions: list[str], server_roles: list[str] = ()) -> None:
+    """The creator may hold CREATE ANY DATABASE and nothing else. (The dbcreator role is refused: it
+    also carries ALTER ANY DATABASE, which reaches databases this application did not create.)"""
+    if server_roles:
+        raise EngineError("the creator login belongs to the server role(s) " + ", ".join(server_roles)
+                          + "; use a login that holds only CREATE ANY DATABASE")
+    perms = {p.upper() for p in server_permissions}
+    excess = perms - {"CONNECT SQL", "VIEW ANY DATABASE", "CREATE ANY DATABASE"}
+    if excess:
+        raise EngineError("the creator login may hold only CREATE ANY DATABASE (it can do more: "
+                          + ", ".join(sorted(excess)[:5]) + ")")
+    if "CREATE ANY DATABASE" not in perms:
+        raise EngineError("the creator login cannot create databases (GRANT CREATE ANY DATABASE)")
 
 
 def _odbc_value(value: str) -> str:
@@ -699,19 +746,32 @@ class SQLServerEngine:
         self.profiles = dict(profiles)
         self._connect = connect  # injectable for tests: connect(connection_string, timeout=...)
 
-    def _connection_string(self, profile: SQLServerProfile, driver: str) -> str:
+    def _connection_string(self, profile: SQLServerProfile, driver: str, *, user: str = "",
+                           password_env: str = "", database: str = "") -> str:
         server = f"{profile.host},{profile.port}" if profile.port else profile.host
         trust = "no" if profile.ssl == "verify" else "yes"      # require: encrypted, certificate not verified
-        return (f"DRIVER={{{driver}}};SERVER={server};DATABASE={profile.database};UID={profile.user};"
-                f"PWD={_odbc_value(os.environ.get(profile.password_env, ''))};Encrypt=yes;"
+        password = os.environ.get(password_env or profile.password_env, "")
+        return (f"DRIVER={{{driver}}};SERVER={server};DATABASE={database or profile.database};"
+                f"UID={user or profile.user};PWD={_odbc_value(password)};Encrypt=yes;"
                 f"TrustServerCertificate={trust};APP=hai-agent-reports")
 
-    def open(self, manager: ConnectionManager, name: str, source: str, auth_ref: str):
-        profile = self.profiles.get(source)
-        if profile is None:
-            raise EngineError("unknown database profile")
-        if not os.environ.get(profile.password_env):
-            raise EngineError(f"environment variable {profile.password_env} is not set")
+    def _resolve(self, source: str):
+        """A profile name, or "profile/database" for a database made by the creator (prefix only)."""
+        name, _, database = source.partition("/")
+        profile = self.profiles.get(name)
+        if profile is None or not database:
+            return profile
+        if (not profile.creator_user or not _DB_OVERRIDE.match(database)
+                or not database.startswith(profile.creator_prefix)
+                or database == profile.creator_prefix):
+            raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
+        return replace(profile, database=database)
+
+    def has_creator(self, name: str) -> bool:
+        profile = self.profiles.get(name)
+        return bool(profile and profile.creator_user and profile.creator_password_env)
+
+    def _driver(self, profile: SQLServerProfile):
         connect, driver = self._connect, profile.driver or "ODBC Driver 17 for SQL Server"
         if connect is None:
             import pyodbc  # optional dependency, imported only when this engine is used
@@ -722,6 +782,41 @@ class SQLServerEngine:
                                            "ODBC Driver 13 for SQL Server") if d in installed), "")
                 if not driver:
                     raise EngineError("no 'ODBC Driver 17/18 for SQL Server' is installed on this computer")
+        return connect, driver
+
+    def open_creator(self, name: str):
+        """A function opening autocommit connections for the login that may only CREATE DATABASE."""
+        profile = self.profiles.get(name)
+        if profile is None or not self.has_creator(name):
+            raise EngineError("this database profile has no creator login configured")
+        if not os.environ.get(profile.creator_password_env):
+            raise EngineError(f"environment variable {profile.creator_password_env} is not set")
+        connect, driver = self._driver(profile)
+        timeout_s = max(1, profile.statement_timeout_ms // 1000)
+        text = self._connection_string(profile, driver, user=profile.creator_user,
+                                       password_env=profile.creator_password_env, database="master")
+
+        def factory():
+            conn = connect(text, timeout=5, autocommit=True)   # CREATE DATABASE cannot run in a transaction
+            conn.timeout = timeout_s
+            return conn
+
+        connection = factory()
+        try:
+            perms = [r[0] for r in PostgresEngine._rows(
+                connection, "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'SERVER')")]
+            check_sqlserver_creator_permissions(perms, _server_roles(connection))
+        finally:
+            connection.close()
+        return factory
+
+    def open(self, manager: ConnectionManager, name: str, source: str, auth_ref: str):
+        profile = self._resolve(source)
+        if profile is None:
+            raise EngineError("unknown database profile")
+        if not os.environ.get(profile.password_env):
+            raise EngineError(f"environment variable {profile.password_env} is not set")
+        connect, driver = self._driver(profile)
         timeout_s = max(1, profile.statement_timeout_ms // 1000)
         text = self._connection_string(profile, driver)
 
@@ -761,7 +856,7 @@ class SQLServerEngine:
             connection,
             "SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id "
             f"WHERE s.name = ? AND ({tests}) ORDER BY 1", (profile.schema,))]
-        check_sqlserver_permissions(db_perms, server_perms, writable)
+        check_sqlserver_permissions(db_perms, server_perms, writable, _server_roles(connection))
 
     @staticmethod
     def _discover(connection, name: str, profile: SQLServerProfile):
@@ -794,5 +889,5 @@ class SQLServerEngine:
 
 __all__ = ["EngineError", "MySQLEngine", "check_mysql_writer_grants", "check_mysql_creator_grants", "MySQLProfile", "PostgresEngine", "PostgresProfile",
            "SQLiteEngine", "SQLServerEngine", "SQLServerProfile", "check_mysql_grants",
-           "check_sqlserver_permissions", "map_sqlserver_type", "load_profiles", "map_mysql_type",
+           "check_sqlserver_permissions", "check_sqlserver_creator_permissions", "map_sqlserver_type", "load_profiles", "map_mysql_type",
            "map_postgres_type", "map_sqlite_type", "parse_profiles"]

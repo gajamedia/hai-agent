@@ -86,6 +86,34 @@ def test_a_wide_table_of_hundreds_of_columns_is_allowed_when_it_fits_a_mysql_row
     assert len(design.tables[0].columns) == 500
 
 
+def test_sqlserver_statements_use_brackets_its_types_an_identity_key_and_give_the_reader_read_only_access():
+    from agent.workflow.database_creation import SQLSERVER
+    design = _designer().validate(GOOD)
+    statements = build_statements(design, dialect=SQLSERVER, grant_reader="hai_sql_reader")
+    assert statements[0] == "CREATE DATABASE [hai_toko]"
+    assert "CREATE USER [hai_sql_reader] FOR LOGIN [hai_sql_reader]" in statements[1]
+    assert "db_datareader" in statements[2] and "db_owner" not in " ".join(statements) and "db_datawriter" not in " ".join(statements)
+    table = statements[3]
+    assert table.startswith("CREATE TABLE [hai_toko].[dbo].[tb_bahan] ([id] INT IDENTITY(1,1) NOT NULL, [nama] NVARCHAR(255) NOT NULL")
+    assert table.endswith("PRIMARY KEY ([id]))") and "`" not in table
+    # adding tables to an existing database touches nothing else
+    assert build_statements(design, database_exists=True, dialect=SQLSERVER, grant_reader="x") == [table]
+    from agent.workflow.database_creation import CreationRefused
+    with pytest.raises(CreationRefused):
+        build_statements(design, dialect=SQLSERVER, grant_reader="x]; DROP")
+
+
+def test_sqlserver_has_no_mysql_row_size_cap_but_keeps_the_500_column_limit():
+    from agent.workflow.database_creation import SQLSERVER
+    designer = DatabaseDesigner(None, prefix="hai_", dialect=SQLSERVER)
+    wide = [{"name": f"c{i}", "type": "text"} for i in range(200)]
+    assert len(designer.validate({**GOOD, "tables": [{"name": "t", "columns": wide}]}).tables[0].columns) == 200
+    with pytest.raises(ValueError, match="too wide"):
+        _designer().validate({**GOOD, "tables": [{"name": "t", "columns": wide}]})        # MySQL still refuses
+    with pytest.raises(ValueError, match="limit is 500"):
+        designer.validate({**GOOD, "tables": [{"name": "t", "columns": wide * 3}]})
+
+
 def test_a_design_with_only_a_database_is_allowed():
     design = _designer().validate({"database": "hai_kosong"})
     assert design.tables == () and build_statements(design) == ["CREATE DATABASE `hai_kosong` CHARACTER SET utf8mb4"]

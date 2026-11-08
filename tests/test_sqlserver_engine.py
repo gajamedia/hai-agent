@@ -18,8 +18,8 @@ import pytest
 
 from agent.llm.contracts import LLMResponse
 from api.database_engines import (
-    EngineError, SQLServerEngine, SQLServerProfile, check_sqlserver_permissions, map_sqlserver_type,
-    parse_profiles,
+    EngineError, SQLServerEngine, SQLServerProfile, check_sqlserver_creator_permissions,
+    check_sqlserver_permissions, map_sqlserver_type, parse_profiles,
 )
 from api.database_profile_check import check_profile
 from api.database_runtime_registry import DatabaseRuntimeRegistry, RegistryError
@@ -140,6 +140,7 @@ def ms(monkeypatch, tmp_path):
     import pyodbc
     tag = uuid.uuid4().hex[:8]
     db, reader, writer, owner = f"hai_rep_{tag}", f"rd_{tag}", f"wr_{tag}", f"ow_{tag}"
+    creator, new_db = f"cr_{tag}", f"hai_new_{tag}"
     base = ("DRIVER={ODBC Driver 17 for SQL Server};SERVER=" + SERVER +
             ";TrustServerCertificate=yes;Encrypt=yes;")
     admin = pyodbc.connect(base + "DATABASE=master;Trusted_Connection=yes", autocommit=True)
@@ -147,8 +148,10 @@ def ms(monkeypatch, tmp_path):
     password = "Rolepw" + uuid.uuid4().hex[:12]
     try:
         cur.execute(f"CREATE DATABASE [{db}]")
-        for user in (reader, writer, owner):
+        for user in (reader, writer, owner, creator):
             cur.execute(f"CREATE LOGIN [{user}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF")
+        cur.execute(f"CREATE USER [{creator}] FOR LOGIN [{creator}]")      # in master: the permission lives there
+        cur.execute(f"GRANT CREATE ANY DATABASE TO [{creator}]")
         cur.execute(f"USE [{db}]")
         for user in (reader, writer, owner):
             cur.execute(f"CREATE USER [{user}] FOR LOGIN [{user}]")
@@ -175,7 +178,9 @@ def ms(monkeypatch, tmp_path):
 
         profiles = parse_profiles({
             "ms_reader": profile(reader), "ms_writer": profile(writer), "ms_owner": profile(owner),
-            "ms_wrongpw": profile(reader, "HAI_TEST_MS_WRONG_PW")})
+            "ms_wrongpw": profile(reader, "HAI_TEST_MS_WRONG_PW"),
+            "ms_creator": {**profile(reader), "creator": {"user": creator, "password_env": "HAI_TEST_MS_ROLE_PW",
+                                                          "prefix": "hai_"}}})
         made = []
 
         def registry(*answers):
@@ -186,14 +191,20 @@ def ms(monkeypatch, tmp_path):
             return r
 
         yield SimpleNamespace(registry=registry, db=db, admin=cur, reader=reader, profiles=profiles,
-                              password=password)
+                              password=password, new_db=new_db, creator=creator, work=tmp_path / "work")
     finally:
         for r in locals().get("made", []):
             r.shutdown()
         cur.execute("USE master")
-        cur.execute(f"IF DB_ID(N'{db}') IS NOT NULL ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
-        cur.execute(f"IF DB_ID(N'{db}') IS NOT NULL DROP DATABASE [{db}]")
-        for user in (reader, writer, owner):
+        for user in (reader, writer, owner, creator):                      # pooled sessions keep a login "in use"
+            cur.execute("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = ?", user)
+            for (session,) in cur.fetchall():
+                cur.execute(f"KILL {int(session)}")
+        for name in (db, new_db):
+            cur.execute(f"IF DB_ID(N'{name}') IS NOT NULL ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+            cur.execute(f"IF DB_ID(N'{name}') IS NOT NULL DROP DATABASE [{name}]")
+        cur.execute(f"IF USER_ID(N'{creator}') IS NOT NULL DROP USER [{creator}]")
+        for user in (reader, writer, owner, creator):
             cur.execute(f"IF SUSER_ID(N'{user}') IS NOT NULL DROP LOGIN [{user}]")
         admin.close()
 
@@ -282,3 +293,134 @@ class TestSQLServerConformance(ConformanceSuite):
             q_sales=f"[{ms.db}].dbo.sales", q_order=f"[{ms.db}].dbo.[order]", order_name="order",
             quote=lambda column: f"[{column}]", assert_read_only=probe,
             leak_tokens=[SERVER or "", ms.reader, ms.db, ms.password])
+
+
+# ------------------------------------------------------------ creating databases
+@pytest.mark.parametrize("perms,roles,needle", [
+    (["CONNECT SQL", "VIEW ANY DATABASE", "CREATE ANY DATABASE"], [], None),
+    (["CONNECT SQL", "VIEW ANY DATABASE", "CREATE ANY DATABASE"], ["sysadmin"], "sysadmin"),
+    (["CONNECT SQL", "CREATE ANY DATABASE"], ["dbcreator"], "dbcreator"),
+    (["CONNECT SQL", "ALTER ANY DATABASE", "CREATE ANY DATABASE"], [], "ALTER ANY DATABASE"),
+    (["CONNECT SQL", "VIEW ANY DATABASE"], [], "cannot create"),
+    (["CONNECT SQL", "CREATE ANY DATABASE", "ALTER ANY LOGIN"], [], "ALTER ANY LOGIN"),
+])
+def test_the_creator_may_hold_create_any_database_and_nothing_else(perms, roles, needle):
+    if needle is None:
+        check_sqlserver_creator_permissions(perms, roles)
+    else:
+        with pytest.raises(EngineError, match=needle):
+            check_sqlserver_creator_permissions(perms, roles)
+
+
+def test_a_reader_in_a_server_role_is_refused():
+    with pytest.raises(EngineError, match="securityadmin"):
+        check_sqlserver_permissions(["CONNECT", "SELECT"], ["CONNECT SQL"], [], ["securityadmin"])
+
+
+@pytest.mark.parametrize("creator,needle", [
+    ({"user": "hai_sql_reader", "password_env": "C"}, "own login"),
+    ({"user": "c1"}, "creator must be"),
+    ({"user": "c1", "password_env": "C", "prefix": "Bad"}, "creator must be"),
+    ({"user": "c1; DROP", "password_env": "C"}, "creator must be"),
+    ({"user": "c1", "password_env": "C", "extra": 1}, "creator must be"),
+])
+def test_invalid_creator_blocks_are_rejected(creator, needle):
+    with pytest.raises(EngineError, match=needle):
+        parse_profiles({"crm": {**GOOD, "creator": creator}})
+
+
+def test_a_creator_block_is_optional_and_a_database_can_be_chosen_only_with_the_prefix():
+    plain = SQLServerEngine(parse_profiles({"crm": GOOD}))
+    assert not plain.has_creator("crm")
+    with pytest.raises(EngineError, match="only databases named"):
+        plain._resolve("crm/hai_x")
+    engine = SQLServerEngine(parse_profiles({"crm": {**GOOD, "creator": {"user": "c1", "password_env": "C"}}}))
+    assert engine.has_creator("crm") and engine._resolve("crm/hai_shop").database == "hai_shop"
+    for bad in ("crm/dbsales", "crm/hai_", "crm/HAI_X", "crm/hai_x;DROP"):
+        with pytest.raises(EngineError):
+            engine._resolve(bad)
+
+
+@live
+def test_a_server_with_a_creator_is_listed_with_its_prefix_and_type(ms):
+    assert ms.registry().creatable_profiles() == [{"name": "ms_creator", "prefix": "hai_", "type": "sqlserver"}]
+
+
+def _design(db, table="tb_pegawai"):
+    return json.dumps({"supported": True, "database": db, "title": "hr", "tables": [{"name": table, "columns": [
+        {"name": "nip", "type": "text", "nullable": False}, {"name": "gaji", "type": "decimal"},
+        {"name": "tanggal_masuk", "type": "date"}, {"name": "catatan", "type": "long_text"}]}]})
+
+
+@live
+def test_a_database_and_tables_are_created_then_read_by_the_reader_and_more_tables_added(ms):
+    reg = ms.registry(_design(ms.new_db), _design(ms.new_db, "tb_cuti"))
+    service = reg.database_creator("ms_creator")
+    first = service.designer.plan("buat database hr")
+    mode, statements = service.preview(first.design)
+    assert mode == "create_database" and statements[0] == f"CREATE DATABASE [{ms.new_db}]"
+    assert any("db_datareader" in s for s in statements) and not any("db_owner" in s for s in statements)
+    assert service.execute(first.design, actor="alice", plan_id="p1", question="q")["mode"] == "create_database"
+    ms.admin.execute(f"SELECT name FROM [{ms.new_db}].sys.tables")
+    assert [r[0] for r in ms.admin.fetchall()] == ["tb_pegawai"]
+    ms.admin.execute(f"SELECT c.name FROM [{ms.new_db}].sys.identity_columns c "
+                     f"WHERE c.object_id = OBJECT_ID('[{ms.new_db}].dbo.tb_pegawai')")
+    assert [r[0] for r in ms.admin.fetchall()] == ["id"]                 # the automatic numeric key
+
+    # the same tables again are refused, new tables are added without touching the existing one
+    with pytest.raises(Exception, match="already has the table"):
+        service.preview(first.design)
+    more = service.designer.plan("tambah tabel cuti")
+    mode, statements = service.preview(more.design)
+    assert mode == "add_tables" and len(statements) == 1
+    assert service.execute(more.design, actor="alice", plan_id="p2", question="q")["mode"] == "add_tables"
+    ms.admin.execute(f"SELECT name FROM [{ms.new_db}].sys.tables ORDER BY 1")
+    assert [r[0] for r in ms.admin.fetchall()] == ["tb_cuti", "tb_pegawai"]
+
+    # the read-only login can read the new database through the same profile, and only read
+    out = reg.connect("hrdb", engine="sqlserver", source=f"ms_creator/{ms.new_db}", actor_id="alice")
+    assert {t["name"] for t in out["schema"]["tables"]} == {"tb_cuti", "tb_pegawai"}
+    with reg._connections["hrdb"].manager.connection("hrdb") as c:
+        with pytest.raises(Exception):
+            c.cursor().execute("INSERT INTO dbo.tb_cuti (nip) VALUES ('x')")
+    audit = (ms.work / "audit" / "creations-ms_creator.jsonl").read_text("utf-8")
+    assert "create_database" in audit and "add_tables" in audit
+
+
+@live
+def test_the_creator_cannot_touch_a_database_it_did_not_create_or_drop_anything(ms):
+    from agent.workflow.database_creation import CreationRefused
+    reg = ms.registry(_design(ms.db))
+    service = reg.database_creator("ms_creator")
+    design = service.designer.plan("tambah ke database lama").design
+    with pytest.raises(CreationRefused, match="cannot open the existing database"):
+        service.preview(design)                                           # exists, but not the creator's
+    with pytest.raises(CreationRefused):
+        service.execute(design, actor="a", plan_id="p", question="q")
+    ms.admin.execute(f"SELECT COUNT(*) FROM [{ms.db}].sys.tables")
+    assert ms.admin.fetchone()[0] == 2                                    # untouched: sales and order
+    connection = service._connect()
+    try:
+        for sql in (f"DROP DATABASE [{ms.db}]", f"CREATE TABLE [{ms.db}].dbo.x (a INT)", "CREATE LOGIN zz WITH PASSWORD = 'Aa1x234567890'"):
+            with pytest.raises(Exception):
+                connection.cursor().execute(sql)
+    finally:
+        connection.close()
+
+
+@live
+def test_a_name_outside_the_prefix_is_refused_before_anything_runs(ms):
+    reg = ms.registry(json.dumps({"supported": True, "database": "dbsales_x", "tables": []}),
+                      json.dumps({"supported": True, "database": "dbsales_x", "tables": []}))
+    result = reg.database_creator("ms_creator").designer.plan("buat dbsales_x")
+    assert result.design is None and "must start with" in result.reason
+
+
+@live
+def test_a_login_with_more_than_create_any_database_is_refused_as_creator(ms):
+    ms.admin.execute(f"ALTER SERVER ROLE dbcreator ADD MEMBER [{ms.creator}]")
+    try:
+        with pytest.raises(RegistryError, match="dbcreator|cannot use the creator"):
+            ms.registry().database_creator("ms_creator")
+    finally:
+        ms.admin.execute(f"ALTER SERVER ROLE dbcreator DROP MEMBER [{ms.creator}]")
