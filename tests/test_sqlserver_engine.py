@@ -110,7 +110,7 @@ def test_registry_lists_the_profile_without_the_server_and_knows_the_engine(tmp_
     reg = DatabaseRuntimeRegistry(
         data_root=tmp_path / "d", work_dir=tmp_path / "w", authorization_policy=AuthorizationPolicy(),
         llm_provider_factory=lambda: None, profiles=parse_profiles({"local_sqlserver": GOOD}))
-    assert reg.profiles() == [{"name": "local_sqlserver", "type": "sqlserver"}]
+    assert reg.profiles() == [{"name": "local_sqlserver", "type": "sqlserver"}]     # no creator: no prefix offered
     assert reg.profile_engine("local_sqlserver") == "sqlserver"
     assert reg.available_engines() == ["sqlite", "sqlserver"]
     assert "sqlserver" in reg.supported_engine_names() and "mssql" in reg.supported_engine_names()
@@ -501,3 +501,15 @@ def test_the_creator_plan_of_connect_sqlserver_works_on_a_real_server_and_passes
             ms.admin.execute(f"KILL {int(session)}")
         ms.admin.execute(f"IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}]")
         ms.admin.execute(f"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}]")
+
+
+def test_a_profile_with_a_creator_tells_the_page_its_prefix_and_never_anything_else(tmp_path):
+    (tmp_path / "d").mkdir()
+    profiles = parse_profiles({
+        "with_creator": {**GOOD, "creator": {"user": "c1", "password_env": "C", "prefix": "hai_"}},
+        "plain": GOOD})
+    reg = DatabaseRuntimeRegistry(
+        data_root=tmp_path / "d", work_dir=tmp_path / "w", authorization_policy=AuthorizationPolicy(),
+        llm_provider_factory=lambda: None, profiles=profiles)
+    assert reg.profiles() == [{"name": "plain", "type": "sqlserver"},
+                              {"name": "with_creator", "type": "sqlserver", "prefix": "hai_"}]

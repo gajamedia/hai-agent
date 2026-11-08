@@ -324,9 +324,13 @@ class DatabaseRuntimeRegistry:
 
     def profiles(self) -> list[dict[str, str]]:
         """Names and types only: never hosts, users or secrets."""
-        out = [{"name": n, "type": kind}
-               for kind, engine in self._engines.items()
-               for n in getattr(engine, "profiles", {})]
+        out = []
+        for kind, engine in self._engines.items():
+            for n, profile in getattr(engine, "profiles", {}).items():
+                item = {"name": n, "type": kind}
+                if getattr(engine, "has_creator", lambda _n: False)(n):
+                    item["prefix"] = profile.creator_prefix     # databases made by the agent can be chosen
+                out.append(item)
         return sorted(out, key=lambda item: item["name"])
 
     def profile_engine(self, name: Any) -> str | None:

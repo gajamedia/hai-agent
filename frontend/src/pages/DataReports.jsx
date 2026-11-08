@@ -233,6 +233,8 @@ export default function DataReports() {
   const [filename, setFilename] = useState("");
   const [profiles, setProfiles] = useState([]);
   const [source, setSource] = useState("");
+  const [database, setDatabase] = useState("");
+  const chosenProfile = profiles.find((p) => p.name === source);
   const [warnings, setWarnings] = useState([]);
   const [engineRequests, setEngineRequests] = useState([]);
   const [wantedEngine, setWantedEngine] = useState("");
@@ -292,7 +294,7 @@ export default function DataReports() {
     event.preventDefault();
     return guarded(async () => {
       const payload = source
-        ? { name: name.trim(), profile: source }
+        ? { name: name.trim(), profile: source, ...(database.trim() ? { database: database.trim() } : {}) }
         : { name: name.trim(), filename: filename.trim() };
       const data = await connectDatabase(payload);
       setWarnings(data.warnings || []);
@@ -439,12 +441,25 @@ export default function DataReports() {
             {profiles.length > 0 && (
               <label>
                 Sumber
-                <select value={source} onChange={(e) => setSource(e.target.value)}>
+                <select value={source} onChange={(e) => { setSource(e.target.value); setDatabase(""); }}>
                   <option value="">File SQLite di folder data</option>
                   {profiles.map((p) => (
                     <option key={p.name} value={p.name}>{`${p.name} (${p.type})`}</option>
                   ))}
                 </select>
+              </label>
+            )}
+            {chosenProfile?.prefix && (
+              <label>
+                Database <small>opsional; kosong = database bawaan profil</small>
+                <input
+                  value={database}
+                  onChange={(e) => setDatabase(e.target.value)}
+                  placeholder={`${chosenProfile.prefix}nama_database`}
+                  aria-label="Database buatan agent"
+                />
+                <small>Untuk database yang dibuat agent, tulis namanya (diawali {chosenProfile.prefix}).
+                  Nama koneksi di atas hanya label; ia tidak memilih database.</small>
               </label>
             )}
             {!source && (
@@ -491,6 +506,7 @@ export default function DataReports() {
                 <span>
                   <b>{c.name}</b> ·{" "}
                   {STATUS_TEXT(c)}
+                  {c.file && <small style={{ display: "block", opacity: 0.7 }}>sumber: {c.file}</small>}
                 </span>
                 {c.status !== "unavailable" && (
                   <button type="button" className="at-button at-button-secondary" disabled={busy} onClick={() => review(c.name)}>

@@ -245,6 +245,30 @@ describe("DataReports", () => {
     expect(api.connectDatabase).toHaveBeenCalledWith({ name: "crm", profile: "crm_pg" });
   });
 
+  it("lets the user name a database made by the agent on a server that can create them, and says the connection name is only a label", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [
+      { name: "local_mysql", type: "mysql", prefix: "hai_" }, { name: "crm_pg", type: "postgresql" }] });
+    api.connectDatabase.mockResolvedValue({ name: "testing", schema: SCHEMA, warnings: [] });
+    renderPage();
+    await user.type(screen.getByLabelText(/Nama koneksi/), "testing");
+    const select = await screen.findByLabelText(/Sumber/);
+    await user.selectOptions(select, "crm_pg");
+    expect(screen.queryByLabelText("Database buatan agent")).toBeNull();           // no prefix: the field is not offered
+    await user.selectOptions(select, "local_mysql");
+    expect(screen.getByText(/hanya label/)).toBeTruthy();
+    await user.type(screen.getByLabelText("Database buatan agent"), "hai_testingai");
+    await user.click(screen.getByRole("button", { name: /Hubungkan/ }));
+    expect(api.connectDatabase).toHaveBeenCalledWith({ name: "testing", profile: "local_mysql", database: "hai_testingai" });
+  });
+
+  it("shows where each connection comes from", async () => {
+    api.listDatabaseConnections.mockResolvedValue({ connections: [{ name: "hai_testingai", status: "connected_pending_approval",
+      database: "mysql", file: "local_mysql/hai_testingai" }] });
+    renderPage();
+    expect(await screen.findByText(/sumber: local_mysql\/hai_testingai/)).toBeTruthy();
+  });
+
   it("lets the user ask for an unsupported database and shows the request status", async () => {
     const user = userEvent.setup();
     api.createEngineRequest.mockResolvedValue({ id: "r1" });
