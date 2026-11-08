@@ -323,3 +323,24 @@ database services and SQLite files. It sends no login and no query.
 * SQL Server is only reported: the agent has no SQL Server engine yet.
 * A SQLite file can be used only inside `HAI_DATABASE_ROOT`; the report says which ones are.
 * A server on a non-standard port is not found; add it by hand as in section 5.
+
+## 9. SQL Server on this computer
+
+```powershell
+pip install pyodbc                       # or: pip install -e .[sqlserver]
+python scripts\connect_sqlserver.py      # diagnose, changes nothing
+python scripts\connect_sqlserver.py --create-reader --database <name>
+```
+
+The diagnosis lists the installed instances (service running or not, TCP/IP on or off, accepted login types),
+checks the ODBC driver and pyodbc, and connects with your own Windows login to show the version, whether you
+administer the instance and the user databases. SQL Server Express usually has TCP/IP off: it is then reachable
+only from this computer (that is why `discover_databases.py` does not see it on port 1433). The script never
+turns TCP/IP on and never changes server settings.
+
+`--create-reader` creates a SQL login with a random password that can only read the one database you name
+(writes and schema changes are denied), stores the password in `.env` and the details without the password in
+`data\reports\sqlserver_connections.json`, then checks that a write is refused. It needs mixed-mode
+authentication and you being an administrator; otherwise it stops and says what to change.
+
+The agent has no SQL Server engine yet, so nothing goes into `profiles.json`.
