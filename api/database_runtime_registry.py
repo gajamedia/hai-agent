@@ -470,16 +470,23 @@ class DatabaseRuntimeRegistry:
             logger.warning("Could not open the writer for connection %r (source %r): %s: %s",
                            conn.name, conn.filename, type(exc).__name__, exc)
             code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
-            detail = ("the writer account has no access to this database. An administrator must run "
-                      "scripts/setup_mysql_creator_user.py <profile> (for databases the agent created) or "
-                      "scripts/setup_mysql_writer_user.py <profile> (for the profile's own database), then "
-                      "restart the backend" if code == 1044 else "connection failed")
+            if getattr(impl, "kind", "mysql") == "sqlserver":
+                denied = ("4060" in str(exc) or "18456" in str(exc))
+                fix = ("python scripts/connect_sqlserver.py --create-writer --database <name>, then restart the backend")
+            else:
+                denied = code == 1044
+                fix = ("scripts/setup_mysql_creator_user.py <profile> (for databases the agent created) or "
+                       "scripts/setup_mysql_writer_user.py <profile> (for the profile's own database), then "
+                       "restart the backend")
+            detail = ("the writer account has no access to this database. An administrator must run " + fix
+                      if denied else "connection failed")
             raise RegistryError(f"cannot use the writer account: {detail}") from exc
         if self._llm is None:
             self._llm = LLMService(self.llm_provider_factory())
         return DataChangeService(
             planner=DataChangePlanner(self._llm, tables), connect=factory, quote=impl.quote,
             paramstyle=impl.paramstyle, lock_clause=getattr(impl, "lock_clause", " FOR UPDATE"),
+            dialect=getattr(impl, "dialect", "limit"),
             audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl")
 
     # --------------------------------------------------- creating databases
@@ -518,6 +525,7 @@ class DatabaseRuntimeRegistry:
                 designer=DatabaseDesigner(self._llm, prefix=prefix, dialect=DIALECTS[impl.kind]),
                 connect=factory, profile=profile,
                 grant_reader=impl.profiles[profile].user if impl.kind == "sqlserver" else "",
+                grant_writer=impl.profiles[profile].writer_user if impl.kind == "sqlserver" else "",
                 audit_path=self.work_dir / "audit" / f"creations-{profile}.jsonl")
             self._creators[profile] = service
             return service

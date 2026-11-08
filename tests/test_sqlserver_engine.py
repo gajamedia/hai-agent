@@ -19,7 +19,7 @@ import pytest
 from agent.llm.contracts import LLMResponse
 from api.database_engines import (
     EngineError, SQLServerEngine, SQLServerProfile, check_sqlserver_creator_permissions,
-    check_sqlserver_permissions, map_sqlserver_type, parse_profiles,
+    check_sqlserver_permissions, check_sqlserver_writer_permissions, map_sqlserver_type, parse_profiles,
 )
 from api.database_profile_check import check_profile
 from api.database_runtime_registry import DatabaseRuntimeRegistry, RegistryError
@@ -180,7 +180,11 @@ def ms(monkeypatch, tmp_path):
             "ms_reader": profile(reader), "ms_writer": profile(writer), "ms_owner": profile(owner),
             "ms_wrongpw": profile(reader, "HAI_TEST_MS_WRONG_PW"),
             "ms_creator": {**profile(reader), "creator": {"user": creator, "password_env": "HAI_TEST_MS_ROLE_PW",
-                                                          "prefix": "hai_"}}})
+                                                          "prefix": "hai_"}},
+            "ms_rw": {**profile(reader), "writer": {"user": writer, "password_env": "HAI_TEST_MS_ROLE_PW"}},
+            "ms_rw_owner": {**profile(reader), "writer": {"user": owner, "password_env": "HAI_TEST_MS_ROLE_PW"}},
+            "ms_all": {**profile(reader), "writer": {"user": writer, "password_env": "HAI_TEST_MS_ROLE_PW"},
+                       "creator": {"user": creator, "password_env": "HAI_TEST_MS_ROLE_PW", "prefix": "hai_"}}})
         made = []
 
         def registry(*answers):
@@ -343,7 +347,9 @@ def test_a_creator_block_is_optional_and_a_database_can_be_chosen_only_with_the_
 
 @live
 def test_a_server_with_a_creator_is_listed_with_its_prefix_and_type(ms):
-    assert ms.registry().creatable_profiles() == [{"name": "ms_creator", "prefix": "hai_", "type": "sqlserver"}]
+    listed = ms.registry().creatable_profiles()
+    assert {"name": "ms_creator", "prefix": "hai_", "type": "sqlserver"} in listed
+    assert {item["name"] for item in listed} == {"ms_creator", "ms_all"}        # only profiles with a creator
 
 
 def _design(db, table="tb_pegawai"):
@@ -513,3 +519,254 @@ def test_a_profile_with_a_creator_tells_the_page_its_prefix_and_never_anything_e
         llm_provider_factory=lambda: None, profiles=profiles)
     assert reg.profiles() == [{"name": "plain", "type": "sqlserver"},
                               {"name": "with_creator", "type": "sqlserver", "prefix": "hai_"}]
+
+
+# ------------------------------------------------------------ changing data
+def test_a_writer_block_is_optional_and_must_be_its_own_login():
+    plain = SQLServerEngine(parse_profiles({"crm": GOOD}))
+    assert not plain.has_writer("crm")
+    ok = parse_profiles({"crm": {**GOOD, "writer": {"user": "w1", "password_env": "W"}}})["crm"]
+    assert (ok.writer_user, ok.writer_password_env) == ("w1", "W")
+    for bad in ({"user": "hai_sql_reader", "password_env": "W"}, {"user": "w1"},
+                {"user": "w1; DROP", "password_env": "W"}, {"user": "w1", "password_env": "W", "extra": 1}):
+        with pytest.raises(EngineError, match="writer"):
+            parse_profiles({"crm": {**GOOD, "writer": bad}})
+    with pytest.raises(EngineError, match="own login"):
+        parse_profiles({"crm": {**GOOD, "creator": {"user": "c1", "password_env": "C"},
+                                "writer": {"user": "c1", "password_env": "W"}}})
+
+
+@pytest.mark.parametrize("db,server,roles,needle", [
+    (["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE"], ["CONNECT SQL"], [], None),
+    (["CONNECT", "SELECT"], ["CONNECT SQL"], [], "cannot change data"),
+    (["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE", "ALTER"], ["CONNECT SQL"], [], "ALTER"),
+    (["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE TABLE", "EXECUTE"], [], [], "CREATE TABLE|EXECUTE"),
+    (["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE"], ["CONNECT SQL", "CONTROL SERVER"], [], "server-wide"),
+    (["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE"], ["CONNECT SQL"], ["dbcreator"], "dbcreator"),
+])
+def test_the_writer_may_change_data_in_its_database_and_nothing_else(db, server, roles, needle):
+    if needle is None:
+        check_sqlserver_writer_permissions(db, server, roles)
+    else:
+        with pytest.raises(EngineError, match=needle):
+            check_sqlserver_writer_permissions(db, server, roles)
+
+
+def test_the_sqlserver_dialect_puts_top_first_and_the_lock_as_a_table_hint():
+    from agent.workflow.data_change import ChangeSqlBuilder
+    builder = ChangeSqlBuilder(quote="[", paramstyle="qmark", dialect="top")
+    sql, params = builder.select("items", ["id", "region"], [("region", "eq", "west")], limit=11,
+                                 lock=SQLServerEngine.lock_clause)
+    assert sql == "SELECT TOP (11) [id], [region] FROM [items] WITH (UPDLOCK, ROWLOCK) WHERE [region] = ?"
+    assert params == ["west"] and "LIMIT" not in sql and "FOR UPDATE" not in sql
+    mysql = ChangeSqlBuilder(quote="`", paramstyle="format").select("t", ["a"], [], limit=3, lock=" FOR UPDATE")[0]
+    assert mysql == "SELECT `a` FROM `t` LIMIT 3 FOR UPDATE"
+
+
+def test_a_big_insert_is_split_under_the_2100_parameter_limit():
+    from agent.workflow.data_change import ChangeSqlBuilder
+    builder = ChangeSqlBuilder(quote="[", paramstyle="qmark", dialect="top")
+    columns = [f"c{i}" for i in range(30)]
+    rows = [{c: i for c in columns} for i in range(100)]
+    chunks = builder.insert_chunks("t", columns, rows)
+    assert len(chunks) > 1 and all(len(params) <= 2000 for _, params in chunks)
+    assert sum(len(params) for _, params in chunks) == 3000
+    assert len(builder.insert_chunks("t", ["a"], [{"a": i} for i in range(2500)])) == 3      # 1000 rows at most
+
+
+def _items(ms):
+    ms.admin.execute(f"CREATE TABLE [{ms.db}].dbo.items (id INT IDENTITY(1,1) PRIMARY KEY, region VARCHAR(20), "
+                     "product VARCHAR(20), amount DECIMAL(10,2), sold_on DATE)")
+    for i in range(1, 31):
+        ms.admin.execute(f"INSERT INTO [{ms.db}].dbo.items (region, product, amount, sold_on) VALUES (?,?,?,?)",
+                         ["west", "east", "north"][i % 3], "widget" if i % 2 else "gadget", f"{10 + i}.25",
+                         f"2026-01-{(i % 28) + 1:02d}")
+
+
+def _writable_registry(ms, source="ms_rw"):
+    reg = ms.registry()
+    reg.connect("items_rw", engine="sqlserver", source=source, actor_id="alice")
+    reg.activate("items_rw", {"items": {
+        "columns": ["id", "region", "product", "amount", "sold_on"],
+        "filterable_columns": ["id", "region", "product", "amount", "sold_on"], "key_column": "id",
+        "writable": {"operations": ["insert", "update", "delete"],
+                     "columns": ["region", "product", "amount", "sold_on"]}}}, actor_id="bob")
+    return reg
+
+
+def _count(ms, where="1=1"):
+    ms.admin.execute(f"SELECT COUNT(*) FROM [{ms.db}].dbo.items WHERE {where}")
+    return ms.admin.fetchone()[0]
+
+
+def _run_change(service, payload, max_rows=100, approver=None):
+    request = service.planner.validate(payload, max_rows=max_rows)
+    preview = service.preview(request)
+    return service.execute(request, expected_rows=preview.expected_rows, actor="alice", approver=approver,
+                           plan_id="p", question="q"), preview
+
+
+@live
+def test_update_with_a_date_range_and_bound_values_matches_independent_sql(ms):
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    expected = _count(ms, "sold_on BETWEEN '2026-01-05' AND '2026-01-10' AND region = 'west'")
+    assert expected
+    done, preview = _run_change(service, {
+        "operation": "update", "table": "items", "set": {"product": "x'; DROP TABLE t;--"},
+        "conditions": [{"column": "sold_on", "operator": "between", "value": ["2026-01-05", "2026-01-10"]},
+                       {"column": "region", "operator": "eq", "value": "west"}]})
+    assert done.rows_affected == preview.expected_rows == expected
+    assert _count(ms, "product LIKE 'x%DROP TABLE t%'") == expected         # stored as plain text
+    assert _count(ms) == 30                                                      # the table is still there
+
+
+@live
+def test_setting_the_value_a_row_already_has_still_counts_the_row(ms):
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    done, _ = _run_change(service, {"operation": "update", "table": "items", "set": {"amount": 11.25},
+                                    "conditions": [{"column": "id", "operator": "eq", "value": 1}]})
+    assert done.rows_affected == 1
+
+
+@live
+def test_delete_and_insert_work_and_the_audit_keeps_the_deleted_rows(ms):
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    done, _ = _run_change(service, {"operation": "delete", "table": "items",
+                                    "conditions": [{"column": "id", "operator": "in", "value": [1, 2, 3]}]},
+                          approver="bob")
+    assert done.rows_affected == 3 and _count(ms, "id IN (1,2,3)") == 0
+    assert sorted(r["id"] for r in done.before_image) == [1, 2, 3]
+    ins, _ = _run_change(service, {"operation": "insert", "table": "items", "rows": [
+        {"region": "south", "product": "gadget", "amount": 5, "sold_on": "2026-02-01"},
+        {"region": "south", "product": "widget", "amount": 6, "sold_on": "2026-02-02"}]})
+    assert ins.rows_affected == 2 and _count(ms, "region = 'south'") == 2        # the IDENTITY key made the ids
+    audit = (ms.work / "audit" / "changes-items_rw.jsonl").read_text("utf-8")
+    assert "committed" in audit and "before_image" in audit
+
+
+@live
+def test_a_big_insert_runs_in_chunks_inside_one_transaction(ms):
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    rows = [{"region": "r", "product": f"p{i}", "amount": i, "sold_on": "2026-03-01"} for i in range(100)]
+    done, _ = _run_change(service, {"operation": "insert", "table": "items", "rows": rows}, max_rows=100)
+    assert done.rows_affected == 100 and _count(ms, "region = 'r'") == 100
+
+
+@live
+def test_the_users_row_limit_stops_a_change_that_is_too_big(ms):
+    from agent.workflow.data_change import ChangeRefused
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    request = service.planner.validate({"operation": "update", "table": "items", "set": {"product": "z"},
+                                        "conditions": [{"column": "region", "operator": "eq", "value": "west"}]},
+                                       max_rows=3)
+    with pytest.raises(ChangeRefused, match="more than 3 rows"):
+        service.preview(request)
+    assert _count(ms, "product = 'z'") == 0
+
+
+@live
+def test_data_that_moved_since_the_preview_rolls_everything_back(ms):
+    from agent.workflow.data_change import ChangeRefused
+    _items(ms)
+    service = _writable_registry(ms).data_changes("items_rw")
+    request = service.planner.validate({"operation": "update", "table": "items", "set": {"product": "z"},
+                                        "conditions": [{"column": "region", "operator": "eq", "value": "west"}]},
+                                       max_rows=100)
+    preview = service.preview(request)
+    ms.admin.execute(f"UPDATE [{ms.db}].dbo.items SET region = 'west' WHERE id = 2")      # one more row matches now
+    with pytest.raises(ChangeRefused, match="data changed since the preview"):
+        service.execute(request, expected_rows=preview.expected_rows, actor="alice", approver=None,
+                        plan_id="p", question="q")
+    assert _count(ms, "product = 'z'") == 0
+
+
+@live
+def test_the_reader_connection_still_cannot_write_on_a_connection_that_can_change_data(ms):
+    _items(ms)
+    reg = _writable_registry(ms)
+    with reg._connections["items_rw"].manager.connection("items_rw") as c:
+        with pytest.raises(Exception):
+            c.cursor().execute("UPDATE dbo.items SET amount = 0")
+    assert _count(ms, "amount = 0") == 0
+
+
+@live
+def test_a_profile_without_a_writer_cannot_enable_writing(ms):
+    _items(ms)
+    with pytest.raises(RegistryError, match="no writer account"):
+        _writable_registry(ms, source="ms_reader")
+
+
+@live
+def test_a_writer_that_owns_the_database_is_refused(ms):
+    _items(ms)
+    with pytest.raises(RegistryError, match="cannot use the writer account"):
+        _writable_registry(ms, source="ms_rw_owner")
+
+
+@live
+def test_a_database_made_by_the_agent_can_be_changed_at_once_when_the_profile_has_a_writer(ms):
+    reg = ms.registry(_design(ms.new_db))
+    service = reg.database_creator("ms_all")
+    design = service.designer.plan("buat database").design
+    mode, statements = service.preview(design)
+    assert mode == "create_database" and any("db_datawriter" in s for s in statements)
+    service.execute(design, actor="alice", plan_id="p1", question="q")
+    reg.connect("hrdb", engine="sqlserver", source=f"ms_all/{ms.new_db}", actor_id="alice")
+    reg.activate("hrdb", {"tb_pegawai": {
+        "columns": ["id", "nip", "gaji"], "filterable_columns": ["id", "nip"], "key_column": "id",
+        "writable": {"operations": ["insert", "update"], "columns": ["nip", "gaji"]}}}, actor_id="bob")
+    changes = reg.data_changes("hrdb")
+    done, _ = _run_change(changes, {"operation": "insert", "table": "tb_pegawai", "rows": [
+        {"nip": "001", "gaji": 5000000}, {"nip": "002", "gaji": 6000000}]})
+    assert done.rows_affected == 2
+    done, _ = _run_change(changes, {"operation": "update", "table": "tb_pegawai", "set": {"gaji": 7000000},
+                                    "conditions": [{"column": "nip", "operator": "eq", "value": "002"}]})
+    assert done.rows_affected == 1
+    ms.admin.execute(f"SELECT nip, gaji FROM [{ms.new_db}].dbo.tb_pegawai ORDER BY nip")
+    assert [(r[0], float(r[1])) for r in ms.admin.fetchall()] == [("001", 5000000.0), ("002", 7000000.0)]
+
+
+@live
+def test_the_writer_plan_of_connect_sqlserver_works_on_a_real_server_and_passes_the_safety_check(ms):
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "scripts" / "connect_sqlserver.py"
+    spec = importlib.util.spec_from_file_location("connect_sqlserver_live3", path)
+    tool = importlib.util.module_from_spec(spec)
+    _sys.modules["connect_sqlserver_live3"] = tool
+    spec.loader.exec_module(tool)
+    login = f"sw_{uuid.uuid4().hex[:8]}"
+    password = tool.generate_password()
+    import os as _os
+    try:
+        for _ in range(2):                                   # twice: a reset after a half-finished run must work
+            for database, statements in tool.plan_writer_statements(login, ms.db, password).items():
+                ms.admin.execute(f"USE [{database}]")
+                for sql in statements:
+                    ms.admin.execute(sql)
+        ms.admin.execute("USE master")
+        _items(ms)
+        _os.environ["HAI_TEST_MS_SCRIPT_PW"] = password
+        profile = parse_profiles({"sw": {**GOOD, "server": SERVER, "database": ms.db, "user": ms.reader,
+                                         "password_env": "HAI_TEST_MS_ROLE_PW",
+                                         "writer": {"user": login, "password_env": "HAI_TEST_MS_SCRIPT_PW"}}})
+        factory = SQLServerEngine(profile).open_writer("sw")             # runs the writer safety check
+        connection = factory()
+        connection.close()
+    finally:
+        _os.environ.pop("HAI_TEST_MS_SCRIPT_PW", None)
+        ms.admin.execute("USE master")
+        ms.admin.execute("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = ?", login)
+        for (session,) in ms.admin.fetchall():
+            ms.admin.execute(f"KILL {int(session)}")
+        ms.admin.execute(f"USE [{ms.db}]")
+        ms.admin.execute(f"IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}]")
+        ms.admin.execute("USE master")
+        ms.admin.execute(f"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}]")

@@ -103,6 +103,19 @@ def test_sqlserver_statements_use_brackets_its_types_an_identity_key_and_give_th
         build_statements(design, dialect=SQLSERVER, grant_reader="x]; DROP")
 
 
+def test_sqlserver_gives_the_writer_data_rights_in_a_new_database_only_when_there_is_a_writer():
+    from agent.workflow.database_creation import SQLSERVER
+    design = _designer().validate(GOOD)
+    both = " ".join(build_statements(design, dialect=SQLSERVER, grant_reader="hai_sql_reader", grant_writer="hai_sql_writer"))
+    assert "CREATE USER [hai_sql_writer]" in both and "db_datawriter] ADD MEMBER [hai_sql_writer]" in both
+    assert "db_datawriter] ADD MEMBER [hai_sql_reader]" not in both and "db_owner" not in both
+    assert "hai_sql_writer" not in " ".join(build_statements(design, dialect=SQLSERVER, grant_reader="hai_sql_reader"))
+    assert "hai_sql_writer" not in " ".join(build_statements(design, database_exists=True, dialect=SQLSERVER,
+                                                             grant_reader="x", grant_writer="hai_sql_writer"))
+    with pytest.raises(CreationRefused):
+        build_statements(design, dialect=SQLSERVER, grant_writer="w]; DROP")
+
+
 def test_sqlserver_has_no_mysql_row_size_cap_but_keeps_the_500_column_limit():
     from agent.workflow.database_creation import SQLSERVER
     designer = DatabaseDesigner(None, prefix="hai_", dialect=SQLSERVER)

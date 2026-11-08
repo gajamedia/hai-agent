@@ -188,8 +188,17 @@ class DatabaseDesigner:
         return DatabaseDesign(database, tuple(tables), title)
 
 
-def _build_sqlserver(design: DatabaseDesign, database_exists: bool, grant_reader: str) -> list[str]:
+def _build_sqlserver(design: DatabaseDesign, database_exists: bool, grant_reader: str,
+                     grant_writer: str = "") -> list[str]:
     statements = [] if database_exists else [f"CREATE DATABASE [{design.database}]"]
+    if grant_writer and not database_exists:
+        if not _LOGIN.match(grant_writer):
+            raise CreationRefused("the writer account name is not a plain name")
+        # The writer may change data in the new database (the application still limits tables and columns).
+        for line in (f"CREATE USER [{grant_writer}] FOR LOGIN [{grant_writer}]",
+                     f"ALTER ROLE [db_datareader] ADD MEMBER [{grant_writer}]",
+                     f"ALTER ROLE [db_datawriter] ADD MEMBER [{grant_writer}]"):
+            statements.append(f"EXEC [{design.database}].sys.sp_executesql N'{line}'")
     if grant_reader and not database_exists:
         if not _LOGIN.match(grant_reader):
             raise CreationRefused("the reader account name is not a plain name")
@@ -208,12 +217,12 @@ def _build_sqlserver(design: DatabaseDesign, database_exists: bool, grant_reader
 
 
 def build_statements(design: DatabaseDesign, *, database_exists: bool = False, dialect: Dialect = MYSQL,
-                     grant_reader: str = "") -> list[str]:
+                     grant_reader: str = "", grant_writer: str = "") -> list[str]:
     """CREATE statements. Every name was validated against a strict pattern and is quoted.
 
     When the database already exists only its new tables are created: nothing existing is touched."""
     if dialect.name == "sqlserver":
-        return _build_sqlserver(design, database_exists, grant_reader)
+        return _build_sqlserver(design, database_exists, grant_reader, grant_writer)
     statements = [] if database_exists else [f"CREATE DATABASE `{design.database}` CHARACTER SET utf8mb4"]
     for table in design.tables:
         columns = ["`id` INT NOT NULL AUTO_INCREMENT"]
@@ -227,10 +236,10 @@ def build_statements(design: DatabaseDesign, *, database_exists: bool = False, d
 
 class DatabaseCreationService:
     def __init__(self, *, designer: DatabaseDesigner, connect: Callable[[], Any], profile: str,
-                 audit_path: Path, grant_reader: str = "",
+                 audit_path: Path, grant_reader: str = "", grant_writer: str = "",
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.designer, self._connect, self.profile = designer, connect, profile
-        self.dialect, self.grant_reader = designer.dialect, grant_reader
+        self.dialect, self.grant_reader, self.grant_writer = designer.dialect, grant_reader, grant_writer
         self.audit_path, self._clock = Path(audit_path), clock
         self._lock = threading.Lock()
 
@@ -264,7 +273,8 @@ class DatabaseCreationService:
             (design.database,)))
         if not exists:
             return "create_database", build_statements(design, dialect=self.dialect,
-                                                       grant_reader=self.grant_reader)
+                                                       grant_reader=self.grant_reader,
+                                                       grant_writer=self.grant_writer)
         if not design.tables:
             raise CreationRefused(f"A database named '{design.database}' already exists and no tables were "
                                   "asked for; nothing is overwritten. Ask for tables to add, or choose another name.")

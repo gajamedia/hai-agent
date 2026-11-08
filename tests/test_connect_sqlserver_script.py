@@ -27,7 +27,10 @@ class FakeCursor:
         elif sql.startswith("SELECT name FROM sys.databases"):
             self.rows = [("dbsales",)]
         elif sql.startswith("SELECT permission_name"):
-            self.rows = [("CONNECT SQL",), ("CREATE ANY DATABASE",)]
+            perms = (self.db.__dict__.get("db_perms", ["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE"])
+                     if "'DATABASE'" in sql
+                     else self.db.__dict__.get("server_perms", ["CONNECT SQL", "CREATE ANY DATABASE"]))
+            self.rows = [(p,) for p in perms]
         elif sql.startswith("SELECT CAST(IS_SRVROLEMEMBER"):
             self.rows = [(0,) * 8]
         elif sql.startswith("SELECT COUNT(*)"):
@@ -290,3 +293,51 @@ def test_a_server_name_that_cannot_be_a_profile_is_refused_before_anything_is_wr
     code, text = run_remote(tmp_path, fake, ["--server", "db;Trusted_Connection=yes", "--admin-user", "sa",
                                              "--create-reader", "--database", "dbsales"])
     assert code != 0 and not (tmp_path / "profiles.json").exists()
+
+
+def _writer_run(tmp_path, fake, extra, answers=("y",)):
+    return run(tmp_path, fake, ["--create-writer", *extra], answers=answers)
+
+
+def test_create_writer_gives_data_rights_in_one_database_and_adds_a_writer_block(tmp_path):
+    path = _profile_file(tmp_path)
+    fake = FakePyodbc(server_perms=["CONNECT SQL"])
+    code, text = _writer_run(tmp_path, fake, ["--database", "dbsales"])
+    assert code == 0 and "can change data in this database and holds nothing else" in text
+    done = [(db, s) for db, s in fake.shared["executed"] if not s.startswith("SELECT")]
+    assert any("CREATE LOGIN [hai_sql_writer]" in s for _, s in done)
+    assert any(db == "dbsales" and "db_datareader" in s for db, s in done)
+    assert any(db == "dbsales" and "db_datawriter" in s for db, s in done)
+    assert not any("db_owner" in s or "db_ddladmin" in s or "sysadmin" in s for _, s in done)
+    block = json.loads(path.read_text("utf-8"))["local_sqlserver"]["writer"]
+    assert block == {"user": "hai_sql_writer", "password_env": "HAI_LOCAL_SQLSERVER_WRITER_PASSWORD"}
+    password = (tmp_path / ".env").read_text("utf-8").split("HAI_LOCAL_SQLSERVER_WRITER_PASSWORD=")[1].strip()
+    assert password not in path.read_text("utf-8") and password not in text
+    from api.database_engines import parse_profiles
+    assert parse_profiles(json.loads(path.read_text("utf-8")))["local_sqlserver"].writer_user == "hai_sql_writer"
+
+
+def test_create_writer_does_not_pass_its_own_safety_check_if_the_login_could_do_more(tmp_path):
+    _profile_file(tmp_path)
+    fake = FakePyodbc(server_perms=["CONNECT SQL"], db_perms=["CONNECT", "SELECT", "INSERT", "UPDATE", "DELETE", "ALTER"])
+    code, text = _writer_run(tmp_path, fake, ["--database", "dbsales"])
+    assert code != 0 and "did not pass the safety check" in text
+
+
+@pytest.mark.parametrize("shared,answers,extra_argv,needle", [
+    ({"windows_only": 1}, ("y",), ["--database", "dbsales"], "Windows logins only"),
+    ({"admin": 0}, ("y",), ["--database", "dbsales"], "not an administrator"),
+    ({}, ("n",), ["--database", "dbsales"], "Nothing changed"),
+    ({}, ("y",), [], "needs --database"),
+    ({}, ("y",), ["--database", "other"], "not found"),
+    ({}, ("y",), ["--database", "dbsales", "--writer-user", "hai_sql_reader"], "different login"),
+    ({}, ("y",), ["--database", "dbsales", "--writer-user", "x]; DROP"], "letters, digits"),
+    ({}, ("y",), ["--database", "dbsales", "--profile", "nope_such"], "not a SQL Server profile"),
+])
+def test_create_writer_refuses_or_stops_without_changes(tmp_path, shared, answers, extra_argv, needle):
+    _profile_file(tmp_path)
+    fake = FakePyodbc(**shared)
+    code, text = _writer_run(tmp_path, fake, extra_argv, answers=answers)
+    assert code != 0 and needle in text
+    assert not any(s.startswith(("CREATE", "GRANT", "IF", "ALTER")) for _, s in fake.shared["executed"])
+    assert not (tmp_path / ".env").exists()

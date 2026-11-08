@@ -173,11 +173,14 @@ class SQLServerProfile:
     creator_user: str = ""
     creator_password_env: str = ""
     creator_prefix: str = "hai_"
+    # Optional third login that may INSERT/UPDATE/DELETE. The reader above never can.
+    writer_user: str = ""
+    writer_password_env: str = ""
 
 
 _COMMON = {"type", "host", "port", "database", "user", "password_env", "statement_timeout_ms"}
 _EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl", "writer", "creator"},
-          "sqlserver": {"server", "schema", "ssl", "driver", "creator"}}
+          "sqlserver": {"server", "schema", "ssl", "driver", "creator", "writer"}}
 _DEFAULT_PORT = {"postgresql": 5432, "mysql": 3306, "sqlserver": 0}
 _MSSQL_SERVER = re.compile(r"^[A-Za-z0-9_.\-\\()]{1,100}$")
 _MSSQL_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
@@ -225,9 +228,19 @@ def parse_profiles(data: Any) -> dict[str, Any]:
                                       '{"user": "...", "password_env": "...", "prefix": "hai_"}')
                 if creator and str(creator["user"]).strip() == common["user"]:
                     raise EngineError(f"profile {name!r}: the creator must be its own login")
+                writer = raw.get("writer") or {}
+                if writer and (not isinstance(writer, Mapping) or set(writer) - {"user", "password_env"}
+                               or not writer.get("user") or not writer.get("password_env")
+                               or not _MSSQL_NAME.match(str(writer.get("user")))):
+                    raise EngineError(f"profile {name!r}: writer must be "
+                                      '{"user": "...", "password_env": "..."}')
+                if writer and str(writer["user"]).strip() in {common["user"], str(creator.get("user", ""))}:
+                    raise EngineError(f"profile {name!r}: the writer must be its own login")
                 profile = SQLServerProfile(
                     **common, schema=str(raw.get("schema", "dbo")), ssl=str(raw.get("ssl", "require")),
                     driver=str(raw.get("driver", "")).strip(),
+                    writer_user=str(writer.get("user", "")).strip(),
+                    writer_password_env=str(writer.get("password_env", "")).strip(),
                     creator_user=str(creator.get("user", "")).strip(),
                     creator_password_env=str(creator.get("password_env", "")).strip(),
                     creator_prefix=str(creator.get("prefix", "hai_")))
@@ -730,6 +743,27 @@ def check_sqlserver_creator_permissions(server_permissions: list[str], server_ro
         raise EngineError("the creator login cannot create databases (GRANT CREATE ANY DATABASE)")
 
 
+_MSSQL_WRITER_DB_ALLOWED = _MSSQL_DB_ALLOWED | {"INSERT", "UPDATE", "DELETE"}
+
+
+def check_sqlserver_writer_permissions(database_permissions: list[str], server_permissions: list[str],
+                                       server_roles: list[str] = ()) -> None:
+    """The writer may SELECT, INSERT, UPDATE and DELETE inside its one database, and nothing else:
+    no schema changes, no EXECUTE, no ownership, no server-wide rights or roles."""
+    if server_roles:
+        raise EngineError("the writer login belongs to the server role(s) " + ", ".join(server_roles)
+                          + "; use a login with data rights on one database only")
+    excess = {p.upper() for p in database_permissions} - _MSSQL_WRITER_DB_ALLOWED
+    if excess:
+        raise EngineError("the writer account may change data only (it can do more: "
+                          + ", ".join(sorted(excess)[:5]) + ")")
+    excess = {p.upper() for p in server_permissions} - _MSSQL_SERVER_ALLOWED
+    if excess:
+        raise EngineError("the writer login holds server-wide rights (" + ", ".join(sorted(excess)[:5]) + ")")
+    if not {"INSERT", "UPDATE", "DELETE"} <= {p.upper() for p in database_permissions}:
+        raise EngineError("the writer account cannot change data (needs INSERT, UPDATE and DELETE on its database)")
+
+
 def _odbc_value(value: str) -> str:
     """Braces make an ODBC value literal, so a password with ; or = cannot add keywords."""
     return "{" + value.replace("}", "}}") + "}"
@@ -770,6 +804,42 @@ class SQLServerEngine:
     def has_creator(self, name: str) -> bool:
         profile = self.profiles.get(name)
         return bool(profile and profile.creator_user and profile.creator_password_env)
+
+    def has_writer(self, source: str) -> bool:
+        profile = self._resolve(source)
+        return bool(profile and profile.writer_user and profile.writer_password_env)
+
+    # SELECT TOP (n) ... FROM [t] WITH (UPDLOCK, ROWLOCK): the rows the change will touch stay locked
+    lock_clause = " WITH (UPDLOCK, ROWLOCK)"
+
+    def open_writer(self, source: str):
+        """A function opening write-capable connections (a transaction each) for the profile's writer login.
+
+        Verified once, here: only data rights on the profile's database. The reader is never reused to write."""
+        profile = self._resolve(source)
+        if profile is None or not self.has_writer(source):
+            raise EngineError("this database profile has no writer account configured")
+        if not os.environ.get(profile.writer_password_env):
+            raise EngineError(f"environment variable {profile.writer_password_env} is not set")
+        connect, driver = self._driver(profile)
+        timeout_s = max(1, profile.statement_timeout_ms // 1000)
+        text = self._connection_string(profile, driver, user=profile.writer_user,
+                                       password_env=profile.writer_password_env)
+
+        def factory():
+            conn = connect(text, timeout=5)          # autocommit off: one transaction per change
+            conn.timeout = timeout_s
+            return conn
+
+        connection = factory()
+        try:
+            rows = PostgresEngine._rows
+            db_perms = [r[0] for r in rows(connection, "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'DATABASE')")]
+            server_perms = [r[0] for r in rows(connection, "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'SERVER')")]
+            check_sqlserver_writer_permissions(db_perms, server_perms, _server_roles(connection))
+        finally:
+            connection.close()
+        return factory
 
     def _driver(self, profile: SQLServerProfile):
         connect, driver = self._connect, profile.driver or "ODBC Driver 17 for SQL Server"
@@ -889,5 +959,6 @@ class SQLServerEngine:
 
 __all__ = ["EngineError", "MySQLEngine", "check_mysql_writer_grants", "check_mysql_creator_grants", "MySQLProfile", "PostgresEngine", "PostgresProfile",
            "SQLiteEngine", "SQLServerEngine", "SQLServerProfile", "check_mysql_grants",
-           "check_sqlserver_permissions", "check_sqlserver_creator_permissions", "map_sqlserver_type", "load_profiles", "map_mysql_type",
+           "check_sqlserver_permissions", "check_sqlserver_creator_permissions", "check_sqlserver_writer_permissions",
+           "map_sqlserver_type", "load_profiles", "map_mysql_type",
            "map_postgres_type", "map_sqlite_type", "parse_profiles"]

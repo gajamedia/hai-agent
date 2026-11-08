@@ -466,4 +466,27 @@ Differences from MySQL you should know:
   not apply.
 * Adding tables to a database the agent did not make is refused (the creator has no access to it).
 
-Not available for SQL Server yet: changing data (insert, update, delete) from the agent (MySQL only).
+### Changing data on SQL Server (the "Ubah data" page)
+
+```powershell
+python scripts\connect_sqlserver.py --create-writer --database <name>     # after --create-reader made the profile
+```
+
+This creates a login that can `SELECT`, `INSERT`, `UPDATE` and `DELETE` in that ONE database (`db_datareader` and
+`db_datawriter`) and nothing else (no schema changes, no `EXECUTE`, no server rights or roles), stores its password
+in `.env` and adds a `writer` block to the profile. Restart the backend, then in Data Reports open **Ubah
+persetujuan** and tick **boleh diubah** (and Tambah/Ubah/Hapus) per table. After that **Ubah data** lists the
+database next to the MySQL ones; everything works as in section 6: preview with before/after rows, your own row
+limit, the typed phrase, a fresh Keycloak login, a second person for deletes, an audit line with the deleted rows.
+
+* Run the command again with another `--database` to give the same login access to one more database, for
+  example one the agent created before the writer existed. Databases the agent creates afterwards give the
+  writer access automatically (if the profile has a writer at that time).
+* The reader and the writer are different logins. The reader never writes, even on a connection approved for
+  changes.
+* A table needs an `IDENTITY` numeric key to accept inserts (tables made by *Buat database* have one). The key
+  column is never writable.
+* The check on the writer is strict: a login that is `db_owner`, belongs to a server role (`sysadmin`,
+  `dbcreator`, ...) or can alter schema is refused with the reason.
+* "boleh diubah" grants the writer's rights on the whole database to the *login*; the application, not SQL
+  Server, limits which tables, columns and operations a change may use.

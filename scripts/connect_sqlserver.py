@@ -3,6 +3,7 @@
     python scripts/connect_sqlserver.py                                 # diagnose and test the connection
     python scripts/connect_sqlserver.py --create-reader --database dbsales
     python scripts/connect_sqlserver.py --create-creator                # lets the agent create databases
+    python scripts/connect_sqlserver.py --create-writer --database dbsales   # lets the agent change data
     python scripts/connect_sqlserver.py --server "10.62.10.34,1433" --admin-user sa --create-reader --database db1
 
 Diagnose (changes nothing):
@@ -28,6 +29,15 @@ Diagnose (changes nothing):
   * writes its password into .env and a "creator" block into the profile that --create-reader made.
   SQL Server cannot limit that permission to names starting with a prefix, so the application enforces the
   prefix (default hai_) and the databases it makes give the read-only login read access, nothing more.
+
+--create-writer --database <name> (same checks, same confirmation) lets the "Ubah data" page change data:
+  * creates a login that can SELECT, INSERT, UPDATE and DELETE in that ONE database (db_datareader and
+    db_datawriter) and nothing else: no schema changes, no EXECUTE, no server rights;
+  * writes its password into .env and a "writer" block into the profile. Run it again with another --database
+    to give the same login access to one more database (for example one the agent created before the writer
+    existed; databases created afterwards get the access automatically).
+  The application still limits which tables, columns and operations may be changed, previews every change,
+  needs a typed phrase and a fresh login, and asks a second person to approve deletes.
 """
 from __future__ import annotations
 
@@ -325,6 +335,79 @@ def create_creator(*, admin_connect: Callable[[str], Any], creator_connect: Call
     return 0
 
 
+def plan_writer_statements(login: str, database: str, password: str) -> dict[str, list[str]]:
+    for name in (login, database):
+        if not _IDENT.match(name):
+            raise SetupError(f"'{name}': letters, digits and _ only, starting with a letter")
+    return {
+        "master": [f"IF SUSER_ID(N'{login}') IS NULL CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', "
+                   "CHECK_POLICY = OFF, DEFAULT_DATABASE = [master] "
+                   f"ELSE ALTER LOGIN [{login}] WITH PASSWORD = N'{password}'"],
+        database: [
+            f"IF USER_ID(N'{login}') IS NULL CREATE USER [{login}] FOR LOGIN [{login}]",
+            f"ALTER ROLE [db_datareader] ADD MEMBER [{login}]",
+            f"ALTER ROLE [db_datawriter] ADD MEMBER [{login}]",
+        ],
+    }
+
+
+def create_writer(*, admin_connect: Callable[[str], Any], writer_connect: Callable[[str, str, str], Any],
+                  login: str, database: str, profile: str, info: dict[str, Any], env_path: Path,
+                  profiles_path: Path, ask: Callable[[str], str], out: Callable[[str], None]) -> int:
+    from api.database_engines import _server_roles, check_sqlserver_writer_permissions
+    if info["windows_only"]:
+        raise SetupError("This instance accepts Windows logins only, so a SQL login cannot be created. Enable "
+                         "'SQL Server and Windows Authentication mode' and restart the SQL Server service first.")
+    if not info["is_admin"]:
+        raise SetupError("Your Windows login is not an administrator (sysadmin) of this instance.")
+    if database not in info["databases"]:
+        raise SetupError(f"database '{database}' not found. Available: {', '.join(info['databases']) or '(none)'}")
+    profiles = json.loads(profiles_path.read_text("utf-8-sig")) if profiles_path.exists() else {}
+    existing = profiles.get(profile)
+    if not isinstance(existing, dict) or existing.get("type") != "sqlserver":
+        raise SetupError(f"profile '{profile}' is not a SQL Server profile in {profiles_path.name}. Run "
+                         "--create-reader first (or pass --profile with the name it created).")
+    if login in {existing.get("user"), existing.get("creator", {}).get("user")}:
+        raise SetupError("the writer must be a different login than the read-only and the creator login")
+    password = generate_password()
+    plan = plan_writer_statements(login, database, password)
+    env_var = f"HAI_{profile.upper()}_WRITER_PASSWORD"
+    out(f"\nPlan on this server for profile '{profile}':")
+    out(f"  1. create (or reset the password of) the SQL login '{login}' with a random password")
+    out(f"  2. let it SELECT, INSERT, UPDATE and DELETE in the database '{database}' only (no schema changes,")
+    out("     no EXECUTE, no server rights, no other database)")
+    out(f"  3. write the password to {env_path.name} as {env_var} and a writer block to {profiles_path.name}")
+    if ask("Continue? [y/N] ").strip().lower() != "y":
+        out("Nothing changed.")
+        return 1
+    for target, statements in plan.items():
+        conn = admin_connect(target)
+        conn.autocommit = True
+        cur = conn.cursor()
+        for sql in statements:
+            cur.execute(sql)
+        conn.close()
+    set_env_value(env_path, env_var, password)
+    existing["writer"] = {"user": login, "password_env": env_var}
+    profiles_path.write_text(json.dumps(profiles, indent=2) + "\n", encoding="utf-8")
+    out(f"[ok] login ready; password stored in {env_path.name}, writer block in profile '{profile}'")
+    check = writer_connect(database, login, password)
+    cur = check.cursor()
+    cur.execute("SELECT permission_name FROM sys.fn_my_permissions(NULL, 'DATABASE')")
+    db_perms = [row[0] for row in cur.fetchall()]
+    cur.execute("SELECT permission_name FROM sys.fn_my_permissions(NULL, 'SERVER')")
+    server_perms = [row[0] for row in cur.fetchall()]
+    roles = _server_roles(check)
+    check.close()
+    try:
+        check_sqlserver_writer_permissions(db_perms, server_perms, roles)
+    except Exception as exc:  # noqa: BLE001
+        raise SetupError(f"the new login did not pass the safety check: {exc}") from exc
+    out("[ok] the login can change data in this database and holds nothing else. Restart the backend, then "
+        "approve 'boleh diubah' per table in Data Reports (Ubah persetujuan).")
+    return 0
+
+
 # ------------------------------------------------------------------ main
 def _default_profiles(env_path: Path) -> Path:
     value = os.getenv("HAI_DATABASE_PROFILES", "")
@@ -347,6 +430,8 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
     parser.add_argument("--create-reader", action="store_true")
     parser.add_argument("--create-creator", action="store_true", help="let the agent create databases (CREATE ANY DATABASE)")
     parser.add_argument("--creator-user", default="hai_sql_creator")
+    parser.add_argument("--create-writer", action="store_true", help="let the agent change data (needs --database)")
+    parser.add_argument("--writer-user", default="hai_sql_writer")
     parser.add_argument("--database", default="", help="database the read-only account may read")
     parser.add_argument("--user", default="hai_sql_reader")
     parser.add_argument("--profile", default="local_sqlserver")
@@ -434,10 +519,24 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
         except SetupError as exc:
             out(f"\nerror: {exc}")
             return 1
+    if args.create_writer:
+        if not args.database:
+            out("\n--create-writer needs --database <name>.")
+            return 2
+        profiles_path = Path(args.profiles) if args.profiles else _default_profiles(Path(args.env))
+        try:
+            return create_writer(
+                admin_connect=connect_admin, writer_connect=lambda db, u, p: connect(db, u, p),
+                login=args.writer_user, database=args.database, profile=args.profile, info=info,
+                env_path=Path(args.env), profiles_path=profiles_path, ask=ask, out=out)
+        except SetupError as exc:
+            out(f"\nerror: {exc}")
+            return 1
     if not args.create_reader:
         out("\nTo create a read-only account and register it for the agent: "
             "python scripts\\connect_sqlserver.py --create-reader --database <name>\n"
-            "To let the agent create databases: python scripts\\connect_sqlserver.py --create-creator")
+            "To let the agent create databases: python scripts\\connect_sqlserver.py --create-creator\n"
+            "To let the agent change data: python scripts\\connect_sqlserver.py --create-writer --database <name>")
         return 0
     if not args.database:
         out("\n--create-reader needs --database <name>.")

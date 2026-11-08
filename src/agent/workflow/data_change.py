@@ -90,10 +90,12 @@ class ChangeResult:
 class ChangeSqlBuilder:
     """Parameterized statements. Identifiers are checked and quoted; values are always bound."""
 
-    def __init__(self, *, quote: str, paramstyle: str) -> None:
+    def __init__(self, *, quote: str, paramstyle: str, dialect: str = "limit") -> None:
         if paramstyle not in {"qmark", "format"}:
             raise ValueError("paramstyle must be 'qmark' or 'format'")
-        self.quote, self.paramstyle = quote, paramstyle
+        if dialect not in {"limit", "top"}:
+            raise ValueError("dialect must be 'limit' or 'top'")
+        self.quote, self.paramstyle, self.dialect = quote, paramstyle, dialect
 
     def _adapter(self, table: str, column: str) -> BusinessDatabaseAdapter:
         spec = ReadOnlyTableSpec(table=table, columns=(column,), filterable_columns=(column,))
@@ -124,9 +126,11 @@ class ChangeSqlBuilder:
                lock: str = "") -> tuple[str, list[Any]]:
         adapter, params, bind = self._statement(table, conditions)
         q = adapter._q
-        sql = (f"SELECT {', '.join(q(c) for c in columns)} FROM {q(table)}"
-               f"{self._where(adapter, bind, conditions)} LIMIT {int(limit)}{lock}")
-        return sql, params
+        names = ', '.join(q(c) for c in columns)
+        where = self._where(adapter, bind, conditions)
+        if self.dialect == "top":     # SQL Server: TOP after SELECT, the lock as a table hint after the table
+            return f"SELECT TOP ({int(limit)}) {names} FROM {q(table)}{lock}{where}", params
+        return f"SELECT {names} FROM {q(table)}{where} LIMIT {int(limit)}{lock}", params
 
     def update(self, table: str, set_values, conditions) -> tuple[str, list[Any]]:
         adapter, params, bind = self._statement(table, conditions)
@@ -145,6 +149,15 @@ class ChangeSqlBuilder:
         q = adapter._q
         groups = ", ".join("(" + ", ".join(bind(row.get(c)) for c in columns) + ")" for row in rows)
         return f"INSERT INTO {q(table)} ({', '.join(q(c) for c in columns)}) VALUES {groups}", params
+
+
+    def insert_chunks(self, table: str, columns: Sequence[str], rows, *, max_params: int = 2000,
+                      max_rows: int = 1000) -> list[tuple[str, list[Any]]]:
+        """One INSERT per chunk. SQL Server accepts at most 2,100 parameters and 1,000 rows per statement;
+        every chunk runs in the caller's one transaction."""
+        per = max(1, min(max_rows, max_params // max(1, len(columns))))
+        rows = list(rows)
+        return [self.insert(table, columns, rows[i:i + per]) for i in range(0, len(rows), per)]
 
 
 # ------------------------------------------------------------------------ planning
@@ -281,10 +294,10 @@ class DataChangeService:
     """Preview and execute validated changes with a write-capable connection."""
 
     def __init__(self, *, planner: DataChangePlanner, connect: Callable[[], Any], quote: str,
-                 paramstyle: str, audit_path: Path, lock_clause: str = " FOR UPDATE",
+                 paramstyle: str, audit_path: Path, lock_clause: str = " FOR UPDATE", dialect: str = "limit",
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.planner, self._connect = planner, connect
-        self.builder = ChangeSqlBuilder(quote=quote, paramstyle=paramstyle)
+        self.builder = ChangeSqlBuilder(quote=quote, paramstyle=paramstyle, dialect=dialect)
         self.audit_path, self.lock_clause, self._clock = Path(audit_path), lock_clause, clock
         self._audit_lock = threading.Lock()
 
@@ -381,15 +394,20 @@ class DataChangeService:
                             f"{expected_rows} were shown. Nothing was changed; plan it again.")
                 if request.operation == "insert":
                     cols = sorted({c for row in request.rows for c, _ in row})
-                    sql, params = self.builder.insert(
-                        request.table, cols, [dict(row) for row in request.rows])
+                    rows = [dict(row) for row in request.rows]
+                    statements = (self.builder.insert_chunks(request.table, cols, rows)
+                                  if self.builder.dialect == "top"
+                                  else [self.builder.insert(request.table, cols, rows)])
                 elif request.operation == "update":
-                    sql, params = self.builder.update(request.table, request.set_values, request.conditions)
+                    statements = [self.builder.update(request.table, request.set_values, request.conditions)]
                 else:
-                    sql, params = self.builder.delete(request.table, request.conditions)
-                record.update(sql=sql, params=[_plain(p) for p in params])
-                cursor.execute(sql, params)
-                affected = cursor.rowcount
+                    statements = [self.builder.delete(request.table, request.conditions)]
+                sql, params = statements[0]
+                record.update(sql=sql, params=[_plain(p) for p in params], statements=len(statements))
+                affected = 0
+                for sql, params in statements:
+                    cursor.execute(sql, params)
+                    affected += cursor.rowcount
                 if affected != expected_rows:
                     raise ChangeRefused(
                         f"The statement touched {affected} rows, not the {expected_rows} that were shown. "
