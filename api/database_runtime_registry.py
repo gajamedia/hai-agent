@@ -52,7 +52,7 @@ from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
 from api.database_engines import (
-    EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, map_mysql_type, map_postgres_type,
+    EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, SQLServerEngine, map_mysql_type, map_postgres_type,
     map_sqlite_type,
 )
 
@@ -134,6 +134,8 @@ class DatabaseRuntimeRegistry:
             self._engines["postgresql"] = PostgresEngine(by_type["postgresql"])
         if "mysql" in by_type:
             self._engines["mysql"] = MySQLEngine(by_type["mysql"])
+        if "sqlserver" in by_type:
+            self._engines["sqlserver"] = SQLServerEngine(by_type["sqlserver"])
         if engines:
             self._engines.update(engines)
         self._connections: dict[str, _Connection] = {}
@@ -313,8 +315,8 @@ class DatabaseRuntimeRegistry:
     def supported_engine_names(self) -> list[str]:
         """Product names users might type when asking for an engine (already supported ones)."""
         aliases = {"sqlite": ["sqlite"], "postgresql": ["postgresql", "postgres"],
-                   "mysql": ["mysql", "mariadb"]}
-        return sorted({alias for kind in {"sqlite", "postgresql", "mysql"}
+                   "mysql": ["mysql", "mariadb"], "sqlserver": ["sqlserver", "sql server", "mssql"]}
+        return sorted({alias for kind in {"sqlite", "postgresql", "mysql", "sqlserver"}
                        for alias in aliases[kind]})
 
     def available_engines(self) -> list[str]:

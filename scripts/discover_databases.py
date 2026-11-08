@@ -13,7 +13,8 @@ What it does, and what it deliberately does NOT do:
     the name of the environment variable that will hold the password). It never writes a password and
     never asks for one. The next step it prints creates the read-only account (setup_mysql_readonly_user.py
     asks for the administrator password once, in the terminal, and does not keep it).
-  * SQL Server is detected and reported only: the agent has no SQL Server engine yet, so no profile is written.
+  * SQL Server is detected and reported only: register it with scripts/connect_sqlserver.py, which also creates
+    the read-only login (a SQL Server profile needs a server name such as (local)\\SQLEXPRESS, not a port).
   * SQLite files are listed, with whether they sit inside HAI_DATABASE_ROOT (the only place the agent reads).
 """
 from __future__ import annotations
@@ -236,7 +237,7 @@ def build_report(found: list[Found], services: dict[str, list[str]], profiles: d
         name = is_registered(profiles, hit)
         status = f"registered as profile '{name}'" if name else "NOT registered"
         if hit.kind == "sqlserver":
-            status = "detected; the agent has no SQL Server engine yet, so it cannot be registered"
+            status = "detected; register it with: python scripts\\connect_sqlserver.py --create-reader --database <name>"
         lines.append(f"  - {hit.detail} at {hit.host}:{hit.port}: {status}")
     for kind, names in sorted(services.items()):
         if not any(f.kind == kind for f in found):

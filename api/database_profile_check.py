@@ -10,10 +10,11 @@ import os
 from typing import Any, Mapping
 
 from agent.database import ConnectionManager
-from api.database_engines import EngineError, MySQLEngine, PostgresEngine
+from api.database_engines import EngineError, MySQLEngine, PostgresEngine, SQLServerEngine
 
-_ENGINES = {"mysql": MySQLEngine, "postgresql": PostgresEngine}
-_DRIVER_HINT = {"mysql": 'pip install "PyMySQL>=1.1,<2"', "postgresql": 'pip install "psycopg[binary]>=3.2,<4"'}
+_ENGINES = {"mysql": MySQLEngine, "postgresql": PostgresEngine, "sqlserver": SQLServerEngine}
+_DRIVER_HINT = {"mysql": 'pip install "PyMySQL>=1.1,<2"', "postgresql": 'pip install "psycopg[binary]>=3.2,<4"',
+              "sqlserver": 'pip install "pyodbc>=5,<6" (and Microsoft ODBC Driver 17 or 18 for SQL Server)'}
 
 # MySQL / MariaDB client error numbers -> what to do about them.
 _MYSQL_HINTS = {
@@ -35,6 +36,13 @@ def _hint(exc: BaseException) -> str:
     if code in _MYSQL_HINTS:
         return _MYSQL_HINTS[code]
     text = str(exc).lower()
+    if "18456" in text or "login failed" in text:
+        return "SQL Server refused the login: wrong user or password, or the instance accepts Windows logins only"
+    if "4060" in text or "cannot open database" in text:
+        return "the login cannot open that database (does it exist, and does the login have a user in it?)"
+    if "does not exist or access denied" in text or "named pipes" in text or "shared memory" in text:
+        return ("SQL Server is not reachable with that server name (service running? for another computer, "
+                "TCP/IP must be enabled and the name or port correct)")
     if "ssl" in text or "tls" in text:
         return "a TLS problem: check the profile's ssl/sslmode and that the server offers encryption"
     if "password authentication failed" in text:
@@ -50,7 +58,8 @@ def check_profile(name: str, profiles: Mapping[str, Any]) -> tuple[bool, list[st
         available = ", ".join(sorted(profiles)) or "(none)"
         return False, [f"[FAIL] no profile named '{name}'. Profiles in the file: {available}"]
     profile = profiles[name]
-    lines = [f"[ok]   profile '{name}': {profile.type} at {profile.host}:{profile.port}, "
+    where = f"{profile.host}:{profile.port}" if profile.port else profile.host
+    lines = [f"[ok]   profile '{name}': {profile.type} at {where}, "
              f"database '{profile.database}', user '{profile.user}'"]
     if not os.environ.get(profile.password_env):
         lines.append(f"[FAIL] environment variable {profile.password_env} is not set or empty. "

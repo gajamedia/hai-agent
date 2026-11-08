@@ -101,7 +101,7 @@ SQLSERVER = tool.Found("sqlserver", "127.0.0.1", 1433, "Microsoft SQL Server")
 
 def test_looking_only_reports_and_writes_nothing(tmp_path):
     code, text, profiles = _run(tmp_path, [MYSQL, SQLSERVER], [])
-    assert code == 0 and "MySQL 8.0.36" in text and "NOT registered" in text and "no SQL Server engine" in text
+    assert code == 0 and "MySQL 8.0.36" in text and "NOT registered" in text and "connect_sqlserver.py" in text
     assert "--add" in text and not profiles.exists()
 
 

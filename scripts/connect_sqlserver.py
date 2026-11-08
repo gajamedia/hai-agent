@@ -13,14 +13,12 @@ Diagnose (changes nothing):
 --create-reader (after showing the plan and asking for a yes):
   * creates a SQL login with a random password, a user for it in ONE database, and gives it read-only access
     (db_datareader) while explicitly denying writes and schema changes;
-  * writes the password into .env (variable HAI_<PROFILE>_PASSWORD) and the connection details, without the
-    password, into data/reports/sqlserver_connections.json;
+  * writes the password into .env (variable HAI_<PROFILE>_PASSWORD) and a profile, without the password, into
+    profiles.json (HAI_DATABASE_PROFILES), which makes it appear in the Data Reports profile list after the
+    backend restarts;
   * verifies the account: it can read, and a write is refused.
   It needs an instance that accepts SQL logins (mixed mode) and you being an administrator of it. It never
   changes server settings, never enables TCP/IP and never touches any other database.
-
-The agent has no SQL Server engine yet, so nothing is written to profiles.json (an unknown type there would
-stop the whole app from starting). This script prepares the safe account and the connection details.
 """
 from __future__ import annotations
 
@@ -169,7 +167,7 @@ def plan_statements(login: str, database: str, password: str) -> dict[str, list[
 
 def create_reader(*, admin_connect: Callable[[str], Any], reader_connect: Callable[[str, str, str], Any],
                   database: str, login: str, profile: str, server: str, info: dict[str, Any],
-                  env_path: Path, details_path: Path, ask: Callable[[str], str],
+                  env_path: Path, profiles_path: Path, ask: Callable[[str], str],
                   out: Callable[[str], None]) -> int:
     if info["windows_only"]:
         raise SetupError("This instance accepts Windows logins only, so a SQL login cannot be created. Enable "
@@ -187,8 +185,8 @@ def create_reader(*, admin_connect: Callable[[str], Any], reader_connect: Callab
     out(f"  1. create (or reset the password of) the SQL login '{login}' with a random password")
     out(f"  2. give it read-only access to the database '{database}' only (read yes; insert, update, delete,")
     out("     schema changes denied)")
-    out(f"  3. write the password to {env_path.name} as HAI_{profile.upper()}_PASSWORD and the connection details")
-    out(f"     (no password) to {details_path.name}")
+    out(f"  3. write the password to {env_path.name} as HAI_{profile.upper()}_PASSWORD and the profile '{profile}'")
+    out(f"     (no password) to {profiles_path.name}")
     if ask("Continue? [y/N] ").strip().lower() != "y":
         out("Nothing changed.")
         return 1
@@ -206,12 +204,12 @@ def create_reader(*, admin_connect: Callable[[str], Any], reader_connect: Callab
     conn.close()
     env_var = f"HAI_{profile.upper()}_PASSWORD"
     set_env_value(env_path, env_var, password)
-    details = json.loads(details_path.read_text("utf-8")) if details_path.exists() else {}
-    details[profile] = {"type": "sqlserver", "server": server, "database": database, "user": login,
-                        "password_env": env_var}
-    details_path.parent.mkdir(parents=True, exist_ok=True)
-    details_path.write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
-    out(f"[ok] account created; password stored in {env_path.name}, details in {details_path.name}")
+    profiles = json.loads(profiles_path.read_text("utf-8-sig")) if profiles_path.exists() else {}
+    profiles[profile] = {"type": "sqlserver", "server": server, "database": database, "user": login,
+                         "password_env": env_var, "ssl": "require"}
+    profiles_path.parent.mkdir(parents=True, exist_ok=True)
+    profiles_path.write_text(json.dumps(profiles, indent=2) + "\n", encoding="utf-8")
+    out(f"[ok] account created; password stored in {env_path.name}, profile '{profile}' in {profiles_path.name}")
 
     reader = reader_connect(database, login, password)
     cur = reader.cursor()
@@ -229,6 +227,15 @@ def create_reader(*, admin_connect: Callable[[str], Any], reader_connect: Callab
 
 
 # ------------------------------------------------------------------ main
+def _default_profiles(env_path: Path) -> Path:
+    value = os.getenv("HAI_DATABASE_PROFILES", "")
+    if not value and env_path.exists():
+        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            if line.startswith("HAI_DATABASE_PROFILES="):
+                value = line.partition("=")[2].strip().strip('"')
+    return Path(value) if value else ROOT / "data" / "reports" / "profiles.json"
+
+
 def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_reader=read_instances,
          service_state: Callable[[str], str] | None = None, ask: Callable[[str], str] = input,
          out: Callable[[str], None] = print) -> int:
@@ -240,7 +247,7 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
     parser.add_argument("--user", default="hai_sql_reader")
     parser.add_argument("--profile", default="local_sqlserver")
     parser.add_argument("--env", default=str(ROOT / ".env"))
-    parser.add_argument("--details", default=str(ROOT / "data" / "reports" / "sqlserver_connections.json"))
+    parser.add_argument("--profiles", default="", help="profiles JSON (default: HAI_DATABASE_PROFILES in .env)")
     args = parser.parse_args(argv)
 
     if service_state is None:
@@ -306,17 +313,18 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
         conn.close()
 
     if not args.create_reader:
-        out("\nTo create a read-only account for the agent: "
+        out("\nTo create a read-only account and register it for the agent: "
             "python scripts\\connect_sqlserver.py --create-reader --database <name>")
         return 0
     if not args.database:
         out("\n--create-reader needs --database <name>.")
         return 2
+    profiles_path = Path(args.profiles) if args.profiles else _default_profiles(Path(args.env))
     try:
         return create_reader(
             admin_connect=lambda db: connect(db), reader_connect=lambda db, u, p: connect(db, u, p),
             database=args.database, login=args.user, profile=args.profile, server=server, info=info,
-            env_path=Path(args.env), details_path=Path(args.details), ask=ask, out=out)
+            env_path=Path(args.env), profiles_path=profiles_path, ask=ask, out=out)
     except SetupError as exc:
         out(f"\nerror: {exc}")
         return 1

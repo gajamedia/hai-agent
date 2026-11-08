@@ -69,7 +69,7 @@ class FakePyodbc:
 
 def run(tmp_path, pyodbc, argv=(), answers=("y",), instances=(INSTANCE,)):
     lines, replies = [], iter(answers)
-    code = tool.main(["--env", str(tmp_path / ".env"), "--details", str(tmp_path / "d.json"), *argv],
+    code = tool.main(["--env", str(tmp_path / ".env"), "--profiles", str(tmp_path / "profiles.json"), *argv],
                      pyodbc_module=pyodbc, instances_reader=lambda: list(instances),
                      service_state=lambda name: "running", ask=lambda p: next(replies), out=lines.append)
     return code, "\n".join(lines)
@@ -82,7 +82,7 @@ def test_diagnose_reports_the_instance_the_login_and_the_databases_and_changes_n
     assert "an administrator" in text and "dbsales" in text
     assert "Trusted_Connection=yes" in fake.strings[0] and r"SERVER=(local)\SQLEXPRESS" in fake.strings[0]
     assert all(not sql.startswith(("CREATE", "ALTER")) for _, sql in fake.shared["executed"])
-    assert not (tmp_path / ".env").exists() and not (tmp_path / "d.json").exists()
+    assert not (tmp_path / ".env").exists() and not (tmp_path / "profiles.json").exists()
 
 
 def test_a_missing_driver_or_unreachable_server_is_explained(tmp_path):
@@ -102,9 +102,12 @@ def test_create_reader_makes_a_read_only_account_and_keeps_the_password_out_of_t
     env = (tmp_path / ".env").read_text("utf-8")
     password = env.split("HAI_LOCAL_SQLSERVER_PASSWORD=")[1].strip()
     assert len(password) == 24
-    details = (tmp_path / "d.json").read_text("utf-8")
+    details = (tmp_path / "profiles.json").read_text("utf-8")
     assert password not in details and json.loads(details)["local_sqlserver"]["user"] == "hai_sql_reader"
     assert password not in text
+    # the app accepts exactly what the script wrote
+    from api.database_engines import parse_profiles
+    assert parse_profiles(json.loads(details))["local_sqlserver"].host == r"(local)\SQLEXPRESS"
 
 
 def test_declining_changes_nothing(tmp_path):

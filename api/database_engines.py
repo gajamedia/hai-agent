@@ -78,6 +78,26 @@ def map_postgres_type(declared: str) -> str:
     return "string"
 
 
+_MSSQL_INTEGER = {"tinyint", "smallint", "int", "bigint"}
+_MSSQL_NUMBER = {"decimal", "numeric", "float", "real", "money", "smallmoney"}
+_MSSQL_DATETIME = {"datetime", "datetime2", "smalldatetime", "datetimeoffset"}
+
+
+def map_sqlserver_type(declared: str) -> str:
+    t = (declared or "").lower()
+    if t in _MSSQL_INTEGER:
+        return "integer"
+    if t in _MSSQL_NUMBER:
+        return "number"
+    if t == "bit":
+        return "boolean"
+    if t == "date":
+        return "date"
+    if t in _MSSQL_DATETIME:
+        return "datetime"
+    return "string"
+
+
 # ------------------------------------------------------------------ SQLite
 class SQLiteEngine:
     kind = "sqlite"
@@ -134,9 +154,30 @@ class MySQLProfile:
     creator_prefix: str = "hai_"
 
 
+@dataclass(frozen=True)
+class SQLServerProfile:
+    r"""``host`` is the server as ODBC writes it: ``(local)\SQLEXPRESS``, ``name\instance`` or a host name.
+    ``port`` 0 means "let the driver find it" (shared memory on this computer, or the SQL Browser)."""
+    name: str
+    host: str
+    port: int
+    database: str
+    user: str
+    password_env: str
+    schema: str = "dbo"
+    ssl: str = "require"
+    driver: str = ""
+    statement_timeout_ms: int = 15000
+    type: str = "sqlserver"
+
+
 _COMMON = {"type", "host", "port", "database", "user", "password_env", "statement_timeout_ms"}
-_EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl", "writer", "creator"}}
-_DEFAULT_PORT = {"postgresql": 5432, "mysql": 3306}
+_EXTRA = {"postgresql": {"schema", "sslmode"}, "mysql": {"ssl", "writer", "creator"},
+          "sqlserver": {"server", "schema", "ssl", "driver"}}
+_DEFAULT_PORT = {"postgresql": 5432, "mysql": 3306, "sqlserver": 0}
+_MSSQL_SERVER = re.compile(r"^[A-Za-z0-9_.\-\\()]{1,100}$")
+_MSSQL_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_MSSQL_DRIVER = re.compile(r"^[A-Za-z0-9 ._\-]{1,60}$")
 
 
 def parse_profiles(data: Any) -> dict[str, Any]:
@@ -156,8 +197,11 @@ def parse_profiles(data: Any) -> dict[str, Any]:
         if unknown:
             raise EngineError(f"profile {name!r}: unsupported fields {sorted(unknown)}")
         try:
+            if kind == "sqlserver" and "server" in raw and "host" in raw:
+                raise EngineError(f"profile {name!r}: give either server or host, not both")
+            host = raw["server"] if kind == "sqlserver" and "server" in raw else raw["host"]
             common = dict(
-                name=name, host=str(raw["host"]).strip(),
+                name=name, host=str(host).strip(),
                 port=int(raw.get("port", _DEFAULT_PORT[kind])),
                 database=str(raw["database"]).strip(), user=str(raw["user"]).strip(),
                 password_env=str(raw["password_env"]).strip(),
@@ -166,6 +210,10 @@ def parse_profiles(data: Any) -> dict[str, Any]:
                 profile = PostgresProfile(
                     **common, schema=str(raw.get("schema", "public")),
                     sslmode=str(raw.get("sslmode", "require")))
+            elif kind == "sqlserver":
+                profile = SQLServerProfile(
+                    **common, schema=str(raw.get("schema", "dbo")), ssl=str(raw.get("ssl", "require")),
+                    driver=str(raw.get("driver", "")).strip())
             else:
                 writer = raw.get("writer") or {}
                 if writer and (not isinstance(writer, Mapping) or set(writer) - {"user", "password_env"}
@@ -195,7 +243,7 @@ def parse_profiles(data: Any) -> dict[str, Any]:
             raise EngineError(f"profile {name!r} is incomplete or invalid: {exc}") from exc
         if not all((profile.host, profile.database, profile.user, profile.password_env)):
             raise EngineError(f"profile {name!r} has empty fields")
-        if not 1 <= profile.port <= 65535:
+        if not (0 if kind == "sqlserver" else 1) <= profile.port <= 65535:
             raise EngineError(f"profile {name!r}: invalid port")
         if not 100 <= profile.statement_timeout_ms <= 120000:
             raise EngineError(f"profile {name!r}: statement_timeout_ms out of range")
@@ -205,6 +253,18 @@ def parse_profiles(data: Any) -> dict[str, Any]:
             if profile.sslmode not in {"disable", "allow", "prefer", "require",
                                        "verify-ca", "verify-full"}:
                 raise EngineError(f"profile {name!r}: invalid sslmode")
+        elif kind == "sqlserver":
+            # These values go into an ODBC connection string, so only plain characters are allowed.
+            if not _MSSQL_SERVER.match(profile.host):
+                raise EngineError(f"profile {name!r}: invalid server name")
+            if not (_MSSQL_NAME.match(profile.database) and _MSSQL_NAME.match(profile.user)
+                    and _MSSQL_NAME.match(profile.schema)):
+                raise EngineError(f"profile {name!r}: database, user and schema use letters, digits and _ only")
+            if profile.driver and not _MSSQL_DRIVER.match(profile.driver):
+                raise EngineError(f"profile {name!r}: invalid driver name")
+            if profile.ssl not in {"require", "verify"}:
+                raise EngineError(f"profile {name!r}: ssl must be 'require' or 'verify' "
+                                  "(SQL Server connections are always encrypted)")
         elif profile.ssl not in {"require", "verify"}:
             raise EngineError(f"profile {name!r}: ssl must be 'require' or 'verify' "
                               "(MySQL connections are always encrypted)")
@@ -598,6 +658,141 @@ class MySQLEngine:
         return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
 
 
+# ----------------------------------------------------------------- SQL Server
+# Effective permissions the reading account may hold (database level, then server level).
+_MSSQL_DB_ALLOWED = {"CONNECT", "SELECT", "REFERENCES", "VIEW DEFINITION", "VIEW DATABASE STATE",
+                     "VIEW ANY COLUMN ENCRYPTION KEY DEFINITION", "VIEW ANY COLUMN MASTER KEY DEFINITION"}
+_MSSQL_SERVER_ALLOWED = {"CONNECT SQL", "VIEW ANY DATABASE"}
+
+
+def check_sqlserver_permissions(database_permissions: list[str], server_permissions: list[str],
+                                writable_tables: list[str]) -> None:
+    """Refuse any account that can do more than read. Session flags do not exist in SQL Server,
+    so this check (and a SELECT-only account) is the read-only guarantee, next to the SELECT-only
+    statements the adapter builds."""
+    excess = {p.upper() for p in database_permissions} - _MSSQL_DB_ALLOWED
+    if excess:
+        raise EngineError("the database account holds more than SELECT ("
+                          + ", ".join(sorted(excess)[:5]) + "); use a db_datareader-only login")
+    excess = {p.upper() for p in server_permissions} - _MSSQL_SERVER_ALLOWED
+    if excess:
+        raise EngineError("the login holds server-wide rights (" + ", ".join(sorted(excess)[:5])
+                          + "); use a login with read access to one database only")
+    if writable_tables:
+        raise EngineError("the database account can modify data (" + ", ".join(writable_tables[:5])
+                          + "); grant it SELECT only")
+
+
+def _odbc_value(value: str) -> str:
+    """Braces make an ODBC value literal, so a password with ; or = cannot add keywords."""
+    return "{" + value.replace("}", "}}") + "}"
+
+
+class SQLServerEngine:
+    kind = "sqlserver"
+    paramstyle = "qmark"
+    quote = "["
+    dialect = "top"          # SELECT TOP (n) ... instead of LIMIT n
+    map_type = staticmethod(map_sqlserver_type)
+
+    def __init__(self, profiles: Mapping[str, SQLServerProfile], *, connect=None) -> None:
+        self.profiles = dict(profiles)
+        self._connect = connect  # injectable for tests: connect(connection_string, timeout=...)
+
+    def _connection_string(self, profile: SQLServerProfile, driver: str) -> str:
+        server = f"{profile.host},{profile.port}" if profile.port else profile.host
+        trust = "no" if profile.ssl == "verify" else "yes"      # require: encrypted, certificate not verified
+        return (f"DRIVER={{{driver}}};SERVER={server};DATABASE={profile.database};UID={profile.user};"
+                f"PWD={_odbc_value(os.environ.get(profile.password_env, ''))};Encrypt=yes;"
+                f"TrustServerCertificate={trust};APP=hai-agent-reports")
+
+    def open(self, manager: ConnectionManager, name: str, source: str, auth_ref: str):
+        profile = self.profiles.get(source)
+        if profile is None:
+            raise EngineError("unknown database profile")
+        if not os.environ.get(profile.password_env):
+            raise EngineError(f"environment variable {profile.password_env} is not set")
+        connect, driver = self._connect, profile.driver or "ODBC Driver 17 for SQL Server"
+        if connect is None:
+            import pyodbc  # optional dependency, imported only when this engine is used
+            connect = pyodbc.connect
+            if not profile.driver:
+                installed = list(pyodbc.drivers())
+                driver = next((d for d in ("ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server",
+                                           "ODBC Driver 13 for SQL Server") if d in installed), "")
+                if not driver:
+                    raise EngineError("no 'ODBC Driver 17/18 for SQL Server' is installed on this computer")
+        timeout_s = max(1, profile.statement_timeout_ms // 1000)
+        text = self._connection_string(profile, driver)
+
+        def factory():
+            conn = connect(text, timeout=5)
+            conn.timeout = timeout_s          # query timeout, seconds
+            return conn
+
+        def guard(connection) -> None:
+            cur = connection.cursor()
+            try:
+                cur.execute("SELECT CAST(IS_SRVROLEMEMBER('sysadmin') AS int), CAST(IS_MEMBER('db_owner') AS int)")
+                row = cur.fetchone()
+            finally:
+                cur.close()
+            if not row or row[0] == 1 or row[1] == 1:
+                raise PermissionError("the SQL Server login is an administrator or database owner; "
+                                      "use a db_datareader-only login.")
+
+        manager.register(name=name, database="sqlserver", authorization_ref=auth_ref,
+                         connection_factory=factory, read_only_guard=guard,
+                         read_only=True, enabled=True)
+        with manager.connection(name) as connection:
+            self._check_account(connection, profile)
+            schema, skipped = self._discover(connection, name, profile)
+        return schema, _skipped_warning(skipped)
+
+    @staticmethod
+    def _check_account(connection, profile: SQLServerProfile) -> None:
+        rows = PostgresEngine._rows
+        db_perms = [r[0] for r in rows(connection, "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'DATABASE')")]
+        server_perms = [r[0] for r in rows(connection, "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'SERVER')")]
+        object_name = "QUOTENAME(s.name) + '.' + QUOTENAME(t.name)"
+        tests = " OR ".join(f"HAS_PERMS_BY_NAME({object_name}, 'OBJECT', '{p}') = 1"
+                            for p in ("INSERT", "UPDATE", "DELETE", "ALTER"))
+        writable = [r[0] for r in rows(
+            connection,
+            "SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id "
+            f"WHERE s.name = ? AND ({tests}) ORDER BY 1", (profile.schema,))]
+        check_sqlserver_permissions(db_perms, server_perms, writable)
+
+    @staticmethod
+    def _discover(connection, name: str, profile: SQLServerProfile):
+        rows = PostgresEngine._rows(
+            connection,
+            "SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE "
+            "FROM INFORMATION_SCHEMA.COLUMNS c JOIN INFORMATION_SCHEMA.TABLES t "
+            "ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME "
+            "AND t.TABLE_TYPE = 'BASE TABLE' WHERE c.TABLE_SCHEMA = ? "
+            "ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION", (profile.schema,))
+        pks = {(r[0], r[1]) for r in PostgresEngine._rows(
+            connection,
+            "SELECT t.name, c.name FROM sys.indexes i "
+            "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+            "JOIN sys.tables t ON t.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id "
+            "WHERE i.is_primary_key = 1 AND s.name = ?", (profile.schema,))}
+        tables: dict[str, list[SQLiteColumn]] = {}
+        skipped = 0
+        for table, column, data_type, nullable in rows:
+            if not (_usable(table) and _usable(column)):
+                skipped += 1
+                continue
+            tables.setdefault(table, []).append(SQLiteColumn(
+                name=column, declared_type=str(data_type), nullable=(nullable == "YES"),
+                primary_key=(table, column) in pks))
+        items = tuple(SQLiteTable(name=t, columns=tuple(c)) for t, c in sorted(tables.items()))
+        return SQLiteSchema(profile_name=name, tables=items[:MAX_TABLES]), skipped
+
+
 __all__ = ["EngineError", "MySQLEngine", "check_mysql_writer_grants", "check_mysql_creator_grants", "MySQLProfile", "PostgresEngine", "PostgresProfile",
-           "SQLiteEngine", "check_mysql_grants", "load_profiles", "map_mysql_type",
+           "SQLiteEngine", "SQLServerEngine", "SQLServerProfile", "check_mysql_grants",
+           "check_sqlserver_permissions", "map_sqlserver_type", "load_profiles", "map_mysql_type",
            "map_postgres_type", "map_sqlite_type", "parse_profiles"]
