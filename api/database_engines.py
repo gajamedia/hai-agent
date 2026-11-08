@@ -545,11 +545,13 @@ _ANY_DB_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
 
 def any_database_allowed() -> bool:
-    """HAI_ALLOW_ANY_DATABASE_NAME=true: READING may name any database on a server profile (default off).
+    """HAI_ALLOW_ANY_DATABASE_NAME=true: reading AND changing data may name any database on a server profile
+    (default off).
 
-    Meant for databases this application did not create. Only the read-only account ever connects to
-    such a database: it is still checked to hold SELECT and nothing more, and the server decides what it
-    can see. Writing and creating stay limited to the profile's own database and the creator prefix.
+    Meant for databases this application did not create. The read-only account is still checked to hold
+    SELECT and nothing more. Changing data uses the profile's separate writer account, which is still checked
+    to hold only SELECT/INSERT/UPDATE/DELETE, so the server's own grants decide which databases it can change.
+    Only creating databases stays limited to the creator prefix.
     """
     return os.environ.get("HAI_ALLOW_ANY_DATABASE_NAME", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -559,7 +561,7 @@ def _resolve_database(profile, database: str, *, for_write: bool):
     if (profile.creator_user and _DB_OVERRIDE.match(database)
             and database.startswith(profile.creator_prefix) and database != profile.creator_prefix):
         return replace(profile, database=database)
-    if not for_write and any_database_allowed() and _ANY_DB_NAME.match(database):
+    if any_database_allowed() and _ANY_DB_NAME.match(database):
         return replace(profile, database=database)
     raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
 
