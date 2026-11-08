@@ -224,8 +224,15 @@ export default function DataChanges() {
                 Database
                 <select value={database} onChange={(e) => setDatabase(e.target.value)} required>
                   <option value="">Pilih...</option>
-                  {databases.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
+                  {databases.map((d) => (
+                    <option key={d.name} value={d.name}>{d.database ? `${d.name} (${d.database})` : d.name}</option>
+                  ))}
                 </select>
+                <small>
+                  Hanya koneksi yang tabelnya sudah disetujui untuk diubah muncul di sini (MySQL, SQL Server, ...).
+                  Koneksi lain: di <Link to="/data-reports">Data Reports</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
+                  server juga butuh akun penulis di profilnya.
+                </small>
               </label>
             )}
             <label>

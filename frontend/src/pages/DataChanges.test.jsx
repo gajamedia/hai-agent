@@ -60,6 +60,21 @@ describe("DataChanges", () => {
     expect(screen.queryByRole("button", { name: /Buat rencana/ })).toBeNull();
   });
 
+  it("lists connections of every engine with the engine's name, so SQL Server can be picked next to MySQL", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({ connections: [
+      { name: "dbsales", database: "mysql", status: "active", tables: ["tb_bahan"], writable_tables: ["tb_bahan"] },
+      { name: "hai_hris", database: "sqlserver", status: "active", tables: ["tb_pegawai"], writable_tables: ["tb_pegawai"] },
+      { name: "readonly_pg", database: "postgresql", status: "active", tables: ["t"] }] });
+    renderPage();
+    const select = await screen.findByLabelText(/^Database/);
+    expect(screen.getByRole("option", { name: "dbsales (mysql)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "hai_hris (sqlserver)" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /readonly_pg/ })).toBeNull();      // nothing approved for changing
+    await user.selectOptions(select, "hai_hris");
+    expect(select.value).toBe("hai_hris");
+  });
+
   it("sends the user's own row limit, capped by the server ceiling shown to them", async () => {
     const user = userEvent.setup();
     renderPage();
