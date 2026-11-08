@@ -227,3 +227,13 @@ def test_create_creator_refuses_or_stops_without_changes(tmp_path, shared, answe
     assert code != 0 and needle in text
     assert not any(s.startswith(("CREATE", "GRANT", "IF", "ALTER")) for _, s in fake.shared["executed"])
     assert not (tmp_path / ".env").exists()
+
+
+def test_the_reader_plan_names_only_roles_that_exist_in_sql_server():
+    """db_denyddladmin does not exist; a fake connection let that through once."""
+    import re
+    fixed = {"db_accessadmin", "db_backupoperator", "db_datareader", "db_datawriter", "db_ddladmin",
+             "db_denydatareader", "db_denydatawriter", "db_owner", "db_securityadmin"}
+    plan = tool.plan_statements("hai_sql_reader", "dbsales", "x")
+    used = {m for sqls in plan.values() for s in sqls for m in re.findall(r"\[(db_[a-z]+)\]", s)}
+    assert used == {"db_datareader", "db_denydatawriter"} and used <= fixed

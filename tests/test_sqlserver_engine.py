@@ -424,3 +424,80 @@ def test_a_login_with_more_than_create_any_database_is_refused_as_creator(ms):
             ms.registry().database_creator("ms_creator")
     finally:
         ms.admin.execute(f"ALTER SERVER ROLE dbcreator DROP MEMBER [{ms.creator}]")
+
+
+@live
+def test_the_reader_plan_of_connect_sqlserver_works_on_a_real_server_and_is_read_only(ms):
+    """The statements the setup script runs, executed for real (a fake connection hid a missing role once)."""
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "scripts" / "connect_sqlserver.py"
+    spec = importlib.util.spec_from_file_location("connect_sqlserver_live", path)
+    tool = importlib.util.module_from_spec(spec)
+    _sys.modules["connect_sqlserver_live"] = tool
+    spec.loader.exec_module(tool)
+    login = f"sr_{uuid.uuid4().hex[:8]}"
+    password = tool.generate_password()
+    plan = tool.plan_statements(login, ms.db, password)
+    try:
+        for database, statements in plan.items():
+            ms.admin.execute(f"USE [{database}]")
+            for sql in statements:
+                ms.admin.execute(sql)
+        for database, statements in plan.items():          # running it again (a reset) must work as well
+            ms.admin.execute(f"USE [{database}]")
+            for sql in statements:
+                ms.admin.execute(sql)
+        ms.admin.execute("USE master")
+        from agent.database import ConnectionManager
+        import os as _os
+        _os.environ["HAI_TEST_MS_SCRIPT_PW"] = password
+        profile = parse_profiles({"sr": {"type": "sqlserver", "server": SERVER, "database": ms.db, "user": login,
+                                         "password_env": "HAI_TEST_MS_SCRIPT_PW"}})
+        schema, _ = SQLServerEngine(profile).open(ConnectionManager(), "sr", "sr", "diag")   # passes the safety check
+        assert {t.name for t in schema.tables} == {"sales", "order"}
+    finally:
+        _os.environ.pop("HAI_TEST_MS_SCRIPT_PW", None)
+        ms.admin.execute("USE master")
+        ms.admin.execute("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = ?", login)
+        for (session,) in ms.admin.fetchall():
+            ms.admin.execute(f"KILL {int(session)}")
+        ms.admin.execute(f"USE [{ms.db}]")
+        ms.admin.execute(f"IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}]")
+        ms.admin.execute("USE master")
+        ms.admin.execute(f"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}]")
+
+
+@live
+def test_the_creator_plan_of_connect_sqlserver_works_on_a_real_server_and_passes_the_safety_check(ms):
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "scripts" / "connect_sqlserver.py"
+    spec = importlib.util.spec_from_file_location("connect_sqlserver_live2", path)
+    tool = importlib.util.module_from_spec(spec)
+    _sys.modules["connect_sqlserver_live2"] = tool
+    spec.loader.exec_module(tool)
+    login = f"sc_{uuid.uuid4().hex[:8]}"
+    password = tool.generate_password()
+    try:
+        ms.admin.execute("USE master")
+        for _ in range(2):                                   # twice: a reset after a half-finished run must work
+            for sql in tool.plan_creator_statements(login, password):
+                ms.admin.execute(sql)
+        import os as _os
+        _os.environ["HAI_TEST_MS_SCRIPT_PW"] = password
+        profile = parse_profiles({"sc": {**GOOD, "server": SERVER, "database": ms.db, "creator": {
+            "user": login, "password_env": "HAI_TEST_MS_SCRIPT_PW"}}})
+        factory = SQLServerEngine(profile).open_creator("sc")          # runs the creator safety check
+        connection = factory()
+        connection.close()
+    finally:
+        _os.environ.pop("HAI_TEST_MS_SCRIPT_PW", None)
+        ms.admin.execute("USE master")
+        ms.admin.execute("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = ?", login)
+        for (session,) in ms.admin.fetchall():
+            ms.admin.execute(f"KILL {int(session)}")
+        ms.admin.execute(f"IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}]")
+        ms.admin.execute(f"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}]")

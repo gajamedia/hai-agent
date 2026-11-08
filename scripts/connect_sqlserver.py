@@ -168,7 +168,6 @@ def plan_statements(login: str, database: str, password: str) -> dict[str, list[
             f"IF USER_ID(N'{login}') IS NULL CREATE USER [{login}] FOR LOGIN [{login}]",
             f"ALTER ROLE [db_datareader] ADD MEMBER [{login}]",
             f"ALTER ROLE [db_denydatawriter] ADD MEMBER [{login}]",
-            f"ALTER ROLE [db_denyddladmin] ADD MEMBER [{login}]",
         ],
     }
 
