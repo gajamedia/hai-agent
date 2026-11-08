@@ -196,6 +196,59 @@ same as for the sample file: approve tables and columns, ask, review the plan, r
 Tables or columns whose names contain characters other than letters, digits and underscores (a space or a
 hyphen) are hidden, and the page tells you how many. Reserved words such as `order` or `group` work.
 
+### MySQL on another computer (for example 10.62.10.35)
+
+Everything above works for a server on another computer. Only the profile and the account host change.
+The setup tools connect to the `host` and `port` in the profile, so no extra option is needed for that.
+
+**On the MySQL server (a DBA does this once):**
+
+1. Let MySQL listen on the network: in `my.ini` / `my.cnf` set `bind-address = 0.0.0.0` (or the server's own
+   IP) and restart MySQL. By default it listens on `127.0.0.1` only.
+2. Allow port 3306 in the firewall for this computer only.
+3. Have an administrator account that may connect **from this computer** (for example
+   `'setup_admin'@'<IP of this computer>'`). `root@localhost` cannot be used from outside. Remove or lock this
+   account after the setup; the tools use it once and never store its password.
+
+**On this computer:**
+
+1. Add the profile to `data\reports\profiles.json`, next to the others. The name must be different from the
+   existing ones; the password variable can be empty for now:
+
+   ```json
+   "kantor_mysql": {
+     "type": "mysql", "host": "10.62.10.35", "port": 3306, "database": "dbsales",
+     "user": "hai_reader", "password_env": "HAI_MYSQL_KANTOR_PASSWORD", "ssl": "require"
+   }
+   ```
+
+   and put `HAI_MYSQL_KANTOR_PASSWORD=` (empty) in `.env`.
+2. Create the accounts. **`--hosts` is the important option**: a MySQL account belongs to the address the
+   connection comes from, and the default (`localhost,127.0.0.1`) is useless from another computer. Give the
+   IP of this computer as the MySQL server sees it:
+
+   ```powershell
+   python scripts\setup_mysql_readonly_user.py kantor_mysql --admin-user setup_admin --hosts "10.62.10.20"
+   python scripts\setup_mysql_creator_user.py  kantor_mysql --admin-user setup_admin --hosts "10.62.10.20"
+   python scripts\check_database_profile.py kantor_mysql
+   ```
+
+   (`setup_mysql_writer_user.py` takes the same options, for section 6.) If the check says
+   `Access denied for 'hai_reader'@'<host>'`, that `<host>` is the address to put in `--hosts`; run the tool
+   again.
+3. Restart the backend. `kantor_mysql` now appears in **Sumber** (Data Reports) and in the **Server** list of
+   *Buat database*, next to `local_mysql` and any SQL Server profile.
+
+Good to know:
+
+* The link is always encrypted, but `"ssl": "require"` does not check the server's certificate. Outside a
+  trusted LAN use `"ssl": "verify"`, which needs a certificate this computer trusts.
+* The rules are the same as on this computer: the reader holds only `SELECT` on its one database, the creator
+  only `CREATE` on `hai\_%` databases (enforced by MySQL itself), and the writer is a separate account.
+* A server that cannot be reached shows a generic message in the page; the real reason (timeout, refused,
+  access denied) is in the backend log and in the output of `check_database_profile.py`.
+* Not yet automated: unlike SQL Server (`connect_sqlserver.py`), nothing writes the MySQL profile for you.
+
 ## 6. Changing data (insert, update, delete)
 
 Reports only read. Changing data is a separate, deliberately heavier path ("Ubah data" in the sidebar). The
