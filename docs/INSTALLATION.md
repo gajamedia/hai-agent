@@ -1,7 +1,7 @@
 # Manual Instalasi hAI Agent di Komputer Lain (Windows)
 
-Panduan ini memasang hAI Agent dari nol di komputer baru sampai dashboard **Data Reports** dan
-**Ubah data** bisa dipakai. Perintah memakai **PowerShell**. Semua jalan di satu komputer (localhost).
+Panduan ini memasang hAI Agent dari nol di komputer baru sampai menu **Database Agent** (tab **Laporan**,
+**Ubah data**, **Buat database**) bisa dipakai. Perintah memakai **PowerShell**. Semua jalan di satu komputer (localhost).
 
 > Untuk panduan memakai fitur (tanya laporan, ubah data, MySQL jarak jauh), lihat
 > [TRY_DATA_REPORTS_LOCALLY.md](TRY_DATA_REPORTS_LOCALLY.md). Dokumen ini fokus pada **pemasangan**.
@@ -380,7 +380,7 @@ Centang berurutan:
 - [ ] <http://127.0.0.1:8000/health> menjawab OK.
 - [ ] `python scripts\check_llm_provider.py` → minimal satu provider menjawab.
 - [ ] <http://localhost:5173> → diarahkan ke login Keycloak → masuk ke dashboard.
-- [ ] **Data Reports → Koneksi**: nama `sales`, file `sales.sqlite3` → *Hubungkan*.
+- [ ] **Database Agent → Laporan → Koneksi**: nama `sales`, file `sales.sqlite3` → *Hubungkan*.
 - [ ] **Setujui**: centang tabel `sales` dan kolomnya (centang *boleh difilter* untuk `region`, `product`) → *Setujui*.
 - [ ] **Tanya laporan**: *"Total penjualan per wilayah untuk produk widget"* → *Buat rencana* → *Jalankan* → tabel muncul → *Unduh XLSX/PDF*.
 
@@ -396,7 +396,7 @@ Jika semuanya lolos, pemasangan selesai.
 | Backend: gagal start soal `HAI_DATABASE_ROOT` | Folder belum dibuat atau path salah (bagian 8). |
 | Backend: gagal start soal autentikasi | `HAI_AUTH_ENABLED=true` dan `HAI_KEYCLOAK_*` harus terisi; Keycloak harus bisa dijangkau dari backend. |
 | Semua permintaan **401** padahal sudah login | Token tanpa klaim `sub`. Konsol admin: *Clients → hai-agent-web → Client scopes → Add client scope → basic → Default*, lalu login ulang. Alat bantu: `python scripts\inspect_keycloak_token.py`. |
-| **403** di Data Reports | User belum punya role; jalankan bagian 11 lalu sign out/in. |
+| **403** di Database Agent | User belum punya role; jalankan bagian 11 lalu sign out/in. |
 | Login: *Invalid redirect uri* | Frontend jalan di port selain 5173/5174, atau memakai host lain. Tambahkan di client `hai-agent-web`. |
 | Halaman: *Failed to fetch* / CORS | Origin frontend tidak ada di `CORS_ORIGINS`; ubah dan mulai ulang backend. Pastikan `VITE_API_BASE_URL` benar. |
 | Buat rencana lama lalu gagal | Provider pertama macet sampai `OPENCODE_TIMEOUT`. Jalankan `check_llm_provider.py`; atur `HAI_LLM_PROVIDER` ke provider yang sehat. |

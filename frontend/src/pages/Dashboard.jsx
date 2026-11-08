@@ -1521,14 +1521,8 @@ export default function Dashboard() {
 
         <p className="nav-label">WORKSPACE</p>
         {/* Router links, not plain anchors: no full reload, so the Keycloak token is kept. */}
-        <Link className="nav" to="/data-reports">
-          <Database size={16} /> Data Reports
-        </Link>
-        <Link className="nav" to="/data-changes">
-          <Database size={16} /> Ubah data
-        </Link>
-        <Link className="nav" to="/database-creation">
-          <Database size={16} /> Buat database
+        <Link className="nav" to="/database-agent">
+          <Database size={16} /> Database Agent
         </Link>
         <Link className="nav" to="/autonomous-testing">
           <FlaskConical size={16} /> Autonomous Testing

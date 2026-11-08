@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, LoaderCircle, ShieldCheck } from "lucide-react";
+import { AlertCircle, LoaderCircle, ShieldCheck } from "lucide-react";
 import { Link } from "react-router-dom";
 import {
   cancelDataChangePlan,
@@ -196,7 +196,6 @@ export default function DataChanges() {
   return (
     <main className="at-page">
       <header className="at-header">
-        <Link to="/data-reports" className="at-back"><ArrowLeft size={14} /> Data Reports</Link>
         <h1>Ubah data</h1>
         <p>
           Tambah, ubah, atau hapus data dengan perintah biasa. Agent tidak menulis SQL: ia hanya memilih
@@ -213,7 +212,7 @@ export default function DataChanges() {
       <section className="at-panel">
         {databases.length === 0 ? (
           <p>
-            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di <Link to="/data-reports">Data Reports</Link>,
+            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di tab <Link to="/database-agent/reports">Laporan</Link>,
             buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b> serta izin Tambah/Ubah/Hapus. Server juga
             butuh akun penulis di profil database (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
           </p>
@@ -230,7 +229,7 @@ export default function DataChanges() {
                 </select>
                 <small>
                   Hanya koneksi yang tabelnya sudah disetujui untuk diubah muncul di sini (MySQL, SQL Server, ...).
-                  Koneksi lain: di <Link to="/data-reports">Data Reports</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
+                  Koneksi lain: di tab <Link to="/database-agent/reports">Laporan</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
                   server juga butuh akun penulis di profilnya.
                 </small>
               </label>

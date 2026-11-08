@@ -1,7 +1,7 @@
 # Adding a database engine
 
-Supported today: SQLite, PostgreSQL, MySQL. This is the procedure for adding another
-(SQL Server, Oracle, ...), whether a person or a coding agent does the work. A new
+Supported today: SQLite, PostgreSQL, MySQL, SQL Server. This is the procedure for adding another
+(Oracle, ...), whether a person or a coding agent does the work. A new
 engine is accepted **only when the shared conformance suite passes against a
 disposable server**.
 

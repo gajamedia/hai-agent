@@ -396,21 +396,21 @@ describe("sidebar navigation", () => {
         <Where />
         <Routes>
           <Route path="/" element={<Dashboard />} />
-          <Route path="/data-reports" element={<h1>DATA REPORTS PAGE</h1>} />
+          <Route path="/database-agent" element={<h1>DATA REPORTS PAGE</h1>} />
           <Route path="/autonomous-testing" element={<h1>AUTONOMOUS PAGE</h1>} />
         </Routes>
       </MemoryRouter>,
     );
   }
 
-  it("opens Data Reports with a client-side navigation instead of a page reload", async () => {
+  it("opens Database Agent with a client-side navigation instead of a page reload", async () => {
     const user = userEvent.setup();
     renderWithRoutes();
-    const link = await screen.findByRole("link", { name: /Data Reports/ });
-    expect(link).toHaveAttribute("href", "/data-reports");
+    const link = await screen.findByRole("link", { name: /Database Agent/ });
+    expect(link).toHaveAttribute("href", "/database-agent");
     await user.click(link);
     expect(await screen.findByText("DATA REPORTS PAGE")).toBeInTheDocument();
-    expect(screen.getByTestId("where")).toHaveTextContent("/data-reports");
+    expect(screen.getByTestId("where")).toHaveTextContent("/database-agent");
   });
 
   it("opens Autonomous Testing the same way", async () => {

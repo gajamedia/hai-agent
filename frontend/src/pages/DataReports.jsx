@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertCircle, ArrowLeft, Database, LoaderCircle, Plug, Send, Unplug } from "lucide-react";
-import { Link, useLocation } from "react-router-dom";
+import { AlertCircle, Database, LoaderCircle, Plug, Send, Unplug } from "lucide-react";
+import { useLocation } from "react-router-dom";
 import {
   approveDatabaseTables,
   cancelReportPlan,
@@ -442,7 +442,6 @@ export default function DataReports() {
 
   return (
     <main className="at-shell">
-      <Link className="at-back" to="/"><ArrowLeft size={14} /> Kembali</Link>
       <header className="at-header">
         <div>
           <span className="at-eyebrow">DATA REPORTS</span>
