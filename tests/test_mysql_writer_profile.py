@@ -86,3 +86,36 @@ def test_open_writer_checks_the_grants_and_never_reuses_the_reader(monkeypatch):
     with pytest.raises(EngineError, match="not set"):
         engine.open_writer("my")
     assert callable(factory)
+
+
+def test_a_writer_without_access_to_the_database_gives_a_clear_message_not_a_500(tmp_path, caplog):
+    """The writer was granted on dbsales only; connecting it to hai_testingai used to end in a 500 with a traceback."""
+    from types import SimpleNamespace
+    from api.database_runtime_registry import DatabaseRuntimeRegistry, RegistryError
+    from api.security.authorization import AuthorizationPolicy
+
+    (tmp_path / "d").mkdir()
+    reg = DatabaseRuntimeRegistry(data_root=tmp_path / "d", work_dir=tmp_path / "w",
+                                  authorization_policy=AuthorizationPolicy(), llm_provider_factory=lambda: None)
+
+    class Denied:
+        def open_writer(self, source):
+            raise Exception(1044, "Access denied for user 'hai_writer'@'127.0.0.1' to database 'hai_testingai'")
+
+    class Down:
+        def open_writer(self, source):
+            raise Exception(2003, "Can't connect to MySQL server on '10.62.10.35'")
+
+    conn = SimpleNamespace(name="hai_testingai", filename="local_mysql/hai_testingai")
+    reg._writer_engine = lambda _c: Denied()
+    with caplog.at_level("WARNING", logger="hai_agent.database_registry"):
+        with pytest.raises(RegistryError) as info:
+            reg._build_changes(conn, [])
+    text = str(info.value)
+    assert "no access to this database" in text and "setup_mysql_creator_user.py" in text
+    assert "hai_writer" not in text and "127.0.0.1" not in text            # nothing from the driver reaches the browser
+    assert "Access denied for user 'hai_writer'@'127.0.0.1'" in caplog.text    # the operator still sees the real cause
+    reg._writer_engine = lambda _c: Down()
+    with pytest.raises(RegistryError) as info:
+        reg._build_changes(conn, [])
+    assert str(info.value) == "cannot use the writer account: connection failed" and "10.62" not in str(info.value)

@@ -465,6 +465,16 @@ class DatabaseRuntimeRegistry:
             factory = impl.open_writer(conn.filename)
         except EngineError as exc:
             raise RegistryError(f"cannot use the writer account: {exc}") from exc
+        except Exception as exc:
+            # Driver errors can echo hosts and users: the browser gets our own message, the log the real cause.
+            logger.warning("Could not open the writer for connection %r (source %r): %s: %s",
+                           conn.name, conn.filename, type(exc).__name__, exc)
+            code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
+            detail = ("the writer account has no access to this database. An administrator must run "
+                      "scripts/setup_mysql_creator_user.py <profile> (for databases the agent created) or "
+                      "scripts/setup_mysql_writer_user.py <profile> (for the profile's own database), then "
+                      "restart the backend" if code == 1044 else "connection failed")
+            raise RegistryError(f"cannot use the writer account: {detail}") from exc
         if self._llm is None:
             self._llm = LLMService(self.llm_provider_factory())
         return DataChangeService(
