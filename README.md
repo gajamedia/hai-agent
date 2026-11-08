@@ -63,6 +63,8 @@ Dashboard saat ini menyediakan input request kognitif, ringkasan hasil/trace, te
 
 ## Instalasi
 
+> Memasang di komputer baru dari nol (Keycloak, `.env`, LLM, database, role)? Ikuti [manual instalasi lengkap](docs/INSTALLATION.md). Bagian di bawah hanya ringkasan.
+
 Dari direktori root project, buat dan aktifkan virtual environment (PowerShell):
 
 ```powershell
