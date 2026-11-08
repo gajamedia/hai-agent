@@ -1,0 +1,52 @@
+services:
+  keycloak-db:
+    image: postgres:17-alpine
+    container_name: hai_agent_keycloak_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD in keycloak/.env.keycloak}
+    volumes:
+      - hai_keycloak_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - hai-keycloak
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    container_name: hai_agent_keycloak
+    restart: unless-stopped
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:?Set KC_BOOTSTRAP_ADMIN_USERNAME}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?Set KC_BOOTSTRAP_ADMIN_PASSWORD}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:8080
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      HAI_KEYCLOAK_DEV_USER_PASSWORD: ${HAI_KEYCLOAK_DEV_USER_PASSWORD:?Set HAI_KEYCLOAK_DEV_USER_PASSWORD}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./keycloak/realm:/opt/keycloak/data/import:ro
+    networks:
+      - hai-keycloak
+
+volumes:
+  hai_keycloak_pgdata:
+
+networks:
+  hai-keycloak:
+    name: hai-agent-keycloak-network

@@ -23,7 +23,7 @@ class DecisionFactory(Protocol):
 
 @dataclass(frozen=True)
 class AgentUnifiedExecutionReport:
-    """Result returned after one UnifiedDecisionExecutor invocation."""
+    """Result returned after one canonical boundary invocation."""
 
     request: AgentExecutionRequest
     decision: Any
@@ -31,12 +31,12 @@ class AgentUnifiedExecutionReport:
 
 
 class AgentUnifiedExecutorBinding:
-    """Securely bind boundary requests to the Agent's existing executor.
+    """Securely bind boundary requests to existing execution mechanisms.
 
-    Every call through this binding is authorized immediately before the
-    decision/execution path. Callers must supply an application-owned risk
-    registry for actions intended to run without explicit approval. Unknown
-    actions fail closed through the policy default.
+    Trusted capability actions are intercepted only when an explicit port
+    mapping exists. They do not need to appear in Agent.actions and never reach
+    the simulation executor or placeholder Action handler. All other actions
+    retain the historical Agent executor path.
     """
 
     def __init__(
@@ -45,6 +45,7 @@ class AgentUnifiedExecutorBinding:
         *,
         decision_factory: DecisionFactory,
         security_policy: ExecutionSecurityPolicy | None = None,
+        trusted_capability_invocation_port: Any = None,
     ) -> None:
         if agent is None:
             raise ValueError("agent cannot be None.")
@@ -59,6 +60,15 @@ class AgentUnifiedExecutorBinding:
         )
         if not isinstance(self.security_policy, ExecutionSecurityPolicy):
             raise TypeError("security_policy must be an ExecutionSecurityPolicy.")
+        if trusted_capability_invocation_port is not None:
+            if not callable(
+                getattr(trusted_capability_invocation_port, "supports_action", None)
+            ) or not callable(getattr(trusted_capability_invocation_port, "invoke", None)):
+                raise TypeError(
+                    "trusted_capability_invocation_port must expose "
+                    "supports_action() and invoke()."
+                )
+        self.trusted_capability_invocation_port = trusted_capability_invocation_port
         self.last_report: AgentUnifiedExecutionReport | None = None
 
     def _ensure_executor(self) -> Any:
@@ -111,6 +121,47 @@ class AgentUnifiedExecutorBinding:
             return []
         return list(actions)
 
+    def _execute_trusted_capability(
+        self,
+        request: AgentExecutionRequest,
+        execution_context: Any,
+    ) -> AgentUnifiedExecutionReport:
+        port = self.trusted_capability_invocation_port
+        if execution_context is None:
+            raise AgentUnifiedExecutorBindingConfigurationError(
+                "Trusted capability action requires TrustedExecutionContext."
+            )
+
+        # The canonical policy remains an independent gate. The authenticated
+        # gateway then performs principal permission, registry trust, and its
+        # own capability risk checks before calling an adapter.
+        self.security_policy.authorize(request)
+        try:
+            decision = port.describe_action(request.action)
+            result = port.invoke(request, execution_context=execution_context)
+        except Exception:
+            # A trace/persistence failure may occur after a read has completed.
+            # Mark the outcome unknown so callers never infer safe retryability.
+            self.security_policy.record_execution_outcome(
+                request,
+                success=None,
+                reason="trusted_capability_outcome_unknown",
+            )
+            raise
+
+        self.security_policy.record_execution_outcome(
+            request,
+            success=True,
+            reason="trusted_capability_read_completed",
+        )
+        report = AgentUnifiedExecutionReport(
+            request=request,
+            decision=decision,
+            result=result,
+        )
+        self.last_report = report
+        return report
+
     def execute_request(
         self,
         request: AgentExecutionRequest,
@@ -121,12 +172,17 @@ class AgentUnifiedExecutorBinding:
         action_risk: Mapping[str, float] | None = None,
         exploration_risk: float = 0.0,
         action_cost: Mapping[str, float] | None = None,
+        execution_context: Any = None,
     ) -> AgentUnifiedExecutionReport:
         if not isinstance(request, AgentExecutionRequest):
             raise TypeError("request must be AgentExecutionRequest.")
 
-        # Validate the requested action against the real registry before policy
-        # evaluation; never trust a similarly named action from LLM metadata.
+        port = self.trusted_capability_invocation_port
+        if port is not None and port.supports_action(request.action):
+            return self._execute_trusted_capability(request, execution_context)
+
+        # A trusted context may still be consumed by a pre-existing explicit
+        # trusted executor method for non-port actions (C.2 compatibility).
         action_obj = self._ensure_action(request.action)
         self.security_policy.authorize(request)
         executor = self._ensure_executor()
@@ -152,16 +208,26 @@ class AgentUnifiedExecutorBinding:
             "action_cost": dict(action_cost or {}),
         }
         execute_action = getattr(executor, "execute_action", None)
+        execute_with_trusted_context = getattr(
+            executor, "execute_with_trusted_context", None
+        )
         try:
-            if callable(execute_action):
+            if execution_context is not None:
+                if not callable(execute_with_trusted_context):
+                    raise AgentUnifiedExecutorBindingConfigurationError(
+                        "Trusted execution context requires executor "
+                        "execute_with_trusted_context(...); refusing generic execution."
+                    )
+                result = execute_with_trusted_context(
+                    **common_kwargs,
+                    action=action_obj,
+                    execution_context=execution_context,
+                )
+            elif callable(execute_action):
                 result = execute_action(**common_kwargs, action=action_obj)
             else:
-                # Compatibility path for existing fake and legacy executors.
                 result = executor.execute(**common_kwargs)
         except Exception:
-            # The executor may have performed partial side effects before
-            # raising. Record the attempted outcome, then preserve the original
-            # exception unless durable audit itself fails.
             self.security_policy.record_execution_outcome(
                 request, success=False, reason="executor_exception"
             )
@@ -186,6 +252,10 @@ class AgentUnifiedExecutorBinding:
         self.last_report = report
         return report
 
-    def execute(self, request: AgentExecutionRequest, **kwargs: Any) -> Any:
+    def execute(
+        self,
+        request: AgentExecutionRequest,
+        **kwargs: Any,
+    ) -> Any:
         """Boundary-compatible method returning the executor result."""
         return self.execute_request(request, **kwargs).result

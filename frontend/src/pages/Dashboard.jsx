@@ -1,6 +1,7 @@
 import "./execution.css";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { Link } from "react-router-dom";
 import {
   Activity,
   AlertCircle,
@@ -12,6 +13,7 @@ import {
   ChevronUp,
   ChevronDown,
   FileJson,
+  Database,
   FlaskConical,
   LoaderCircle,
   Play,
@@ -38,6 +40,7 @@ import {
 
 import JsonPanel from "../components/JsonPanel.jsx";
 import AssistantComposer from "../components/AssistantComposer.jsx";
+import EnvironmentWorkspace from "../components/EnvironmentWorkspace.jsx";
 import StrategyLab from "./StrategyLab.jsx";
 import { exampleRequest } from "../data/exampleRequest.js";
 import "./telemetry.css";
@@ -52,7 +55,7 @@ function normalizeGoalText(value) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[’‘]/g, "'")
+    .replace(/[Ã¢â‚¬â„¢Ã¢â‚¬Ëœ]/g, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -246,7 +249,7 @@ function List({ items }) {
 
 function formatPercent(successes, failures) {
   const knownOutcomes = successes + failures;
-  if (!knownOutcomes) return "—";
+  if (!knownOutcomes) return "Ã¢â‚¬â€";
   return `${Math.round((successes / knownOutcomes) * 100)}%`;
 }
 
@@ -291,8 +294,13 @@ function ExecutionSection({
   loadingState,
   busy,
   resetting,
+  reconciliationRequired,
   error,
   result,
+  executionMode,
+  preparedPlan,
+  onDiscardPreparedPlan,
+  onExecutionModeChange,
   selectedActions,
   setSelectedActions,
   goalDescription,
@@ -358,11 +366,14 @@ function ExecutionSection({
   const canRun =
     !busy &&
     !resetting &&
-    selectedActions.length > 0 &&
-    selectedActions.length <= 4 &&
+    !reconciliationRequired &&
     Boolean(goalDescription.trim()) &&
     !targetParsed.error &&
     allowedActions.length > 0;
+  const canRunManual =
+    canRun &&
+    selectedActions.length > 0 &&
+    selectedActions.length <= 4;
 
   return (
     <section id="execution" className="execution-section">
@@ -372,8 +383,8 @@ function ExecutionSection({
           <small>CLOSED-LOOP EXECUTION</small>
           <h2>Execution Workspace</h2>
           <p>
-            Pilih aksi yang diizinkan, jalankan simulasi, lalu periksa
-            perubahan state dan pencapaian goal.
+            Pilih mode eksekusi, tentukan goal dan target state, lalu tinjau
+            plan, hasil aksi, dan verifikasi pencapaiannya.
           </p>
         </div>
 
@@ -392,6 +403,21 @@ function ExecutionSection({
         </button>
       </div>
 
+      {reconciliationRequired && (
+        <div className="alert error" role="alert">
+          <AlertCircle size={17} />
+          <div>
+            <b>Eksekusi dikunci sementara</b>
+            <p>
+              Outcome permintaan sebelumnya belum dapat dipastikan. Tombol
+              eksekusi dan reset dinonaktifkan untuk mencegah perubahan state
+              tambahan. Refresh hanya membaca state; lakukan rekonsiliasi
+              melalui prosedur backend sebelum melanjutkan.
+            </p>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="alert error">
           <AlertCircle size={17} />
@@ -405,96 +431,166 @@ function ExecutionSection({
       <div className="execution-grid">
         <section className="panel">
           <div className="panel-head">
-            <h3>Action selection</h3>
-            <span className="tag">
-              {selectedActions.length}/4 dipilih
+            <h3>Execution mode</h3>
+            <span className={`tag ${executionMode === "autonomous" ? "execution-tag-success" : ""}`}>
+              {executionMode === "autonomous" ? "Agent menentukan aksi" : "Aksi ditentukan pengguna"}
             </span>
           </div>
 
-          <p className="muted">
-            Pilih satu aksi atau susun beberapa aksi sesuai urutan
-            eksekusi yang diinginkan.
-          </p>
+          <div className="execution-mode-switch" role="group" aria-label="Execution mode">
+            <button
+              type="button"
+              className={executionMode === "autonomous" ? "primary" : "ghost"}
+              aria-pressed={executionMode === "autonomous"}
+              disabled={busy || resetting}
+              onClick={() => onExecutionModeChange("autonomous")}
+            >
+              <BrainCircuit size={15} /> Autonomous mode
+            </button>
+            <button
+              type="button"
+              className={executionMode === "manual" ? "primary" : "ghost"}
+              aria-pressed={executionMode === "manual"}
+              disabled={busy || resetting}
+              onClick={() => onExecutionModeChange("manual")}
+            >
+              <Workflow size={15} /> Manual mode
+            </button>
+          </div>
 
-          {allowedActions.length ? (
-            <div className="execution-action-list">
-              {allowedActions.map((action) => (
-                <label className="execution-action" key={action}>
-                  <input
-                    type="checkbox"
-                    checked={selectedActions.includes(action)}
-                    disabled={
-                      busy ||
-                      resetting ||
-                      (!selectedActions.includes(action) &&
-                        selectedActions.length >= 4)
-                    }
-                    onChange={() => toggleAction(action)}
-                  />
-                  <span>
-                    <b>{action}</b>
-                    <small>
-                      {selectedActions.includes(action)
-                        ? "Termasuk dalam urutan eksekusi"
-                        : "Aksi yang diizinkan backend"}
-                    </small>
-                  </span>
-                </label>
-              ))}
-            </div>
-          ) : (
-            <div className="empty">
-              <CircleHelp size={24} />
-              <h3>Aksi belum tersedia</h3>
-              <p>Periksa koneksi Execution API.</p>
-            </div>
-          )}
-
-          {selectedActions.length > 0 && (
-            <div className="execution-order">
-              <div className="panel-head">
-                <h3>Urutan eksekusi</h3>
-                <button
-                  type="button"
-                  className="ghost"
-                  disabled={busy || resetting}
-                  onClick={() => setSelectedActions([])}
-                >
-                  Hapus pilihan
-                </button>
-              </div>
-
-              {selectedActions.map((action, index) => (
-                <div className="execution-order-item" key={action}>
-                  <span className="step-number">{index + 1}</span>
-                  <code>{action}</code>
-                  <div className="execution-order-controls">
+          {executionMode === "autonomous" ? (
+            <div className="execution-mode-note" role="note">
+              {preparedPlan ? (
+                <>
+                  <div className="execution-prepared-plan-heading">
+                    <b><ShieldCheck size={16} /> Cognitive Pass plan siap diserahkan</b>
                     <button
                       type="button"
                       className="ghost"
-                      aria-label={`Naikkan ${action}`}
-                      disabled={busy || resetting || index === 0}
-                      onClick={() => moveAction(index, -1)}
+                      onClick={onDiscardPreparedPlan}
+                      disabled={busy || resetting}
                     >
-                      <ChevronUp size={15} aria-hidden="true" />
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      aria-label={`Turunkan ${action}`}
-                      disabled={
-                        busy ||
-                        resetting ||
-                        index === selectedActions.length - 1
-                      }
-                      onClick={() => moveAction(index, 1)}
-                    >
-                      <ChevronDown size={15} aria-hidden="true" />
+                      Buang plan
                     </button>
                   </div>
-                </div>
-              ))}
+                  <p>
+                    {preparedPlan.steps.length} langkah dari Cognitive Pass.
+                    Plan akan dikirim utuh sebagai <code>plan</code>; backend
+                    tetap memvalidasi action terdaftar, precondition, feasibility,
+                    security, permission, dan goal sebelum eksekusi.
+                  </p>
+                  <ol className="execution-prepared-plan-list">
+                    {preparedPlan.steps.map((step, index) => (
+                      <li key={`${step.index || index}-${step.action || "step"}`}>
+                        <b>{step.action || `Step ${index + 1}`}</b>
+                        {step.purpose && <span>{step.purpose}</span>}
+                      </li>
+                    ))}
+                  </ol>
+                </>
+              ) : (
+                <>
+                  <b>Agent memilih dan menyusun action plan.</b>
+                  <p>
+                    Anda hanya memberikan goal dan target state. Frontend tidak
+                    mengirim field <code>actions</code> atau <code>plan</code>;
+                    backend diminta membuat plan dari action catalog runtime yang
+                    terdaftar dan tervalidasi.
+                  </p>
+                </>
+              )}
             </div>
+          ) : (
+            <>
+              <div className="panel-head execution-manual-heading">
+                <h3>Action selection</h3>
+                <span className="tag">{selectedActions.length}/4 dipilih</span>
+              </div>
+              <p className="muted">
+                Pilih dan susun sendiri satu sampai empat aksi yang diizinkan.
+              </p>
+
+              {allowedActions.length ? (
+                <div className="execution-action-list">
+                  {allowedActions.map((action) => (
+                    <label className="execution-action" key={action}>
+                      <input
+                        type="checkbox"
+                        checked={selectedActions.includes(action)}
+                        disabled={
+                          busy ||
+                          resetting ||
+                          (!selectedActions.includes(action) &&
+                            selectedActions.length >= 4)
+                        }
+                        onChange={() => toggleAction(action)}
+                      />
+                      <span>
+                        <b>{action}</b>
+                        <small>
+                          {selectedActions.includes(action)
+                            ? "Termasuk dalam urutan eksekusi"
+                            : "Aksi yang diizinkan backend"}
+                        </small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty">
+                  <CircleHelp size={24} />
+                  <h3>Aksi belum tersedia</h3>
+                  <p>Periksa koneksi Execution API.</p>
+                </div>
+              )}
+
+              {selectedActions.length > 0 && (
+                <div className="execution-order">
+                  <div className="panel-head">
+                    <h3>Urutan eksekusi</h3>
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={busy || resetting}
+                      onClick={() => setSelectedActions([])}
+                    >
+                      Hapus pilihan
+                    </button>
+                  </div>
+
+                  {selectedActions.map((action, index) => (
+                    <div className="execution-order-item" key={action}>
+                      <span className="step-number">{index + 1}</span>
+                      <code>{action}</code>
+                      <div className="execution-order-controls">
+                        <button
+                          type="button"
+                          className="ghost"
+                          aria-label={`Naikkan ${action}`}
+                          disabled={busy || resetting || index === 0}
+                          onClick={() => moveAction(index, -1)}
+                        >
+                          <ChevronUp size={15} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost"
+                          aria-label={`Turunkan ${action}`}
+                          disabled={
+                            busy ||
+                            resetting ||
+                            index === selectedActions.length - 1
+                          }
+                          onClick={() => moveAction(index, 1)}
+                        >
+                          <ChevronDown size={15} aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
 
           <label className="execution-field">
@@ -525,38 +621,51 @@ function ExecutionSection({
           )}
 
           <div className="form-foot execution-form-foot">
-            <code>POST /api/v1/execution/run</code>
+            <code>
+              {executionMode === "autonomous"
+                ? preparedPlan
+                  ? "POST /api/v1/execution/plan-run Â· cognitive_pass_handoff"
+                  : "POST /api/v1/execution/plan-run Â· planner-generated"
+                : "POST /api/v1/execution/plan-run Â· validated_action_selection"}
+            </code>
+            {executionMode === "manual" && (
+              <button
+                type="button"
+                className="ghost"
+                disabled={!canRunManual}
+                onClick={() => onRun(targetParsed.value)}
+              >
+                {busy ? (
+                  <LoaderCircle className="spin" size={15} />
+                ) : (
+                  <Play size={15} />
+                )}
+                {busy ? "Menjalankan..." : "Execute actions"}
+              </button>
+            )}
             <button
               type="button"
               className="primary"
-              disabled={!canRun}
-              onClick={() => onRun(targetParsed.value)}
-            >
-              {busy ? (
-                <LoaderCircle className="spin" size={15} />
-              ) : (
-                <Play size={15} />
-              )}
-              {busy ? "Menjalankan..." : "Execute actions"}
-            </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={!canRun}
-              onClick={() => onPlanRun(targetParsed.value)}
+              disabled={executionMode === "manual" ? !canRunManual : !canRun}
+              onClick={() => onPlanRun(targetParsed.value, executionMode)}
             >
               {busy ? (
                 <LoaderCircle className="spin" size={15} />
               ) : (
                 <Activity size={15} />
               )}
-              {busy ? "Merencanakan & menjalankan..." : "Plan & Run Goal"}
+              {busy
+                ? "Merencanakan & menjalankan..."
+                : executionMode === "autonomous"
+                  ? "Run autonomous goal"
+                  : "Plan & Run Goal"}
             </button>
           </div>
 
           <p className="footnote">
-            Hanya aksi simulasi yang terdaftar pada backend yang dapat
-            dijalankan. Urutan aksi memengaruhi hasil.
+            Autonomous mode meminta planner backend memilih urutan dari action
+            catalog terdaftar. Manual mode menjalankan pilihan aksi eksplisit.
+            Kedua mode tetap dibatasi validasi, permission, dan goal verification backend.
           </p>
         </section>
 
@@ -586,7 +695,9 @@ function ExecutionSection({
                 type="button"
                 className="ghost"
                 onClick={onReset}
-                disabled={busy || resetting || loadingState}
+                disabled={
+                  busy || resetting || loadingState || reconciliationRequired
+                }
               >
                 {resetting ? (
                   <LoaderCircle className="spin" size={14} />
@@ -642,7 +753,7 @@ function ExecutionSection({
                     </div>
                     <div>
                       <small>MODE</small>
-                      <b>{result.mode || "—"}</b>
+                      <b>{result.mode || "Ã¢â‚¬â€"}</b>
                     </div>
                   </div>
 
@@ -653,12 +764,24 @@ function ExecutionSection({
                         ? "Goal terverifikasi tercapai."
                         : "Goal belum terverifikasi tercapai.")}
                   </p>
+                  {(result.audit?.plan_source || result.plan_source) && (
+                    <p className="execution-plan-source">
+                      Plan source: <code>{result.audit?.plan_source || result.plan_source}</code>
+                      {(result.audit?.plan_source || result.plan_source) === "runtime_generated_legacy"
+                        ? " Â· Plan dibuat oleh cognitive runtime backend."
+                        : (result.audit?.plan_source || result.plan_source) === "validated_action_selection"
+                          ? " Â· Urutan aksi berasal dari pilihan manual pengguna."
+                          : (result.audit?.plan_source || result.plan_source) === "cognitive_pass_handoff"
+                            ? " Â· Plan berasal dari Cognitive Pass dan divalidasi backend."
+                            : ""}
+                    </p>
+                  )}
                   {result.status === "error" && (
                     <div className="alert error">
                       <AlertCircle size={17} />
                       <div>
                         <b>
-                          HTTP {result.http_status || "Error"} — {result.error}
+                          HTTP {result.http_status || "Error"} Ã¢â‚¬â€ {result.error}
                         </b>
                         <p>
                           {result.execution_started === false
@@ -833,7 +956,7 @@ function TelemetrySourcePanel({ title, description, sourceData }) {
             <div className="table-scroll"><table className="telemetry-table">
               <thead><tr><th>ID</th><th>Kapabilitas</th><th>Outcome</th><th>Sumber event</th></tr></thead>
               <tbody>{events.map((event, index) => (
-                <tr key={`${event.event_id ?? "event"}-${index}`}><td>{event.event_id ?? "—"}</td><td><code>{event.capability ?? "—"}</code></td><td>{event.success === true ? <span className="telemetry-outcome success-text">Berhasil</span> : event.success === false ? <span className="telemetry-outcome failure-text">Gagal</span> : <span className="telemetry-outcome unknown-text">Belum diketahui</span>}</td><td>{event.source ?? "—"}</td></tr>
+                <tr key={`${event.event_id ?? "event"}-${index}`}><td>{event.event_id ?? "Ã¢â‚¬â€"}</td><td><code>{event.capability ?? "Ã¢â‚¬â€"}</code></td><td>{event.success === true ? <span className="telemetry-outcome success-text">Berhasil</span> : event.success === false ? <span className="telemetry-outcome failure-text">Gagal</span> : <span className="telemetry-outcome unknown-text">Belum diketahui</span>}</td><td>{event.source ?? "Ã¢â‚¬â€"}</td></tr>
               ))}</tbody>
             </table></div>
           ) : <p className="muted telemetry-no-data">Belum ada event telemetry pada runtime ini.</p>}
@@ -855,7 +978,7 @@ function TelemetrySection({ telemetrySources, loading, error, onRefresh, refresh
           {loading ? "Memuat..." : "Refresh"}
         </button>
       </div>
-      <p className="telemetry-contract-note"><code>GET /api/v1/telemetry/capabilities/sources</code> Â· Snapshot tidak digabungkan antar-runtime.</p>
+      <p className="telemetry-contract-note"><code>GET /api/v1/telemetry/capabilities/sources</code> Ãƒâ€šÃ‚Â· Snapshot tidak digabungkan antar-runtime.</p>
       {error && <div className="alert error telemetry-error"><AlertCircle size={17} /><div><b>Telemetry tidak dapat dimuat</b><p>{error}</p></div></div>}
       {loading && !telemetrySources && <div className="empty telemetry-empty"><LoaderCircle className="spin" size={24} /><h3>Memuat telemetry</h3><p>Mengambil sumber telemetry dari API backend.</p></div>}
       {!loading && !telemetrySources && !error && <div className="empty telemetry-empty"><CircleHelp size={24} /><h3>Telemetry belum tersedia</h3><p>Belum ada respons telemetry dari backend.</p></div>}
@@ -863,7 +986,7 @@ function TelemetrySection({ telemetrySources, loading, error, onRefresh, refresh
         <TelemetrySourcePanel title="Cognitive Runtime" description="Penalaran dan kapabilitas runtime kognitif." sourceData={sources.cognitive_runtime} />
         <TelemetrySourcePanel title="Execution Runtime" description="Aksi simulasi dan outcome runtime eksekusi." sourceData={sources.execution_runtime} />
       </div>}
-      <p className="telemetry-updated">{refreshedAt ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}` : "Waktu pembaruan belum tersedia."} Â· Data runtime saat ini; tidak dijamin persisten setelah server restart.</p>
+      <p className="telemetry-updated">{refreshedAt ? `Terakhir diperbarui: ${refreshedAt.toLocaleTimeString()}` : "Waktu pembaruan belum tersedia."} Ãƒâ€šÃ‚Â· Data runtime saat ini; tidak dijamin persisten setelah server restart.</p>
     </section>
   );
 }
@@ -891,9 +1014,12 @@ export default function Dashboard() {
   const [executionLoading, setExecutionLoading] = useState(false);
   const [executionBusy, setExecutionBusy] = useState(false);
   const [executionResetting, setExecutionResetting] = useState(false);
+  const [executionReconciliationRequired, setExecutionReconciliationRequired] =
+    useState(false);
   const [executionError, setExecutionError] = useState("");
   const [executionResult, setExecutionResult] = useState(null);
   const [preparedCognitivePlan, setPreparedCognitivePlan] = useState(null);
+  const [executionMode, setExecutionMode] = useState("autonomous");
   const [selectedActions, setSelectedActions] = useState(["open_box"]);
   const [goalDescription, setGoalDescription] = useState("Open the box");
   const [targetStateText, setTargetStateText] = useState(
@@ -1075,34 +1201,38 @@ export default function Dashboard() {
     }
 
     const liveState = executionState?.state || {};
-    const allowedActions = executionState?.allowed_actions || [];
-    const suggestedActions = suggestSimulationActions(
-      normalizedGoal,
-      allowedActions,
-      proposedPlan,
-    );
     const suggestedTarget = suggestTargetState(normalizedGoal, liveState);
 
+    // Keep the Cognitive Pass plan intact. Do not translate its prose into
+    // manual action IDs: the backend owns canonical validation of this handoff.
     setPreparedCognitivePlan(proposedPlan);
+    setExecutionMode("autonomous");
     setGoalDescription(normalizedGoal.slice(0, 500));
-    // Replace stale selections with a goal-specific proposal. Users can still
-    // edit the action order and target before explicitly executing anything.
-    setSelectedActions(suggestedActions);
-    setTargetStateText(pretty(suggestedTarget));
+    if (Object.keys(suggestedTarget).length > 0) {
+      setTargetStateText(pretty(suggestedTarget));
+    }
     setExecutionResult(null);
-    setExecutionError(
-      suggestedActions.length === 0
-        ? "Plan diterima, tetapi tidak ada action simulasi yang dapat dipetakan secara aman. Pilih action yang tersedia secara manual."
-        : "",
-    );
+    setExecutionError("");
     window.location.hash = "#execution";
 
     window.requestAnimationFrame(() => {
-      document.getElementById("execution")?.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
+      const executionElement = document.getElementById("execution");
+
+      // scrollIntoView is not implemented by every DOM environment (e.g. JSDOM).
+      // Keep browser scrolling when available without throwing in tests or
+      // restricted embedded environments.
+      if (typeof executionElement?.scrollIntoView === "function") {
+        executionElement.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      }
     });
+  }
+
+  function discardPreparedCognitivePlan() {
+    setPreparedCognitivePlan(null);
+    setExecutionError("");
   }
 
   async function executeSelectedActions(targetState) {
@@ -1217,7 +1347,7 @@ export default function Dashboard() {
   //     setExecutionBusy(false);
   //   }
   // }
-  async function runCognitivePlanGoal(targetState) {
+  async function runCognitivePlanGoal(targetState, mode = executionMode) {
     if (executionBusy) return;
 
     setExecutionError("");
@@ -1229,7 +1359,7 @@ export default function Dashboard() {
     try {
       const observation = executionState?.state;
 
-      if (!observation || typeof observation !== "object") {
+      if (!observation || typeof observation !== "object" || Array.isArray(observation)) {
         throw new Error(
           "State simulasi belum tersedia. Refresh execution state lalu coba lagi.",
         );
@@ -1239,16 +1369,29 @@ export default function Dashboard() {
         throw new Error("Goal description wajib diisi.");
       }
 
-      if (!Array.isArray(selectedActions) || selectedActions.length === 0) {
-        throw new Error("Pilih minimal satu action simulasi sebelum menjalankan goal.");
+      if (mode === "manual" && (
+        !Array.isArray(selectedActions) ||
+        selectedActions.length === 0 ||
+        selectedActions.length > 4
+      )) {
+        throw new Error("Mode manual memerlukan satu sampai empat action simulasi.");
       }
 
       payload = {
         observation,
         goal_description: goalDescription.trim(),
         target_state: targetState,
-        actions: selectedActions,
       };
+
+      // The three contracts are intentionally exclusive:
+      // - Cognitive Pass handoff: `plan` only.
+      // - Manual selection: `actions` only.
+      // - Autonomous direct goal: omit both and let the backend planner run.
+      if (mode === "manual") {
+        payload.actions = [...selectedActions];
+      } else if (preparedCognitivePlan) {
+        payload.plan = preparedCognitivePlan;
+      }
 
       const fingerprint = JSON.stringify(payload);
       let idempotencyKey = planRunRetryRef.current?.fingerprint === fingerprint
@@ -1266,7 +1409,7 @@ export default function Dashboard() {
         idempotencyKey,
       );
 
-      // Respons diterima: jangan gunakan key ini untuk permintaan baru.
+      // A response was received; this key must not be reused for a new run.
       planRunRetryRef.current = null;
       setExecutionResult(data);
 
@@ -1285,6 +1428,10 @@ export default function Dashboard() {
         detail.error === "idempotency_outcome_unknown";
 
       const executionStarted = detail.execution_started ?? null;
+
+      if (reconciliationRequired) {
+        setExecutionReconciliationRequired(true);
+      }
 
       const errorMessage = reconciliationRequired
         ? [
@@ -1373,6 +1520,13 @@ export default function Dashboard() {
         </div>
 
         <p className="nav-label">WORKSPACE</p>
+        {/* Router links, not plain anchors: no full reload, so the Keycloak token is kept. */}
+        <Link className="nav" to="/database-agent">
+          <Database size={16} /> Database Agent
+        </Link>
+        <Link className="nav" to="/autonomous-testing">
+          <FlaskConical size={16} /> Autonomous Testing
+        </Link>
         <a
           className={`nav ${activeHash === "#top" ? "active" : ""}`}
           href="#top"
@@ -1448,13 +1602,13 @@ export default function Dashboard() {
           animate={{ opacity: 1, y: 0 }}
         >
           <div>
-            <p className="mint-label">✦ AGENT COGNITION</p>
+            <p className="mint-label">Ã¢Å“Â¦ AGENT COGNITION</p>
             <h2>From observation<br />to a structured plan.</h2>
             <p>
               Jalankan cognitive pass, eksekusi aksi simulasi yang diizinkan,
               verifikasi goal, dan tinjau telemetry dalam satu workspace.
             </p>
-            <a href="#request">Mulai cognitive run ↗</a>
+            <a href="#request">Mulai cognitive run Ã¢â€ â€”</a>
           </div>
           <div className="hero-graphic">
             <div className="ring r1" />
@@ -1473,12 +1627,12 @@ export default function Dashboard() {
           </div>
           <div className="metric">
             <small><Workflow size={14} /> CURRENT CYCLE</small>
-            <b>{response?.cycle ?? "—"}</b>
+            <b>{response?.cycle ?? "Ã¢â‚¬â€"}</b>
             <span>Cycle terakhir</span>
           </div>
           <div className="metric">
             <small><Activity size={14} /> PLAN STEPS</small>
-            <b>{plan?.steps?.length ?? "—"}</b>
+            <b>{plan?.steps?.length ?? "Ã¢â‚¬â€"}</b>
             <span>Langkah dari planner</span>
           </div>
           <div className="metric">
@@ -1486,7 +1640,7 @@ export default function Dashboard() {
             <b>
               {typeof plan?.confidence === "number"
                 ? `${Math.round(plan.confidence * 100)}%`
-                : "—"}
+                : "Ã¢â‚¬â€"}
             </b>
             <span>Nilai dari output model</span>
           </div>
@@ -1656,8 +1810,8 @@ export default function Dashboard() {
                             {step.preconditions?.length > 0 && (
                               <details><summary>Preconditions</summary><List items={step.preconditions} /></details>
                             )}
-                            {step.success_criteria && <p className="good">âœ“ {step.success_criteria}</p>}
-                            {step.risk && <p className="risk">âš  {step.risk}</p>}
+                            {step.success_criteria && <p className="good">ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ {step.success_criteria}</p>}
+                            {step.risk && <p className="risk">ÃƒÂ¢Ã…Â¡Ã‚Â  {step.risk}</p>}
                           </div>
                         </div>
                       ))}
@@ -1680,13 +1834,25 @@ export default function Dashboard() {
           </div>
         </section>
 
+        <EnvironmentWorkspace />
+
         <ExecutionSection
           stateData={executionState}
           loadingState={executionLoading}
           busy={executionBusy}
           resetting={executionResetting}
+          reconciliationRequired={executionReconciliationRequired}
           error={executionError}
           result={executionResult}
+          executionMode={executionMode}
+          preparedPlan={preparedCognitivePlan}
+          onDiscardPreparedPlan={discardPreparedCognitivePlan}
+          onExecutionModeChange={(mode) => {
+            if (mode !== "manual" && mode !== "autonomous") return;
+            setExecutionMode(mode);
+            setExecutionError("");
+            setExecutionResult(null);
+          }}
           selectedActions={selectedActions}
           setSelectedActions={setSelectedActions}
           goalDescription={goalDescription}
@@ -1716,14 +1882,10 @@ export default function Dashboard() {
         />
 
         <footer>
-          hAI Agent Â· Cognitive API
+          hAI Agent Ãƒâ€šÃ‚Â· Cognitive API
           <span><Activity size={12} /> Local development workspace</span>
         </footer>
       </main>
     </div>
   );
 }
-
-
-
-

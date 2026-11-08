@@ -26,3 +26,26 @@ data/*.db-shm
 artifacts/**/*.sqlite
 artifacts/**/*.sqlite3
 artifacts/**/*.jsonl
+
+# Local editor/script backups and one-off audit output
+*.bak*
+*.back*
+*backup*
+*-bak.*
+*,bak*
+audit_reports/
+artifacts/
+frontend/test-results/
+demo03_plan_run_error.json
+data/e2e/
+data/execution_traces.jsonl*
+*pybak*
+
+# One-off audit/patch scripts (generated during development; not part of the product)
+scripts/Collect-*
+scripts/Apply-*
+scripts/apply-*
+scripts/P3_5_*
+
+# Data Reports: sample/real databases and everything generated from them (reports, traces, workflow DB)
+data/reports/

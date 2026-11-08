@@ -1,0 +1,51 @@
+"""Autonomous testing contracts and orchestration components."""
+from .contracts import (
+    ROOM_STATE_SCHEMA,
+    AutonomousTestBatch,
+    AutonomousTestCase,
+    BatchStatus,
+    CaseStatus,
+    CognitiveRuntimeMode,
+    Difficulty,
+    FaultInjectionPolicy,
+    FaultType,
+    GoalEvaluation,
+    RecoveryPolicy,
+    ScenarioDefinition,
+    TestBatchResult,
+    TestCaseResult,
+    TestEnvironmentConfig,
+    canonical_json,
+)
+from .batch_manager import AutonomousTestBatchManager, BatchManagerError
+from .result_repository import (
+    DuplicateBatchError,
+    ResultNotFoundError,
+    ResultRepositoryError,
+    SQLiteTestResultRepository,
+)
+
+__all__ = [
+    "ROOM_STATE_SCHEMA",
+    "AutonomousTestBatch",
+    "AutonomousTestCase",
+    "BatchStatus",
+    "CaseStatus",
+    "CognitiveRuntimeMode",
+    "Difficulty",
+    "FaultInjectionPolicy",
+    "FaultType",
+    "GoalEvaluation",
+    "RecoveryPolicy",
+    "ScenarioDefinition",
+    "TestBatchResult",
+    "TestCaseResult",
+    "TestEnvironmentConfig",
+    "canonical_json",
+    "AutonomousTestBatchManager",
+    "BatchManagerError",
+    "SQLiteTestResultRepository",
+    "DuplicateBatchError",
+    "ResultNotFoundError",
+    "ResultRepositoryError",
+]

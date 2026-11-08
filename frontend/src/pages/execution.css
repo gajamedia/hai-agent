@@ -1,4 +1,3 @@
-
 .execution-section {
   margin-top: 32px;
   scroll-margin-top: 24px;
@@ -193,5 +192,190 @@
 
   .execution-form-foot button {
     justify-content: center;
+  }
+}
+
+.execution-mode-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+
+.execution-mode-switch button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.execution-mode-note {
+  padding: 14px;
+  border: 1px solid var(--border, #29333f);
+  border-radius: 10px;
+  background: var(--surface, #101820);
+}
+
+.execution-mode-note p {
+  margin: 7px 0 0;
+  color: var(--muted, #8e9baa);
+  line-height: 1.6;
+}
+
+.execution-manual-heading {
+  margin-top: 18px;
+}
+
+.execution-plan-source {
+  margin: 10px 0 16px;
+  color: var(--muted, #8e9baa);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+
+/* P3.2 — Cognitive Pass plan handoff */
+.execution-prepared-plan-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.execution-prepared-plan-heading > b {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.execution-prepared-plan-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding-left: 22px;
+}
+
+.execution-prepared-plan-list li {
+  padding-left: 4px;
+}
+
+.execution-prepared-plan-list li span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted, #8e9baa);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+
+/* P3.5.5B — Dynamic environment discovery workspace */
+.environment-workspace {
+  margin-top: 22px;
+}
+
+.environment-workspace .panel-head h3,
+.environment-capability-heading h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.environment-workspace-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 12px 0;
+  padding: 11px 12px;
+  border: 1px solid var(--border, #29333f);
+  border-radius: 9px;
+  color: var(--muted, #8e9baa);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.environment-workspace-notice svg {
+  flex: 0 0 auto;
+  color: var(--success, #70e1a1);
+}
+
+.environment-workspace-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.environment-workspace-grid .execution-field {
+  margin-top: 8px;
+}
+
+.environment-workspace-grid select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  color: inherit;
+  background: var(--surface, #101820);
+  border: 1px solid var(--border, #29333f);
+  border-radius: 8px;
+  font: inherit;
+}
+
+.environment-workspace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 12px 0;
+}
+
+.environment-capability-heading {
+  margin-top: 18px;
+}
+
+.environment-capability-heading h4 {
+  margin: 0;
+}
+
+.environment-capability-list {
+  display: grid;
+  gap: 9px;
+}
+
+.environment-capability {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 12px;
+  border: 1px solid var(--border, #29333f);
+  border-radius: 9px;
+}
+
+.environment-capability input {
+  margin-top: 4px;
+  accent-color: var(--accent, #70e1c1);
+}
+
+.environment-capability.is-disabled {
+  opacity: 0.65;
+}
+
+.environment-capability-body {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.environment-capability-body small {
+  color: var(--muted, #8e9baa);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.environment-capability-body small svg {
+  vertical-align: -2px;
+}
+
+@media (max-width: 620px) {
+  .environment-workspace-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

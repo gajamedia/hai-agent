@@ -7,7 +7,8 @@ as a safe reference, not as a universally optimal planner.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Mapping
+from collections import deque
+from typing import Any, Dict, List, Optional, Mapping, Tuple
 
 from agent.core.action import Action
 from agent.cognition.planner import Planner
@@ -24,10 +25,26 @@ class AdaptivePlanner:
         planner: Planner,
         strategy_selector: StrategySelector,
         risk_strategy_selector: Optional[RiskAwareStrategySelector] = None,
+        avoid_unreliable_routes: bool = False,
+        min_failure_evidence: int = 2,
+        unreliable_success_rate: float = 0.5,
+        alternative_max_depth: int = 8,
+        alternative_max_nodes: int = 5000,
     ):
         self.planner = planner
         self.strategy_selector = strategy_selector
         self.risk_strategy_selector = risk_strategy_selector
+        # Opt-in. Off by default so the base planner remains the sole safe
+        # reference (history can never override a shorter valid route).
+        self.avoid_unreliable_routes = avoid_unreliable_routes
+        # A route is "unreliable" once it has at least ``min_failure_evidence``
+        # recorded attempts and a success rate below ``unreliable_success_rate``.
+        # Unreliable routes are avoided when a valid alternative exists, even if
+        # the base planner (the safe reference) would otherwise choose them.
+        self.min_failure_evidence = min_failure_evidence
+        self.unreliable_success_rate = unreliable_success_rate
+        self.alternative_max_depth = alternative_max_depth
+        self.alternative_max_nodes = alternative_max_nodes
 
     def plan(
         self,
@@ -60,8 +77,16 @@ class AdaptivePlanner:
             strategy for strategy in (strategies or [])
             if getattr(strategy, "is_active", getattr(strategy, "status", "active") == "active")
         ]
+        blocked = (
+            self._unreliable_routes(active, goal)
+            if self.avoid_unreliable_routes
+            else set()
+        )
         feasible = self._filter_feasible_strategies(
-            strategies=active,
+            strategies=[
+                strategy for strategy in active
+                if tuple(strategy.steps) not in blocked
+            ],
             world_state=world_state,
             goal_state=goal_state,
             goal=goal,
@@ -84,6 +109,21 @@ class AdaptivePlanner:
             learned_plan, world_state, goal_state
         )
 
+        # Evidence-based override: the base planner stays the safe reference
+        # except when its chosen route has repeatedly failed in practice.
+        if (
+            baseline_valid
+            and tuple(a.name for a in baseline_plan) in blocked
+        ):
+            if learned_valid:
+                return learned_plan
+            alternative = self._search_alternative(
+                world_state, goal_state, blocked
+            )
+            if alternative is not None:
+                return alternative
+            return baseline_plan
+
         if learned_valid:
             if not baseline_valid:
                 return learned_plan
@@ -94,6 +134,62 @@ class AdaptivePlanner:
         # Keep the base planner's historical fallback contract, even when its
         # output is empty or invalid; callers can inspect/verify the outcome.
         return baseline_plan
+
+    def _unreliable_routes(
+        self, strategies: List[Strategy], goal: Optional[str]
+    ) -> set:
+        """Action-name sequences with enough evidence of repeated failure."""
+        blocked = set()
+        for strategy in strategies:
+            if goal is not None and strategy.goal != goal:
+                continue
+            if (
+                strategy.attempts >= self.min_failure_evidence
+                and strategy.success_rate < self.unreliable_success_rate
+            ):
+                blocked.add(tuple(strategy.steps))
+        return blocked
+
+    def _search_alternative(
+        self,
+        world_state: Dict[str, Any],
+        goal_state: Dict[str, Any],
+        blocked: set,
+    ) -> Optional[List[Action]]:
+        """Breadth-first search for the shortest valid plan not in ``blocked``.
+
+        Bounded by depth and node budget so it cannot run away on large
+        action spaces; returns ``None`` when nothing is found in budget.
+        """
+        queue: deque = deque([(dict(world_state), ())])
+        explored = 0
+        while queue and explored < self.alternative_max_nodes:
+            state, sequence = queue.popleft()
+            explored += 1
+            names = tuple(a.name for a in sequence)
+            # Padding a known-bad route with extra steps is still that route.
+            if any(self._is_subsequence(route, names) for route in blocked):
+                continue
+            if sequence and self._goal_satisfied(state, goal_state):
+                return list(sequence)
+            if len(sequence) >= self.alternative_max_depth:
+                continue
+            for action in self.planner.actions:
+                if not action.can_execute(state):
+                    continue
+                if all(state.get(k) == v for k, v in action.effects.items()):
+                    continue  # no-op in this state
+                next_state = dict(state)
+                next_state.update(action.effects)
+                queue.append((next_state, sequence + (action,)))
+        return None
+
+    @staticmethod
+    def _is_subsequence(route: Tuple[str, ...], names: Tuple[str, ...]) -> bool:
+        if not route:
+            return False
+        remaining = iter(names)
+        return all(step in remaining for step in route)
 
     def _select_strategy(
         self,
