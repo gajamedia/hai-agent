@@ -59,6 +59,7 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"^/api/v1/database-connections/profiles$", "database:connection:manage"),
     ("GET", r"^/api/v1/database-connections/[^/]+/schema$", "database:connection:manage"),
     ("POST", r"^/api/v1/database-connections/[^/]+/approve$", "database:connection:manage"),
+    ("POST", r"^/api/v1/database-connections/[^/]+/refresh$", "database:connection:manage"),
     ("DELETE", r"^/api/v1/database-connections/[^/]+$", "database:connection:manage"),
     # Data changes: planning/cancelling and running are the writer's; approving is a second person's.
     ("GET", r"^/api/v1/data-changes/config$", "data:change:plan"),

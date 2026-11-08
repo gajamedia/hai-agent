@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, ArrowLeft, Database, LoaderCircle, Plug, Send, Unplug } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
   approveDatabaseTables,
   cancelReportPlan,
@@ -20,19 +20,34 @@ import "./autonomous-testing.css";
 
 // The server discovers the schema; the user only picks which tables/columns the
 // agent may use and which columns may be filtered.
-function ApprovalForm({ connection, schema, busy, onApprove }) {
+function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
   // Starts from what is approved now, so changing an active connection adds to it
-  // instead of starting from nothing.
-  const [selection, setSelection] = useState(() =>
-    Object.fromEntries(
+  // instead of starting from nothing. With `preset` (a database the agent has just made or extended), every
+  // table that is not approved yet starts ticked: all columns readable and filterable and, when the server has
+  // a writer account, Tambah and Ubah on every column except the key. Hapus is never pre-ticked. Nothing takes
+  // effect until the user presses the approve button.
+  const [selection, setSelection] = useState(() => {
+    const base = Object.fromEntries(
       Object.entries(schema.approved || {}).map(([table, v]) => [
         table, {
           columns: v.columns, filterable: v.filterable_columns || [],
           writable: v.writable ? { operations: v.writable.operations || [], columns: v.writable.columns || [] } : null,
         },
       ]),
-    ),
-  );
+    );
+    if (preset) {
+      for (const table of schema.tables) {
+        if (base[table.name]) continue;
+        const names = table.columns.map((c) => c.name);
+        const writable = schema.writer_available ? table.columns.filter((c) => !c.primary_key).map((c) => c.name) : [];
+        base[table.name] = {
+          columns: names, filterable: names,
+          writable: writable.length ? { operations: ["insert", "update"], columns: writable } : null,
+        };
+      }
+    }
+    return base;
+  });
 
   const toggleTable = (table, columns) =>
     setSelection((cur) => {
@@ -234,6 +249,9 @@ export default function DataReports() {
   const [profiles, setProfiles] = useState([]);
   const [source, setSource] = useState("");
   const [database, setDatabase] = useState("");
+  const location = useLocation();
+  const [notice, setNotice] = useState(location.state?.message || "");
+  const [preset, setPreset] = useState(Boolean(location.state?.review));
   const chosenProfile = profiles.find((p) => p.name === source);
   const [warnings, setWarnings] = useState([]);
   const [engineRequests, setEngineRequests] = useState([]);
@@ -309,6 +327,8 @@ export default function DataReports() {
     guarded(async () => {
       await approveDatabaseTables(selected, tables);
       setSchema(null);
+      setPreset(false);
+      setNotice("");
       await refresh();
     });
 
@@ -328,6 +348,15 @@ export default function DataReports() {
       setSelected(target);
       setResult(null);
     });
+
+  // Arriving from "Buat database": the new database is already connected; open its approval form at once.
+  useEffect(() => {
+    const target = location.state?.review;
+    if (!target) return;
+    window.history.replaceState({}, "");
+    review(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const requestEngine = (event) => {
     event.preventDefault();
@@ -427,6 +456,7 @@ export default function DataReports() {
       {warnings.length > 0 && (
         <div className="at-warning"><AlertCircle size={16} /><div>{warnings.join(" ")}</div></div>
       )}
+      {notice && <div className="at-config-summary" role="status">{notice}</div>}
       {error && (
         <div className="at-alert" role="alert"><AlertCircle size={17} /><span>{error}</span></div>
       )}
@@ -528,7 +558,7 @@ export default function DataReports() {
         </section>
         <section className="at-panel">
           {schema ? (
-            <ApprovalForm key={selected} connection={selected} schema={schema} busy={busy} onApprove={approve} />
+            <ApprovalForm key={selected} connection={selected} schema={schema} busy={busy} onApprove={approve} preset={preset} />
           ) : (
             <>
               <div className="at-section-heading"><Send size={18} /><h2>Tanya laporan</h2></div>

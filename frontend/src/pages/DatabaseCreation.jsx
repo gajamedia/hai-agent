@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import { AlertCircle, ArrowLeft, LoaderCircle } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   cancelDatabasePlan,
   connectDatabase,
   createDatabasePlan,
   getDatabaseCreationConfig,
   getDatabasePlan,
+  listDatabaseConnections,
+  refreshDatabaseConnection,
   runDatabasePlan,
 } from "../api/client.js";
 import { signInAgain } from "../auth/keycloak.js";
@@ -35,6 +37,7 @@ export default function DatabaseCreation() {
   const [result, setResult] = useState(null);
   const [notice, setNotice] = useState("");
   const [connected, setConnected] = useState(false);
+  const navigate = useNavigate();
 
   useEffect(() => {
     let active = true;
@@ -77,12 +80,40 @@ export default function DatabaseCreation() {
     });
   };
 
+  // The database exists now: connect it (or, when tables were added to one that is already connected, read its
+  // schema again) and open the approval form with everything filled in. The user only has to press Simpan.
+  const openInReports = async (created) => {
+    const source = `${created.profile}/${created.database}`;
+    try {
+      const existing = ((await listDatabaseConnections()).connections || []).find((c) => c.file === source);
+      let name;
+      if (existing) {
+        await refreshDatabaseConnection(existing.name);
+        name = existing.name;
+      } else {
+        name = created.database.slice(0, 32);
+        await connectDatabase({ name, profile: created.profile, database: created.database });
+      }
+      setConnected(true);
+      navigate("/data-reports", { state: {
+        review: name,
+        message: `${created.mode === "add_tables" ? "Tabel baru ditambahkan ke" : "Database baru dibuat:"} ${created.database}. `
+          + "Sudah terhubung, dan pilihan di bawah sudah diisi (boleh difilter, tambah, ubah). Periksa lalu tekan Setujui.",
+      } });
+    } catch (error) {
+      setMessage({ text: `Database sudah dibuat, tetapi belum bisa dihubungkan otomatis: ${errorText(error)} `
+        + "Tekan Hubungkan database ini, atau hubungkan lewat Data Reports." });
+    }
+  };
+
   const run = () =>
     guarded(async () => {
       try {
-        setResult(await runDatabasePlan(plan.plan_id, phrase, plan.plan_id));
+        const created = await runDatabasePlan(plan.plan_id, phrase, plan.plan_id);
+        setResult(created);
         setPlan(null);
         setNotice("");
+        await openInReports(created);
       } catch (error) {
         if (errorCode(error) !== "step_up_required") throw error;
         remember(plan.plan_id);

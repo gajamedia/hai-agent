@@ -648,6 +648,25 @@ class DatabaseRuntimeRegistry:
                 return active[0]
             return self._get(name).name
 
+    def refresh(self, name: str, *, actor_id: str) -> dict[str, Any]:
+        """Read the schema again (for example after tables were added) and keep what is approved.
+
+        A fresh connection is opened first; the old one is replaced only if the approved selection still
+        fits the new schema, so a failure leaves the connection exactly as it was."""
+        with self._lock:
+            old = self._get(name)
+            fresh = self._open(name, old.engine, old.filename, old.approved_by, old.approved_at)
+            try:
+                if old.selection:
+                    self._activate_locked(fresh, old.selection, old.tables_approved_by or old.approved_by,
+                                          old.tables_approved_at or old.approved_at)
+            except Exception:
+                fresh.manager.shutdown()
+                raise
+            self._connections[name] = fresh
+        old.manager.shutdown()
+        return self._describe(fresh)
+
     def disconnect(self, name: str) -> None:
         with self._lock:
             self._experience.bind(name).forget()  # learned values may be business data

@@ -107,6 +107,13 @@ def approve_tables(name: str, request: Request, payload: dict[str, Any]):
     return _call(registry.activate, name, payload.get("tables"), actor_id=principal.actor_id)
 
 
+@router.post("/{name}/refresh")
+def refresh_connection(name: str, request: Request):
+    """Read the schema again, e.g. after the agent added tables. Approvals are kept."""
+    principal, registry = _guard(request)
+    return _call(registry.refresh, name, actor_id=principal.actor_id)
+
+
 @router.delete("/{name}")
 def disconnect_database(name: str, request: Request):
     _, registry = _guard(request)

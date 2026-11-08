@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import DatabaseCreation from "./DatabaseCreation";
 import * as api from "../api/client";
 import * as keycloak from "../auth/keycloak";
@@ -12,6 +12,8 @@ vi.mock("../api/client", () => ({
   createDatabasePlan: vi.fn(),
   getDatabaseCreationConfig: vi.fn(),
   getDatabasePlan: vi.fn(),
+  listDatabaseConnections: vi.fn(),
+  refreshDatabaseConnection: vi.fn(),
   runDatabasePlan: vi.fn(),
 }));
 vi.mock("../auth/keycloak", () => ({ signInAgain: vi.fn() }));
@@ -24,7 +26,18 @@ const PLAN = {
     { name: "nama", type: "text", nullable: false }] }] },
 };
 
-const renderPage = () => render(<MemoryRouter><DatabaseCreation /></MemoryRouter>);
+function Landing() {
+  const state = useLocation().state;
+  return <div>DATA REPORTS review={state?.review} :: {state?.message}</div>;
+}
+
+const renderPage = () => render(
+  <MemoryRouter>
+    <Routes>
+      <Route path="/" element={<DatabaseCreation />} />
+      <Route path="/data-reports" element={<Landing />} />
+    </Routes>
+  </MemoryRouter>);
 
 async function planIt(user) {
   await user.type(await screen.findByLabelText(/Perintah/), "buat toko");
@@ -40,6 +53,9 @@ describe("DatabaseCreation", () => {
     sessionStorage.clear();
     api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [{ name: "local_mysql", prefix: "hai_" }] });
     api.createDatabasePlan.mockResolvedValue(PLAN);
+    api.listDatabaseConnections.mockResolvedValue({ connections: [] });
+    api.connectDatabase.mockResolvedValue({});
+    api.refreshDatabaseConnection.mockResolvedValue({});
   });
 
   it("explains how to enable it when no server can create databases", async () => {
@@ -59,10 +75,9 @@ describe("DatabaseCreation", () => {
     expect(api.runDatabasePlan).not.toHaveBeenCalled();
   });
 
-  it("runs only with the exact phrase, then offers to connect the new database", async () => {
+  it("runs only with the exact phrase, then connects the new database and opens its approval at once", async () => {
     const user = userEvent.setup();
     api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
-    api.connectDatabase.mockResolvedValue({});
     renderPage();
     await planIt(user);
     const run = screen.getByRole("button", { name: "Jalankan" });
@@ -70,9 +85,40 @@ describe("DatabaseCreation", () => {
     await user.type(screen.getByLabelText("Frasa konfirmasi"), "BUAT DATABASE hai_toko");
     await user.click(run);
     expect(api.runDatabasePlan).toHaveBeenCalledWith("d1", "BUAT DATABASE hai_toko", "d1");
-    await user.click(await screen.findByRole("button", { name: /Hubungkan database ini/ }));
+    expect(await screen.findByText(/DATA REPORTS review=hai_toko/)).toBeTruthy();
     expect(api.connectDatabase).toHaveBeenCalledWith({ name: "hai_toko", profile: "local_mysql", database: "hai_toko" });
-    expect(await screen.findByText(/Terhubung/)).toBeTruthy();
+    expect(api.refreshDatabaseConnection).not.toHaveBeenCalled();
+    expect(screen.getByText(/Database baru dibuat: hai_toko/)).toBeTruthy();
+  });
+
+  it("reads the schema again, instead of connecting twice, when tables were added to a database that is already connected", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlan.mockResolvedValue({ ...PLAN, mode: "add_tables", confirm_phrase: "TAMBAH TABEL hai_toko" });
+    api.runDatabasePlan.mockResolvedValue({ status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_baru"], profile: "local_mysql" });
+    api.listDatabaseConnections.mockResolvedValue({ connections: [{ name: "toko", file: "local_mysql/hai_toko", status: "active" }] });
+    renderPage();
+    await planIt(user);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "TAMBAH TABEL hai_toko");
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    expect(await screen.findByText(/DATA REPORTS review=toko/)).toBeTruthy();
+    expect(api.refreshDatabaseConnection).toHaveBeenCalledWith("toko");
+    expect(api.connectDatabase).not.toHaveBeenCalled();
+    expect(screen.getByText(/Tabel baru ditambahkan ke hai_toko/)).toBeTruthy();
+  });
+
+  it("stays on the page with a clear message and a manual button when the automatic connection fails", async () => {
+    const user = userEvent.setup();
+    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+    api.connectDatabase.mockRejectedValueOnce(Object.assign(new Error("403"), { status: 403,
+      body: { detail: { message: "The principal lacks database:connection:manage." } } }));
+    renderPage();
+    await planIt(user);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "BUAT DATABASE hai_toko");
+    await user.click(screen.getByRole("button", { name: "Jalankan" }));
+    expect(await screen.findByText(/Database sudah dibuat, tetapi belum bisa dihubungkan otomatis/)).toBeTruthy();
+    expect(screen.queryByText(/DATA REPORTS review/)).toBeNull();
+    await user.click(await screen.findByRole("button", { name: /Hubungkan database ini/ }));
+    expect(api.connectDatabase).toHaveBeenCalledTimes(2);
   });
 
   it("signs in again when asked, and shows the plan again without running it", async () => {
@@ -105,7 +151,7 @@ describe("DatabaseCreation", () => {
     expect(card).toMatch(/tidak disentuh/);
     await user.type(screen.getByLabelText("Frasa konfirmasi"), "TAMBAH TABEL hai_toko");
     await user.click(screen.getByRole("button", { name: "Jalankan" }));
-    expect(await screen.findByText(/Tabel tb_bahan ditambahkan ke database hai_toko/)).toBeTruthy();
+    expect(await screen.findByText(/Tabel baru ditambahkan ke hai_toko/)).toBeTruthy();
   });
 
   it("says which server is used when only one is configured, and where to set up another", async () => {

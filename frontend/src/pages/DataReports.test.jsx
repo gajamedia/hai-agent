@@ -45,9 +45,9 @@ const PLAN = {
   },
 };
 
-const renderPage = () =>
+const renderPage = (state) =>
   render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[{ pathname: "/", state }]}>
       <DataReports />
     </MemoryRouter>,
   );
@@ -217,6 +217,41 @@ describe("DataReports", () => {
     await user.click(screen.getByRole("button", { name: /Setujui untuk sales/ }));
     const [, tables] = api.approveDatabaseTables.mock.calls[0];
     expect(tables.sales.writable).toEqual({ operations: ["update"], columns: ["amount"] });
+  });
+
+  it("arriving from Buat database opens the new database's approval already filled in, and sends it when approved", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "hai_toko", status: "connected_pending_approval", tables: [] }] });
+    api.getDatabaseSchema.mockResolvedValue({ ...SCHEMA, writer_available: true, approved: {} });
+    api.approveDatabaseTables.mockResolvedValue({ status: "active" });
+    renderPage({ review: "hai_toko", message: "Database baru dibuat: hai_toko. Sudah terhubung." });
+    expect(await screen.findByText(/Database baru dibuat: hai_toko/)).toBeTruthy();
+    expect(api.getDatabaseSchema).toHaveBeenCalledWith("hai_toko");
+    expect((await screen.findByRole("checkbox", { name: "sales" })).checked).toBe(true);
+    const group = await screen.findByLabelText("Izin ubah data sales");
+    expect(within(group).getByRole("checkbox", { name: "Tambah" }).checked).toBe(true);
+    expect(within(group).getByRole("checkbox", { name: "Ubah" }).checked).toBe(true);
+    expect(within(group).getByRole("checkbox", { name: "Hapus" }).checked).toBe(false);      // never pre-ticked
+    await user.click(screen.getByRole("button", { name: /Setujui untuk hai_toko/ }));
+    const [name, tables] = api.approveDatabaseTables.mock.calls[0];
+    expect(name).toBe("hai_toko");
+    expect(tables.sales.columns).toEqual(["id", "region", "amount"]);
+    expect(tables.sales.filterable_columns).toEqual(["id", "region", "amount"]);
+    expect(tables.sales.writable).toEqual({ operations: ["insert", "update"], columns: ["region", "amount"] });   // not the key
+    expect(tables.sales.key_column).toBe("id");
+  });
+
+  it("the preset keeps what was approved before and fills in only the new tables, and offers no writing without a writer", async () => {
+    api.listDatabaseConnections.mockResolvedValue({ connections: [{ name: "x", status: "active", tables: ["sales"] }] });
+    api.getDatabaseSchema.mockResolvedValue({
+      tables: [...SCHEMA.tables, { name: "tb_baru", columns: [{ name: "id", declared_type: "INT", primary_key: true },
+                                                              { name: "nama", declared_type: "TEXT", primary_key: false }] }],
+      approved: { sales: { columns: ["id"], filterable_columns: [], writable: null } } });
+    renderPage({ review: "x", message: "m" });
+    expect((await screen.findByRole("checkbox", { name: "tb_baru" })).checked).toBe(true);     // new: filled in
+    expect(screen.queryByLabelText(/Izin ubah data/)).toBeNull();                              // no writer account
+    expect(screen.queryAllByRole("checkbox", { name: "region" })).toHaveLength(0);             // old table keeps its narrow choice
   });
 
   it("does not offer write permissions on a connection without a writer account", async () => {

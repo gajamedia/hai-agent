@@ -220,6 +220,10 @@ export async function connectDatabase(payload, signal) {
   return jsonPost(`${API_V1}/database-connections`, payload, signal);
 }
 
+export async function refreshDatabaseConnection(name, signal) {
+  return jsonPost(`${API_V1}/database-connections/${encodeURIComponent(name)}/refresh`, {}, signal);
+}
+
 export async function approveDatabaseTables(name, tables, signal) {
   return jsonPost(
     `${API_V1}/database-connections/${encodeURIComponent(name)}/approve`,

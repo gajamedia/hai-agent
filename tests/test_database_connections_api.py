@@ -202,3 +202,39 @@ def test_an_active_connection_shows_what_is_approved_and_can_be_changed(world):
     assert client.post(f"{DB}/sales/approve", json=changed).json()["status"] == "active"
     assert client.get(f"{DB}/sales/schema").json()["approved"]["sales"]["filterable_columns"] == [
         "region", "product", "amount"]
+
+
+def test_refresh_reads_new_tables_and_keeps_the_approval_and_reports_working(world):
+    build, tmp = world
+    client, _ = build((CONNECT, PERMISSION, READ), _plan(filters={"product": "gadget"}))
+    _connect(client)
+    assert client.post(f"{DB}/sales/approve", json=APPROVE).json()["status"] == "active"
+    with sqlite3.connect(tmp / "data" / "sales.sqlite3") as db:                  # the agent adds a table later
+        db.execute("CREATE TABLE tb_extra (id INTEGER PRIMARY KEY, nama TEXT)")
+    assert {t["name"] for t in client.get(f"{DB}/sales/schema").json()["tables"]} == {"sales"}   # not seen yet
+    refreshed = client.post(f"{DB}/sales/refresh")
+    assert refreshed.status_code == 200 and refreshed.json()["status"] == "active"
+    schema = client.get(f"{DB}/sales/schema").json()
+    assert {t["name"] for t in schema["tables"]} == {"sales", "tb_extra"}
+    assert set(schema["approved"]) == {"sales"}                                  # nothing new was approved by itself
+    body = client.post(REPORTS, json={"question": "Penjualan gadget per wilayah"}).json()
+    assert body["status"] == "succeeded", body                                   # the reports still run
+
+
+def test_refresh_that_cannot_keep_the_approval_leaves_the_connection_as_it_was(world):
+    build, tmp = world
+    client, _ = build((CONNECT, PERMISSION, READ), _plan())
+    _connect(client)
+    client.post(f"{DB}/sales/approve", json=APPROVE)
+    with sqlite3.connect(tmp / "data" / "sales.sqlite3") as db:
+        db.execute("ALTER TABLE sales RENAME TO sales_old")                      # the approved table is gone
+    assert client.post(f"{DB}/sales/refresh").status_code == 422
+    assert client.get(f"{DB}").json()["connections"][0]["status"] == "active"    # still as it was
+
+
+def test_refresh_needs_the_connection_permission_and_an_existing_connection(world):
+    build, _ = world
+    client, _ = build((PERMISSION, READ))
+    assert client.post(f"{DB}/sales/refresh").status_code == 403
+    client2, _ = build((CONNECT, PERMISSION, READ))
+    assert client2.post(f"{DB}/nope/refresh").status_code == 404
