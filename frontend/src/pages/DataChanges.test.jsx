@@ -148,6 +148,24 @@ describe("DataChanges", () => {
     expect(screen.getByText(/perlu disetujui/)).toBeTruthy();
   });
 
+  it("with self-approval on, tells a one-person user to approve below instead of asking for someone else", async () => {
+    const user = userEvent.setup();
+    api.getDataChangeConfig.mockResolvedValue({ max_rows_ceiling: 500, default_max_rows: 100, self_approval: true });
+    api.createDataChangePlan.mockResolvedValue({
+      ...PLAN, requires_approval: true, plan: { ...PLAN.plan, operation: "delete", set: undefined } });
+    api.listDataChangeApprovals.mockResolvedValue({ approvals: [
+      { ...PLAN, plan_id: "c1", owner: "hai.dev", own: true, requires_approval: true,
+        plan: { ...PLAN.plan, operation: "delete", set: undefined } }] });
+    renderPage();
+    await planIt(user);
+    expect(screen.getByText(/Setujui sendiri/)).toBeTruthy();
+    expect(screen.queryByText(/perlu disetujui orang lain/)).toBeNull();
+    expect(await screen.findByText(/Anda sendiri/)).toBeTruthy();
+    expect(screen.getByText(/mengizinkan Anda menyetujui perubahan buatan sendiri/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Setujui" }));
+    expect(api.decideDataChange).toHaveBeenCalledWith("c1", "approve");
+  });
+
   it("shows a refusal instead of a plan", async () => {
     const user = userEvent.setup();
     api.createDataChangePlan.mockResolvedValue({

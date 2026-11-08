@@ -78,20 +78,21 @@ class ChangePlanStore:
         with self._lock:
             return self._owned(plan_id, owner)
 
-    def waiting_for_approval(self, viewer: str) -> list[StoredChange]:
-        """Plans someone else made that still need a second person (never your own)."""
+    def waiting_for_approval(self, viewer: str, *, include_own: bool = False) -> list[StoredChange]:
+        """Plans that still need a second person: someone else's, and yours only when self-approval is on."""
         with self._lock:
             self._purge()
             return [p for p in self._plans.values()
-                    if p.state == "planned" and p.requires_approval and p.owner != viewer]
+                    if p.state == "planned" and p.requires_approval and (include_own or p.owner != viewer)]
 
-    def approve(self, plan_id: str, approver: str, *, reject: bool = False) -> StoredChange:
+    def approve(self, plan_id: str, approver: str, *, reject: bool = False,
+                allow_self: bool = False) -> StoredChange:
         with self._lock:
             self._purge()
             plan = self._plans.get(plan_id)
             if plan is None:
                 raise ChangePlanNotFound("change plan not found or expired")
-            if plan.owner == approver:
+            if plan.owner == approver and not allow_self:
                 raise ChangePlanConflict("you cannot approve your own change")
             if not plan.requires_approval or plan.state != "planned":
                 raise ChangePlanConflict("this change is not waiting for approval")

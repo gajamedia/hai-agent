@@ -269,8 +269,13 @@ export default function DataChanges() {
             <div className="at-warning">
               <ShieldCheck size={16} />
               <div>
-                Perubahan ini perlu disetujui <b>orang lain</b> (peran data-change-approver) sebelum bisa dijalankan.
-                Minta mereka membuka halaman ini; setelah disetujui, tekan Jalankan.
+                {config?.self_approval ? (
+                  <>Perubahan ini perlu disetujui dulu (peran data-change-approver). Setujui sendiri di kotak
+                    <b> Menunggu persetujuan</b> di bawah (Anda akan diminta login ulang), lalu tekan Jalankan.</>
+                ) : (
+                  <>Perubahan ini perlu disetujui <b>orang lain</b> (peran data-change-approver) sebelum bisa dijalankan.
+                    Minta mereka membuka halaman ini; setelah disetujui, tekan Jalankan.</>
+                )}
               </div>
             </div>
           )}
@@ -300,10 +305,13 @@ export default function DataChanges() {
       {approvals && (
         <section className="at-panel" aria-label="Menunggu persetujuan">
           <h2>Menunggu persetujuan Anda</h2>
+          {config?.self_approval && (
+            <small>Pengaturan server mengizinkan Anda menyetujui perubahan buatan sendiri; tetap perlu login ulang.</small>
+          )}
           {approvals.length === 0 && <p>Tidak ada.</p>}
           {approvals.map((item) => (
             <div key={item.plan_id} className="at-config-summary">
-              <span>Diajukan oleh <b>{item.owner}</b> pada database <b>{item.database}</b>: “{item.question}”</span>
+              <span>Diajukan oleh <b>{item.own ? "Anda sendiri" : item.owner}</b> pada database <b>{item.database}</b>: “{item.question}”</span>
               <ChangeSummary change={item} />
               <div className="at-form-row">
                 <button type="button" className="at-button at-button-primary" disabled={busy}

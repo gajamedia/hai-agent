@@ -58,6 +58,10 @@ USERS = {
     "bob": AuthenticatedPrincipal(actor_id="bob", permissions=(APPROVE,), auth_time=int(time.time())),
     "bob-stale": AuthenticatedPrincipal(actor_id="bob", permissions=(APPROVE,),
                                         auth_time=int(time.time()) - 3600),
+    "solo": AuthenticatedPrincipal(actor_id="solo", permissions=(MANAGE, PLAN, EXECUTE, APPROVE),
+                                   auth_time=int(time.time())),
+    "solo-stale": AuthenticatedPrincipal(actor_id="solo", permissions=(PLAN, EXECUTE, APPROVE),
+                                         auth_time=int(time.time()) - 3600),
     "reader": AuthenticatedPrincipal(actor_id="carol", permissions=("report:table:run",),
                                      auth_time=int(time.time())),
 }
@@ -245,6 +249,48 @@ def test_delete_waits_for_a_different_person(world):
     assert _count(db) == 28
     assert [e.get("event") or e.get("status") for e in _audit(tmp)] == ["planned", "approved", "committed"]
     assert _audit(tmp)[-1]["approver"] == "bob" and len(_audit(tmp)[-1]["before_image"]) == 2
+
+
+def test_one_person_cannot_approve_their_own_delete_unless_the_server_allows_it(world, monkeypatch):
+    client, provider, db, _ = world
+    monkeypatch.delenv("HAI_DATA_CHANGE_SELF_APPROVAL", raising=False)
+    body = _plan(client, provider, DELETE, user="solo").json()
+    assert _call(client, "POST", f"/approvals/{body['plan_id']}/approve", "solo").status_code == 409
+    assert _call(client, "GET", "/approvals", "solo").json()["approvals"] == []
+    assert _call(client, "GET", "/config", "solo").json()["self_approval"] is False
+    for value in ("", "false", "0", "no", "maybe"):                                  # anything else stays off
+        monkeypatch.setenv("HAI_DATA_CHANGE_SELF_APPROVAL", value)
+        assert _call(client, "GET", "/config", "solo").json()["self_approval"] is False
+    assert _count(db) == 30
+
+
+def test_with_self_approval_on_one_person_plans_approves_and_runs_a_delete_with_a_fresh_login_each_time(world, monkeypatch):
+    client, provider, db, tmp = world
+    monkeypatch.setenv("HAI_DATA_CHANGE_SELF_APPROVAL", "true")
+    assert _call(client, "GET", "/config", "solo").json()["self_approval"] is True
+    body = _plan(client, provider, DELETE, user="solo").json()
+    run = {"confirm": body["confirm_phrase"]}
+    assert _call(client, "POST", f"/plans/{body['plan_id']}/run", "solo", json=run).status_code == 409   # not approved yet
+    listed = _call(client, "GET", "/approvals", "solo").json()["approvals"]
+    assert [(a["plan_id"], a["own"]) for a in listed] == [(body["plan_id"], True)]
+    assert _call(client, "POST", f"/approvals/{body['plan_id']}/approve", "solo-stale").status_code == 403   # fresh login
+    assert _call(client, "POST", f"/approvals/{body['plan_id']}/approve", "alice").status_code == 403        # needs the role
+    assert _call(client, "POST", f"/approvals/{body['plan_id']}/approve", "solo").status_code == 200
+    done = _call(client, "POST", f"/plans/{body['plan_id']}/run", "solo", json=run)
+    assert done.status_code == 200 and done.json()["approved_by"] == "solo" and _count(db) == 28
+    events = _audit(tmp)
+    approved = [e for e in events if e.get("event") == "approved"][0]
+    assert approved["approver"] == "solo" and approved["owner"] == "solo" and approved["self_approval"] is True
+    assert events[-1]["status"] == "committed" and len(events[-1]["before_image"]) == 2
+
+
+def test_with_self_approval_on_a_second_person_is_still_listed_and_still_works(world, monkeypatch):
+    client, provider, db, _ = world
+    monkeypatch.setenv("HAI_DATA_CHANGE_SELF_APPROVAL", "true")
+    body = _plan(client, provider, DELETE).json()                                   # alice's plan
+    listed = _call(client, "GET", "/approvals", "bob").json()["approvals"]
+    assert [(a["plan_id"], a["own"]) for a in listed] == [(body["plan_id"], False)]
+    assert _call(client, "POST", f"/approvals/{body['plan_id']}/approve", "bob").status_code == 200
 
 
 def test_a_rejected_change_cannot_run(world):

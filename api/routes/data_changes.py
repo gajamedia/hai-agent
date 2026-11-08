@@ -76,6 +76,9 @@ def settings() -> dict[str, Any]:
         "max_rows_ceiling": _int_env("HAI_DATA_CHANGE_MAX_ROWS", DEFAULT_MAX_ROWS_CEILING, 1, 1_000_000),
         "default_max_rows": 100,
         "approval": mode,
+        # Off by default. On a one-person setup the owner may approve their own plan; the approval is still a
+        # separate step that needs a fresh sign-in, and both decisions are in the audit trail.
+        "self_approval": os.getenv("HAI_DATA_CHANGE_SELF_APPROVAL", "").strip().lower() in {"1", "true", "yes"},
         "step_up_max_age_seconds": _int_env("HAI_STEPUP_MAX_AGE_SECONDS", 120, 30, 900),
     }
 
@@ -110,11 +113,11 @@ def _plans(request: Request) -> ChangePlanStore:
     return store
 
 
-def _view(stored, store, *, with_phrase: bool) -> dict[str, Any]:
+def _view(stored, store, *, with_phrase: bool, viewer: str | None = None) -> dict[str, Any]:
     out = {"plan_id": stored.plan_id, "database": stored.database, "question": stored.question,
            "plan": stored.summary, "preview": stored.preview, "expected_rows": stored.expected_rows,
            "requires_approval": stored.requires_approval, "state": stored.state,
-           "approved_by": stored.approved_by, "owner": stored.owner,
+           "approved_by": stored.approved_by, "owner": stored.owner, "own": stored.owner == viewer,
            "expires_in_seconds": store.seconds_left(stored)}
     if with_phrase:
         out["confirm_phrase"] = stored.confirm_phrase
@@ -270,8 +273,9 @@ def list_approvals(request: Request):
     """Changes by other people that wait for a second person (never your own)."""
     principal = _principal(request, APPROVE)
     store = _plans(request)
-    return {"approvals": [_view(p, store, with_phrase=False)
-                          for p in store.waiting_for_approval(principal.actor_id)]}
+    own = settings()["self_approval"]
+    return {"approvals": [_view(p, store, with_phrase=False, viewer=principal.actor_id)
+                          for p in store.waiting_for_approval(principal.actor_id, include_own=own)]}
 
 
 def _decide(plan_id: str, request: Request, *, reject: bool):
@@ -280,14 +284,16 @@ def _decide(plan_id: str, request: Request, *, reject: bool):
         _require_recent_login(principal)
     store = _plans(request)
     try:
-        stored = store.approve(plan_id, principal.actor_id, reject=reject)
+        stored = store.approve(plan_id, principal.actor_id, reject=reject,
+                               allow_self=settings()["self_approval"])
     except ChangePlanNotFound as exc:
         raise _err(404, "plan_not_found", str(exc)) from exc
     except ChangePlanConflict as exc:
         raise _err(409, "approval_not_possible", str(exc)) from exc
     stored.service.audit("rejected" if reject else "approved", plan_id=stored.plan_id,
                          approver=principal.actor_id, owner=stored.owner, plan=stored.summary,
-                         expected_rows=stored.expected_rows)
+                         expected_rows=stored.expected_rows,
+                         self_approval=stored.owner == principal.actor_id)
     return {"plan_id": stored.plan_id, "status": stored.state}
 
 
