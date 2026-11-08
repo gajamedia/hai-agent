@@ -3,6 +3,7 @@
     python scripts/connect_sqlserver.py                                 # diagnose and test the connection
     python scripts/connect_sqlserver.py --create-reader --database dbsales
     python scripts/connect_sqlserver.py --create-creator                # lets the agent create databases
+    python scripts/connect_sqlserver.py --server "10.62.10.34,1433" --admin-user sa --create-reader --database db1
 
 Diagnose (changes nothing):
   * lists the SQL Server instances installed here (Windows registry), whether each service is running,
@@ -31,6 +32,7 @@ Diagnose (changes nothing):
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -132,9 +134,35 @@ def pick_driver(drivers: list[str]) -> str | None:
 
 
 def connection_string(driver: str, server: str, *, database: str = "master", user: str = "", password: str = "") -> str:
-    login = f"UID={user};PWD={password}" if user else "Trusted_Connection=yes"
-    # The server is on this computer; the certificate is not verified for that reason only.
+    # Braces make the password literal, so a ; or = in it cannot add connection keywords.
+    login = f"UID={user};PWD={{{password.replace('}', '}}')}}}" if user else "Trusted_Connection=yes"
+    # Encrypted, but the server certificate is not verified (the profile gets ssl "require", the same).
     return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};{login};TrustServerCertificate=yes;Encrypt=yes"
+
+
+def split_server(server: str) -> tuple[str, int]:
+    """'10.62.10.34,1433' -> ('10.62.10.34', 1433); '(local)\\SQLEXPRESS' -> ('(local)\\SQLEXPRESS', 0)."""
+    host, comma, port = server.partition(",")
+    if not comma:
+        return server, 0
+    if not port.strip().isdigit() or not 1 <= int(port) <= 65535:
+        raise SetupError(f"'{server}': the port after the comma must be a number from 1 to 65535")
+    return host.strip(), int(port)
+
+
+def profile_entry(server: str, database: str, login: str, env_var: str) -> dict[str, Any]:
+    """The profile as the app will read it, validated here so a bad one is never written."""
+    from api.database_engines import EngineError, parse_profiles
+    host, port = split_server(server)
+    entry: dict[str, Any] = {"type": "sqlserver", "server": host, "database": database, "user": login,
+                             "password_env": env_var, "ssl": "require"}
+    if port:
+        entry["port"] = port
+    try:
+        parse_profiles({"check_only": entry})
+    except EngineError as exc:
+        raise SetupError(f"the server or names cannot be used in a profile: {exc}") from exc
+    return entry
 
 
 # ------------------------------------------------------------------ diagnose
@@ -212,8 +240,7 @@ def create_reader(*, admin_connect: Callable[[str], Any], reader_connect: Callab
     env_var = f"HAI_{profile.upper()}_PASSWORD"
     set_env_value(env_path, env_var, password)
     profiles = json.loads(profiles_path.read_text("utf-8-sig")) if profiles_path.exists() else {}
-    profiles[profile] = {"type": "sqlserver", "server": server, "database": database, "user": login,
-                         "password_env": env_var, "ssl": "require"}
+    profiles[profile] = profile_entry(server, database, login, env_var)
     profiles_path.parent.mkdir(parents=True, exist_ok=True)
     profiles_path.write_text(json.dumps(profiles, indent=2) + "\n", encoding="utf-8")
     out(f"[ok] account created; password stored in {env_path.name}, profile '{profile}' in {profiles_path.name}")
@@ -310,10 +337,13 @@ def _default_profiles(env_path: Path) -> Path:
 
 def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_reader=read_instances,
          service_state: Callable[[str], str] | None = None, ask: Callable[[str], str] = input,
+         ask_secret: Callable[[str], str] = getpass.getpass,
          out: Callable[[str], None] = print) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--instance", default="", help="instance name (default: the first one found)")
     parser.add_argument("--server", default="", help="override the server string, e.g. (local)\\SQLEXPRESS or host,1433")
+    parser.add_argument("--admin-user", default="", help="administrator SQL login (e.g. sa) for a server on another "
+                        "computer; its password is asked here and never stored. Default: your Windows login")
     parser.add_argument("--create-reader", action="store_true")
     parser.add_argument("--create-creator", action="store_true", help="let the agent create databases (CREATE ANY DATABASE)")
     parser.add_argument("--creator-user", default="hai_sql_creator")
@@ -370,14 +400,22 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
         out("Unexpected instance name.")
         return 1
 
-    out(f"Connecting to {server} with your Windows login...")
+    admin_password = ""
+    if args.admin_user:
+        admin_password = ask_secret(f"Password of {args.admin_user} (not shown, not stored): ")
+        out(f"Connecting to {server} as {args.admin_user}...")
+    else:
+        out(f"Connecting to {server} with your Windows login...")
 
     def connect(database: str = "master", user: str = "", password: str = ""):
         return pyodbc_module.connect(connection_string(driver, server, database=database, user=user,
                                                        password=password), timeout=8)
 
+    def connect_admin(database: str = "master"):
+        return connect(database, args.admin_user, admin_password) if args.admin_user else connect(database)
+
     try:
-        conn = connect()
+        conn = connect_admin()
     except Exception as exc:  # noqa: BLE001 - the driver's message is the useful part
         out(f"  could not connect: {str(exc)[:300]}")
         return 1
@@ -390,7 +428,7 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
         profiles_path = Path(args.profiles) if args.profiles else _default_profiles(Path(args.env))
         try:
             return create_creator(
-                admin_connect=lambda db: connect(db), creator_connect=lambda u, p: connect("master", u, p),
+                admin_connect=connect_admin, creator_connect=lambda u, p: connect("master", u, p),
                 login=args.creator_user, profile=args.profile, info=info, env_path=Path(args.env),
                 profiles_path=profiles_path, ask=ask, out=out)
         except SetupError as exc:
@@ -407,7 +445,7 @@ def main(argv: list[str] | None = None, *, pyodbc_module: Any = None, instances_
     profiles_path = Path(args.profiles) if args.profiles else _default_profiles(Path(args.env))
     try:
         return create_reader(
-            admin_connect=lambda db: connect(db), reader_connect=lambda db, u, p: connect(db, u, p),
+            admin_connect=connect_admin, reader_connect=lambda db, u, p: connect(db, u, p),
             database=args.database, login=args.user, profile=args.profile, server=server, info=info,
             env_path=Path(args.env), profiles_path=profiles_path, ask=ask, out=out)
     except SetupError as exc:

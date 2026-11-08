@@ -359,6 +359,30 @@ How it stays read-only: SQL Server has no read-only session flag, so the engine 
 administrator or database owner, that holds anything beyond CONNECT and SELECT (or server-wide rights), or that
 can INSERT, UPDATE, DELETE or ALTER any table. Reports use only SELECT statements the agent builds itself.
 
+### SQL Server on another computer (for example 10.62.10.34)
+
+Prepare on the SQL Server machine (a DBA does this once): enable TCP/IP in *SQL Server Configuration Manager*
+(Network Configuration > Protocols > TCP/IP, set a fixed port such as 1433 under IPAll), restart the service, and
+allow that port in the firewall for this computer only. The server must accept SQL logins (mixed mode).
+
+Then, from this computer, with an administrator SQL login such as `sa` (its password is asked in the terminal,
+never shown, never stored):
+
+```powershell
+python scripts\discover_databases.py --host 10.62.10.34          # does it answer on 1433?
+python scripts\connect_sqlserver.py --server "10.62.10.34,1433" --admin-user sa --create-reader --database <db>
+python scripts\connect_sqlserver.py --server "10.62.10.34,1433" --admin-user sa --create-creator
+python scripts\check_database_profile.py local_sqlserver
+```
+
+The profile then holds `"server": "10.62.10.34", "port": 1433` (use `--profile name` for a second server, so it
+does not replace `local_sqlserver`). Connections are encrypted; the certificate is not verified unless you set
+`"ssl": "verify"` in the profile, which needs a certificate this computer trusts (do that for anything beyond a
+trusted LAN). If you would rather not give this tool an administrator login, the DBA can create the read-only login
+(`db_datareader` and `db_denydatawriter` on one database) and give you its name; put its password in `.env` and
+write the profile by hand as shown above. A named instance is written `"server": "10.62.10.34\SQL2019"` (the SQL
+Browser service must be running) or, better, with its fixed port.
+
 ### Creating databases and tables on SQL Server (the "Buat database" page)
 
 ```powershell

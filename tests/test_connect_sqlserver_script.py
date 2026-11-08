@@ -237,3 +237,56 @@ def test_the_reader_plan_names_only_roles_that_exist_in_sql_server():
     plan = tool.plan_statements("hai_sql_reader", "dbsales", "x")
     used = {m for sqls in plan.values() for s in sqls for m in re.findall(r"\[(db_[a-z]+)\]", s)}
     assert used == {"db_datareader", "db_denydatawriter"} and used <= fixed
+
+
+# ------------------------------------------------------------- a server on another computer
+def run_remote(tmp_path, pyodbc, argv, answers=("y",), secret="Adm}in;pw=1"):
+    lines, replies = [], iter(answers)
+    code = tool.main(["--env", str(tmp_path / ".env"), "--profiles", str(tmp_path / "profiles.json"), *argv],
+                     pyodbc_module=pyodbc, instances_reader=lambda: [], service_state=lambda n: "running",
+                     ask=lambda p: next(replies), ask_secret=lambda p: secret, out=lines.append)
+    return code, chr(10).join(lines)
+
+
+def test_a_remote_server_is_reached_with_an_admin_login_whose_password_is_asked_and_kept_out_of_everything(tmp_path):
+    fake = FakePyodbc()
+    code, text = run_remote(tmp_path, fake, ["--server", "10.62.10.34,1433", "--admin-user", "sa"])
+    assert code == 0 and "Connecting to 10.62.10.34,1433 as sa" in text and "dbsales" in text
+    first = fake.strings[0]
+    assert "SERVER=10.62.10.34,1433;" in first and "UID=sa;" in first and "Trusted_Connection" not in first
+    assert "PWD={Adm}}in;pw=1}" in first                           # braces: the password cannot add keywords
+    assert "Adm}in" not in text and not (tmp_path / ".env").exists()
+
+
+def test_create_reader_on_a_remote_server_writes_host_and_port_apart_and_the_app_accepts_it(tmp_path):
+    fake = FakePyodbc()
+    code, text = run_remote(tmp_path, fake, ["--server", "10.62.10.34,1433", "--admin-user", "sa",
+                                             "--create-reader", "--database", "dbsales"])
+    assert code == 0
+    saved = json.loads((tmp_path / "profiles.json").read_text("utf-8"))["local_sqlserver"]
+    assert (saved["server"], saved["port"], saved["ssl"]) == ("10.62.10.34", 1433, "require")
+    from api.database_engines import parse_profiles
+    profile = parse_profiles({"x1": saved})["x1"]
+    assert (profile.host, profile.port) == ("10.62.10.34", 1433)
+    assert "Adm}in" not in (tmp_path / ".env").read_text("utf-8") + text
+
+
+@pytest.mark.parametrize("server,expected", [
+    ("10.62.10.34,1433", ("10.62.10.34", 1433)), ("db.example.com", ("db.example.com", 0)),
+    (r"(local)\SQLEXPRESS", (r"(local)\SQLEXPRESS", 0)), (r"10.1.1.1\SQL2019,50123", (r"10.1.1.1\SQL2019", 50123)),
+])
+def test_a_server_string_is_split_into_host_and_port(server, expected):
+    assert tool.split_server(server) == expected
+
+
+@pytest.mark.parametrize("server", ["10.0.0.1,abc", "10.0.0.1,0", "10.0.0.1,70000", "10.0.0.1,"])
+def test_a_bad_port_is_refused(server):
+    with pytest.raises(tool.SetupError):
+        tool.split_server(server)
+
+
+def test_a_server_name_that_cannot_be_a_profile_is_refused_before_anything_is_written(tmp_path):
+    fake = FakePyodbc()
+    code, text = run_remote(tmp_path, fake, ["--server", "db;Trusted_Connection=yes", "--admin-user", "sa",
+                                             "--create-reader", "--database", "dbsales"])
+    assert code != 0 and not (tmp_path / "profiles.json").exists()
