@@ -108,6 +108,14 @@ describe("DatabaseCreation", () => {
     expect(await screen.findByText(/Tabel tb_bahan ditambahkan ke database hai_toko/)).toBeTruthy();
   });
 
+  it("says which server is used when only one is configured, and where to set up another", async () => {
+    api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [{ name: "local_mysql", prefix: "hai_", type: "mysql" }] });
+    renderPage();
+    expect(await screen.findByText(/local_mysql \(mysql\)/)).toBeTruthy();
+    expect(screen.getByText(/siapkan dulu profilnya/)).toBeTruthy();
+    expect(screen.queryByLabelText("Server")).toBeNull();
+  });
+
   it("lets the user pick between a MySQL and a SQL Server server, and sends the chosen profile", async () => {
     const user = userEvent.setup();
     api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [

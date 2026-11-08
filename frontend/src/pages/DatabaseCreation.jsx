@@ -139,6 +139,10 @@ export default function DatabaseCreation() {
                 </select>
               </label>
             )}
+            {profiles.length === 1 && (
+              <small>Server: <b>{profiles[0].name}{profiles[0].type ? ` (${profiles[0].type})` : ""}</b>. Untuk SQL Server,
+                siapkan dulu profilnya (lihat docs/TRY_DATA_REPORTS_LOCALLY.md bagian 9); setelah itu muncul pilihan server di sini.</small>
+            )}
             <label>
               Perintah
               <textarea
