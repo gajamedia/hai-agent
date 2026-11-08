@@ -343,6 +343,34 @@ Restart the backend, sign in again, open **Buat database**, then **Hubungkan dat
 A database created this way is then approved for reading (and, if you wish, writing) in **Ubah persetujuan**
 like any other. Only MySQL, and only the server profiles that have a creator account, can do this for now.
 
+### Adding a server from the browser, accounts included (MySQL and SQL Server)
+
+On **Buat database**, open **Tambah server database** and keep **Otomatis**. Enter the profile name, the server
+(a name or IP) and an **administrator** login (`root` / `sa`), then press **Periksa server**: the page shows the
+databases found, which of the three accounts already exist and which will be created. Press **Buat akun dan
+simpan server**. The accounts are named after the profile (`hai_rd_<name>` reader, `hai_cr_<name>` creator,
+`hai_wr_<name>` writer), so another profile on the same server never has its passwords reset. Their random
+passwords go to `.env`; the profile goes to the profiles file; the server is usable at once.
+
+The administrator password is used for that one request and dropped: it is not written to any file, to the
+environment, to the audit trail or to a log, and it is never returned. The call needs both
+`database:connection:manage` and `database:create:manage` and a fresh Keycloak login. On a shared or production
+server switch it off with `HAI_ADMIN_SETUP=false`; the scripts remain the way to prepare accounts there.
+
+### Adding a server whose accounts already exist (manual)
+
+Choose **Akun sudah ada (manual)**. Pick MySQL, SQL Server or PostgreSQL, then fill in the
+address (a name or IP, so another computer works too), the database to read and the **limited** accounts an
+administrator already made: the read-only account and, optionally, the account that creates databases and the one
+that changes data. Never enter `sa` or `root`; the engines refuse an administrator as the reading account.
+
+The connection is tested first with the same read-only checks the server uses. Only if it works is the profile
+written to the profiles file (`HAI_DATABASE_PROFILES`, default `data/reports/profiles.json`) and each password to
+`.env` as `HAI_DB_<NAME>_PASSWORD` (`_CREATOR_PASSWORD`, `_WRITER_PASSWORD`). The server then shows up in the
+Server list at once. Creating the limited accounts themselves is still a one-time job for an administrator
+(`scripts/setup_mysql_*_user.py`, `scripts/connect_sqlserver.py`); the web page never takes that password.
+Set `HAI_SERVER_REGISTRATION=false` to switch the form off (for example on a shared server).
+
 ## Troubleshooting
 
 | You see | Meaning | Fix |

@@ -126,6 +126,11 @@ class DatabaseRuntimeRegistry:
         self.authorization_policy = authorization_policy
         self.llm_provider_factory = llm_provider_factory
         self.max_connections = max_connections
+        # Where servers added from the browser are saved; None switches that feature off.
+        self.profiles_path: Path | None = None
+        self.env_path: Path | None = None
+        # Creating the limited accounts with a one-time administrator password (see database_admin_setup).
+        self.admin_setup_enabled = False
         self._engines: dict[str, Any] = {"sqlite": SQLiteEngine(self.data_root)}
         by_type: dict[str, dict[str, Any]] = {}
         for pname, profile in (profiles or {}).items():
@@ -332,6 +337,114 @@ class DatabaseRuntimeRegistry:
                     item["prefix"] = profile.creator_prefix     # databases made by the agent can be chosen
                 out.append(item)
         return sorted(out, key=lambda item: item["name"])
+
+    # ----------------------------------------------- servers added from the form
+    @property
+    def can_register_servers(self) -> bool:
+        return self.profiles_path is not None and self.env_path is not None
+
+    def register_server(self, spec: Any) -> dict[str, Any]:
+        """Test and save a server definition, then make it usable at once (no restart)."""
+        from api import database_server_setup as setup
+        if not self.can_register_servers:
+            raise RegistryError("adding servers from the browser is not configured on this server")
+        with self._lock:
+            taken = {p["name"] for p in self.profiles()}
+            try:
+                profile = setup.register(spec, profiles_path=self.profiles_path, env_path=self.env_path,
+                                         taken=taken)
+            except setup.ServerSetupError as exc:
+                raise RegistryError(str(exc)) from exc
+            engine_class = {"postgresql": PostgresEngine, "mysql": MySQLEngine, "sqlserver": SQLServerEngine}
+            impl = self._engines.get(profile.type)
+            if impl is None:
+                self._engines[profile.type] = engine_class[profile.type]({profile.name: profile})
+            else:
+                impl.profiles[profile.name] = profile
+            self._creators.pop(profile.name, None)
+        return next(p for p in self.profiles() if p["name"] == profile.name)
+
+    @property
+    def can_setup_accounts(self) -> bool:
+        return self.can_register_servers and self.admin_setup_enabled
+
+    def _admin_fields(self, payload: Any) -> dict[str, Any]:
+        from api import database_admin_setup as admin
+        if not self.can_setup_accounts:
+            raise RegistryError("automatic account setup is switched off on this server")
+        allowed = {"name", "type", "host", "port", "admin_user", "admin_password", "database", "roles"}
+        if not isinstance(payload, Mapping) or set(payload) - allowed:
+            raise RegistryError("unsupported fields in the request")
+        name = payload.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{1,31}", name):
+            raise RegistryError("name: lowercase letters, digits or _ (2-32 characters, starts with a letter)")
+        return {"name": name, "kind": payload.get("type"), "host": payload.get("host"), "port": payload.get("port"),
+                "admin_user": payload.get("admin_user"), "admin_password": payload.get("admin_password")}
+
+    def inspect_server(self, payload: Any) -> dict[str, Any]:
+        """Look at a server with a one-time administrator login; nothing is changed or kept."""
+        from api import database_admin_setup as admin
+        fields = self._admin_fields(payload)
+        taken = fields["name"] in {p["name"] for p in self.profiles()}
+        try:
+            found = admin.inspect(**fields)
+        except admin.AdminSetupError as exc:
+            raise RegistryError(str(exc)) from exc
+        return {**found, "name_taken": taken}
+
+    def provision_server(self, payload: Any) -> dict[str, Any]:
+        """Create the limited accounts with a one-time administrator login, then register the server."""
+        from api import database_admin_setup as admin
+        fields = self._admin_fields(payload)
+        if fields["name"] in {p["name"] for p in self.profiles()}:
+            raise RegistryError(f"a server named '{fields['name']}' already exists")
+        roles = payload.get("roles", list(admin.ROLES))
+        if not isinstance(roles, list) or set(roles) - set(admin.ROLES):
+            raise RegistryError("roles must be a list of reader, creator, writer")
+        database = payload.get("database") or ""
+        if not isinstance(database, str):
+            raise RegistryError("database is not valid")
+        try:
+            made = admin.provision(**fields, database=database.strip(), roles=tuple(roles))
+        except admin.AdminSetupError as exc:
+            raise RegistryError(str(exc)) from exc
+        finally:
+            fields["admin_password"] = None
+        names, passwords = made["names"], made["passwords"]
+        spec: dict[str, Any] = {"name": fields["name"], "type": fields["kind"], "host": fields["host"],
+                                "user": names["reader"], "password": passwords["reader"]}
+        if database.strip():
+            spec["database"] = database.strip()
+        if fields["port"] not in (None, ""):
+            spec["port"] = fields["port"]
+        for role in ("creator", "writer"):
+            if role in names:
+                spec[role] = {"user": names[role], "password": passwords[role]}
+        try:
+            added = self.register_server(spec)
+        except RegistryError as exc:
+            raise RegistryError(f"the accounts were created but the server could not be registered: {exc}") from exc
+        return {**added, "accounts": names, "reset": made["reset"]}
+
+    def remove_server(self, name: str) -> None:
+        """Forget a server added from the form; refused while a connection still uses it."""
+        from api import database_server_setup as setup
+        if not self.can_register_servers:
+            raise RegistryError("adding servers from the browser is not configured on this server")
+        with self._lock:
+            impl = next((e for e in self._engines.values()
+                         if name in getattr(e, "profiles", {}) and e.kind != "sqlite"), None)
+            if impl is None:
+                raise RegistryNotFound(f"no server named '{name}'")
+            if any(c.filename == name or str(c.filename).startswith(f"{name}/")
+                   for c in self._connections.values()):
+                raise RegistryError("a connection still uses this server; disconnect it first")
+            try:
+                setup.forget(name, profiles_path=self.profiles_path)
+            except setup.ServerSetupError as exc:
+                raise RegistryError(str(exc)) from exc
+            del impl.profiles[name]
+            self._creators.pop(name, None)
 
     def profile_engine(self, name: Any) -> str | None:
         """Engine type of a named server profile, or None if there is no such profile."""
@@ -698,12 +811,22 @@ def registry_factory_from_environment(app: Any) -> DatabaseRuntimeRegistry:
         raise RuntimeError("HAI_DATABASE_ROOT requires HAI_AUTH_ENABLED=true "
                            "(runtime database connections need an authorization policy).")
     profiles = None
+    repo = Path(__file__).resolve().parents[1]
     profiles_path = os.getenv("HAI_DATABASE_PROFILES", "").strip()
+    default_profiles = repo / "data" / "reports" / "profiles.json"
+    if not profiles_path and default_profiles.is_file():
+        profiles_path = str(default_profiles)          # servers added from the form land here
     if profiles_path:
         from api.database_engines import load_profiles
         profiles = load_profiles(profiles_path)
-    return DatabaseRuntimeRegistry(data_root=root, work_dir=work, authorization_policy=policy,
-                                   llm_provider_factory=create_llm_provider, profiles=profiles)
+    registry = DatabaseRuntimeRegistry(data_root=root, work_dir=work, authorization_policy=policy,
+                                       llm_provider_factory=create_llm_provider, profiles=profiles)
+    if os.getenv("HAI_SERVER_REGISTRATION", "true").strip().lower() not in {"0", "false", "no", "off"}:
+        registry.profiles_path = Path(profiles_path or default_profiles)
+        registry.env_path = Path(os.getenv("HAI_ENV_FILE", "").strip() or repo / ".env")
+        registry.admin_setup_enabled = os.getenv("HAI_ADMIN_SETUP", "true").strip().lower() not in {
+            "0", "false", "no", "off"}
+    return registry
 
 
 __all__ = ["registry_factory_from_environment", "DatabaseRuntimeRegistry", "RegistryError", "RegistryNotFound",

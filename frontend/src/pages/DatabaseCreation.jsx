@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, LoaderCircle } from "lucide-react";
+import { AlertCircle, LoaderCircle } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   cancelDatabasePlan,
@@ -12,6 +12,7 @@ import {
   runDatabasePlan,
 } from "../api/client.js";
 import { signInAgain } from "../auth/keycloak.js";
+import AddServerForm from "./AddServerForm.jsx";
 import "./autonomous-testing.css";
 
 const PENDING_KEY = "hai.databaseCreation.pending";
@@ -64,6 +65,13 @@ export default function DatabaseCreation() {
     return () => { active = false; };
   }, []);
 
+  // A server was just added from the form: show it in the list, and pick it if it can create databases.
+  const reloadProfiles = async (added) => {
+    const cfg = await getDatabaseCreationConfig();
+    setProfiles(cfg.profiles || []);
+    if (added && (cfg.profiles || []).some((p) => p.name === added.name)) setProfile(added.name);
+  };
+
   const guarded = async (work) => {
     setBusy(true);
     setMessage(null);
@@ -95,7 +103,7 @@ export default function DatabaseCreation() {
         await connectDatabase({ name, profile: created.profile, database: created.database });
       }
       setConnected(true);
-      navigate("/data-reports", { state: {
+      navigate("/database-agent/reports", { state: {
         review: name,
         message: `${created.mode === "add_tables" ? "Tabel baru ditambahkan ke" : "Database baru dibuat:"} ${created.database}. `
           + "Sudah terhubung, dan pilihan di bawah sudah diisi (boleh difilter, tambah, ubah). Periksa lalu tekan Setujui.",
@@ -139,7 +147,6 @@ export default function DatabaseCreation() {
   return (
     <main className="at-page">
       <header className="at-header">
-        <Link to="/data-reports" className="at-back"><ArrowLeft size={14} /> Data Reports</Link>
         <h1>Buat database</h1>
         <p>
           Minta agent membuat database baru beserta tabelnya, atau menambah tabel baru ke database yang sudah ada. Agent tidak menulis SQL: ia memilih rancangan
@@ -152,12 +159,14 @@ export default function DatabaseCreation() {
         <div className="at-warning" role="alert"><AlertCircle size={16} /><div>{message.text}</div></div>
       )}
 
+      <AddServerForm onAdded={reloadProfiles} />
+
       <section className="at-panel">
         {profiles.length === 0 ? (
           <p>
-            Belum ada server yang boleh membuat database. Jalankan{" "}
-            <code>python scripts\setup_mysql_creator_user.py &lt;profil&gt;</code> lalu restart backend
-            (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
+            Belum ada server yang boleh membuat database. Tambahkan server di atas (isi akun pembuat database),
+            atau jalankan <code>python scripts\setup_mysql_creator_user.py &lt;profil&gt;</code> lalu restart
+            backend (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
           </p>
         ) : (
           <form className="at-form" onSubmit={makePlan} aria-label="Rancang database">
@@ -172,7 +181,7 @@ export default function DatabaseCreation() {
             )}
             {profiles.length === 1 && (
               <small>Server: <b>{profiles[0].name}{profiles[0].type ? ` (${profiles[0].type})` : ""}</b>. Untuk SQL Server,
-                siapkan dulu profilnya (lihat docs/TRY_DATA_REPORTS_LOCALLY.md bagian 9); setelah itu muncul pilihan server di sini.</small>
+                tambahkan servernya lewat panel <b>Tambah server database</b> di atas; setelah itu muncul pilihan server di sini.</small>
             )}
             <label>
               Perintah
@@ -235,7 +244,7 @@ export default function DatabaseCreation() {
             : `Database ${result.database} dibuat${result.tables.length ? ` dengan tabel ${result.tables.join(", ")}` : ""}.`}
           <div className="at-form-row">
             {connected ? (
-              <span>Terhubung. Buka <Link to="/data-reports">Data Reports</Link> untuk menyetujui tabelnya
+              <span>Terhubung. Buka tab <Link to="/database-agent/reports">Laporan</Link> untuk menyetujui tabelnya
                 (centang <b>boleh diubah</b> bila ingin mengisinya).</span>
             ) : (
               <button type="button" className="at-button at-button-primary" disabled={busy} onClick={connect}>

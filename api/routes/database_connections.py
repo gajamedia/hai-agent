@@ -83,7 +83,49 @@ def connect_database(request: Request, payload: dict[str, Any]):
 def list_profiles(request: Request):
     """Server-defined connection profiles (name and type only)."""
     _, registry = _guard(request)
-    return {"profiles": registry.profiles(), "engines": registry.available_engines()}
+    return {"profiles": registry.profiles(), "engines": registry.available_engines(),
+            "server_registration": registry.can_register_servers,
+            "account_setup": registry.can_setup_accounts}
+
+
+@router.post("/servers")
+def add_server(request: Request, payload: dict[str, Any]):
+    """Add a database server from a form: tested first, saved only if the test passes."""
+    _, registry = _guard(request)
+    return _call(registry.register_server, payload)
+
+
+def _guard_admin(request: Request):
+    """Account setup with an administrator password: the manage AND the create permission, and a fresh login."""
+    principal, registry = _guard(request)
+    try:
+        request.app.state.authorization_policy.require(principal, "database:create:manage")
+    except AuthorizationDenied as exc:
+        raise _err(403, "permission_denied", "The principal lacks database:create:manage.") from exc
+    from api.routes.data_changes import _require_recent_login
+    _require_recent_login(principal)
+    return registry
+
+
+@router.post("/servers/inspect")
+def inspect_server(request: Request, payload: dict[str, Any]):
+    """Look at a server with a one-time administrator login. The password is used for this request only."""
+    registry = _guard_admin(request)
+    return _call(registry.inspect_server, payload)
+
+
+@router.post("/servers/auto")
+def auto_server(request: Request, payload: dict[str, Any]):
+    """Create the limited accounts with a one-time administrator login and register the server."""
+    registry = _guard_admin(request)
+    return _call(registry.provision_server, payload)
+
+
+@router.delete("/servers/{name}")
+def remove_server(name: str, request: Request):
+    _, registry = _guard(request)
+    _call(registry.remove_server, name)
+    return {"name": name, "status": "removed"}
 
 
 @router.get("")
