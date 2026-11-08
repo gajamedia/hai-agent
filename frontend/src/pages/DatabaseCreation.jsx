@@ -72,6 +72,13 @@ export default function DatabaseCreation() {
     if (added && (cfg.profiles || []).some((p) => p.name === added.name)) setProfile(added.name);
   };
 
+  // A server was removed from the list: drop it from the choices (and from the selection if it was chosen).
+  const serverRemoved = async (name) => {
+    const cfg = await getDatabaseCreationConfig();
+    setProfiles(cfg.profiles || []);
+    setProfile((current) => (current === name ? "" : current));
+  };
+
   const guarded = async (work) => {
     setBusy(true);
     setMessage(null);
@@ -159,7 +166,7 @@ export default function DatabaseCreation() {
         <div className="at-warning" role="alert"><AlertCircle size={16} /><div>{message.text}</div></div>
       )}
 
-      <AddServerForm onAdded={reloadProfiles} />
+      <AddServerForm onAdded={reloadProfiles} onRemoved={serverRemoved} />
 
       <section className="at-panel">
         {profiles.length === 0 ? (

@@ -232,6 +232,13 @@ export async function autoSetupDatabaseServer(payload, signal) {
   return jsonPost(`${API_V1}/database-connections/servers/auto`, payload, signal);
 }
 
+export async function removeDatabaseServer(name, signal) {
+  return request(`${API_V1}/database-connections/servers/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    signal,
+  });
+}
+
 export async function refreshDatabaseConnection(name, signal) {
   return jsonPost(`${API_V1}/database-connections/${encodeURIComponent(name)}/refresh`, {}, signal);
 }

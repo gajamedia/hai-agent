@@ -16,6 +16,8 @@ vi.mock("../api/client", () => ({
   getDatabaseCreationConfig: vi.fn(),
   getDatabasePlan: vi.fn(),
   listDatabaseConnections: vi.fn(),
+  listDatabaseProfiles: vi.fn(),
+  removeDatabaseServer: vi.fn(),
   refreshDatabaseConnection: vi.fn(),
   runDatabasePlan: vi.fn(),
 }));
@@ -57,6 +59,7 @@ describe("DatabaseCreation", () => {
     api.getDatabaseCreationConfig.mockResolvedValue({ profiles: [{ name: "local_mysql", prefix: "hai_" }] });
     api.createDatabasePlan.mockResolvedValue(PLAN);
     api.listDatabaseConnections.mockResolvedValue({ connections: [] });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
     api.connectDatabase.mockResolvedValue({});
     api.refreshDatabaseConnection.mockResolvedValue({});
   });
@@ -95,6 +98,32 @@ describe("DatabaseCreation", () => {
     expect(await screen.findByText(/srv_two \(sqlserver\) tersimpan/)).toBeTruthy();
     expect(screen.getByRole("option", { name: "srv_two (sqlserver)" })).toBeTruthy();
     expect(screen.getByLabelText("Akun baca: password").value).toBe("");     // password is not kept
+  });
+
+  it("removes a server profile from the list after confirmation", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.listDatabaseProfiles
+      .mockResolvedValueOnce({ profiles: [{ name: "local_mysql", type: "mysql" }, { name: "old_srv", type: "mysql" }] })
+      .mockResolvedValue({ profiles: [{ name: "local_mysql", type: "mysql" }] });
+    api.removeDatabaseServer.mockResolvedValue({ name: "old_srv", status: "removed" });
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Hapus server old_srv" }));
+    expect(api.removeDatabaseServer).toHaveBeenCalledWith("old_srv");
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Hapus server old_srv" })).toBeNull());
+    expect(screen.getByRole("button", { name: "Hapus server local_mysql" })).toBeTruthy();
+  });
+
+  it("shows the reason when a server cannot be removed (still connected)", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [{ name: "old_srv", type: "mysql" }] });
+    api.removeDatabaseServer.mockRejectedValue(Object.assign(new Error("422"), {
+      body: { detail: { message: "a connection still uses this server; disconnect it first" } } }));
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Hapus server old_srv" }));
+    expect(await screen.findByText(/disconnect it first/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hapus server old_srv" })).toBeTruthy();
   });
 
   it("sets up the three accounts automatically from one administrator login, then forgets that password", async () => {

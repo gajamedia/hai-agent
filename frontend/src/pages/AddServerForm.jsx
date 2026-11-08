@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { LoaderCircle } from "lucide-react";
-import { addDatabaseServer, autoSetupDatabaseServer, inspectDatabaseServer } from "../api/client.js";
+import {
+  addDatabaseServer, autoSetupDatabaseServer, inspectDatabaseServer, listDatabaseProfiles, removeDatabaseServer,
+} from "../api/client.js";
 import { signInAgain } from "../auth/keycloak.js";
 
 const EMPTY = {
@@ -229,18 +231,64 @@ function AutoForm({ onAdded }) {
   );
 }
 
-export default function AddServerForm({ onAdded }) {
+/** Servers already in the list, each with a Hapus button. Deleting forgets the profile only; no database is touched. */
+function ServerList({ servers, onRemoved }) {
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+
+  const remove = async (name) => {
+    if (!window.confirm(`Hapus profil server "${name}" dari daftar? Database di server itu tidak dihapus, `
+      + "hanya profil koneksinya. Koneksi yang masih memakai server ini harus diputus dulu.")) return;
+    setBusy(name); setError("");
+    try {
+      await removeDatabaseServer(name);
+      await onRemoved?.(name);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  if (servers.length === 0) return null;
+  return (
+    <div aria-label="Server terdaftar">
+      <p><b>Server terdaftar</b></p>
+      {error && <div className="at-warning" role="alert"><div>{error}</div></div>}
+      <ul>
+        {servers.map((s) => (
+          <li key={s.name}>
+            {s.name} ({s.type}){" "}
+            <button type="button" className="at-button at-button-secondary" disabled={busy === s.name}
+              aria-label={`Hapus server ${s.name}`} onClick={() => remove(s.name)}>
+              Hapus
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default function AddServerForm({ onAdded, onRemoved }) {
   const [mode, setMode] = useState("auto");
+  const [servers, setServers] = useState([]);
+  const loadServers = useCallback(
+    () => listDatabaseProfiles().then((d) => setServers(d.profiles || [])).catch(() => setServers([])), []);
+  useEffect(() => { loadServers(); }, [loadServers]);
+  const added = async (server) => { await loadServers(); await onAdded?.(server); };
+  const removed = async (name) => { await loadServers(); await onRemoved?.(name); };
   return (
     <details className="at-panel" aria-label="Tambah server">
       <summary><b>Tambah server database</b></summary>
+      <ServerList servers={servers} onRemoved={removed} />
       <div className="at-form-row" role="radiogroup" aria-label="Cara menambah server">
         <label><input type="radio" name="server-mode" checked={mode === "auto"} onChange={() => setMode("auto")} />
           {" "}Otomatis (pakai akun administrator sekali)</label>
         <label><input type="radio" name="server-mode" checked={mode === "manual"} onChange={() => setMode("manual")} />
           {" "}Akun sudah ada (manual)</label>
       </div>
-      {mode === "auto" ? <AutoForm onAdded={onAdded} /> : <ManualForm onAdded={onAdded} />}
+      {mode === "auto" ? <AutoForm onAdded={added} /> : <ManualForm onAdded={added} />}
     </details>
   );
 }
