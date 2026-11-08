@@ -155,6 +155,24 @@ def test_update_needs_the_exact_phrase_and_changes_only_the_previewed_rows(world
     assert events == ["planned", "committed"]
 
 
+def test_when_no_llm_provider_answers_the_user_gets_a_clear_retry_message(world, caplog):
+    client, provider, _db, _tmp = world
+
+    def timeout(_request):
+        from agent.llm.fallback_provider import AllProvidersFailedError
+        raise AllProvidersFailedError([("opencode", TimeoutError("timed out after 60 s")),
+                                       ("claude-code", TimeoutError("timed out after 120 s"))])
+    provider.complete = timeout
+    with caplog.at_level("WARNING"):
+        response = _call(client, "POST", "/plans", "alice", json={"question": "q", "max_rows": 1})
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["error"] == "llm_unavailable" and "did not answer in time" in detail["message"]
+    assert "Nothing was changed" in detail["message"] and "opencode" not in response.text
+    assert "timed out after 60 s" in caplog.text                       # the operator still sees why
+    assert "Traceback" not in caplog.text
+
+
 def test_a_plan_runs_once(world):
     client, provider, db, _ = world
     body = _plan(client, provider, UPDATE).json()

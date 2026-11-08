@@ -12,11 +12,12 @@ from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
+from agent.llm.fallback_provider import AllProvidersFailedError
 from agent.workflow.database_creation import CreationRefused
 from api.data_change_plans import ChangePlanConflict, ChangePlanNotFound, ChangePlanStore
 from api.database_runtime_registry import RegistryError, RegistryNotFound
 from api.routes.data_changes import (
-    _err, _principal, _registry, _require_recent_login,
+    LLM_UNAVAILABLE, _err, _principal, _registry, _require_recent_login,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,9 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
         result = service.designer.plan(question)
     except ValueError as exc:
         raise _err(422, "invalid_question", str(exc)) from exc
+    except AllProvidersFailedError as exc:
+        logger.warning("Database design: no LLM provider answered: %s", exc)
+        raise _err(503, "llm_unavailable", LLM_UNAVAILABLE) from exc
     except Exception as exc:
         logger.exception("Database design failed.")
         raise _err(503, "creation_failed", "A plan could not be produced right now.") from exc

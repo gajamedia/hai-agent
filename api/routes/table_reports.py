@@ -12,6 +12,7 @@ from fastapi.encoders import jsonable_encoder
 from api.security.authentication import AuthenticationError, get_attached_principal
 from api.security.authorization import AuthorizationDenied, AuthorizationPolicy
 from api.security.trusted_execution_context import TrustedExecutionContext
+from agent.llm.fallback_provider import AllProvidersFailedError
 from agent.workflow.table_report_service import TableReportService
 from api.database_runtime_registry import (
     DatabaseRuntimeRegistry, RegistryError, RegistryNotFound,
@@ -146,6 +147,10 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
         plan = service.plan(question, report_format)
     except ValueError as exc:
         raise _error(422, "invalid_question", str(exc)) from exc
+    except AllProvidersFailedError as exc:
+        logger.warning("Table report planning: no LLM provider answered: %s", exc)
+        raise _error(503, "llm_unavailable", "The AI model did not answer in time, so no plan was made. Try again "
+                     "in a minute; if it keeps happening an administrator can run scripts/check_llm_provider.py.") from exc
     except Exception as exc:
         logger.exception("Table report planning failed.")
         raise _error(503, "table_report_failed", "A plan could not be produced right now.") from exc

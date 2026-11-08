@@ -18,6 +18,8 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
+
+from agent.llm.fallback_provider import AllProvidersFailedError
 from fastapi.encoders import jsonable_encoder
 
 from agent.workflow.data_change import ChangeRefused, DEFAULT_MAX_ROWS_CEILING
@@ -29,6 +31,9 @@ from api.security.authentication import AuthenticationError, get_attached_princi
 from api.security.authorization import AuthorizationDenied, AuthorizationPolicy
 
 logger = logging.getLogger(__name__)
+LLM_UNAVAILABLE = (
+    "The AI model did not answer in time, so no plan was made. Nothing was changed. Try again in a minute; "
+    "if it keeps happening an administrator can run scripts/check_llm_provider.py.")
 router = APIRouter(prefix="/data-changes", tags=["data-changes"])
 PLAN, EXECUTE, APPROVE = "data:change:plan", "data:change:execute", "data:change:approve"
 _now = time.time  # replaced in tests
@@ -147,6 +152,9 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
         result = service.planner.plan(question, max_rows=max_rows)
     except ValueError as exc:
         raise _err(422, "invalid_question", str(exc)) from exc
+    except AllProvidersFailedError as exc:
+        logger.warning("Data change planning: no LLM provider answered: %s", exc)
+        raise _err(503, "llm_unavailable", LLM_UNAVAILABLE) from exc
     except Exception as exc:
         logger.exception("Data change planning failed.")
         raise _err(503, "data_change_failed", "A plan could not be produced right now.") from exc
