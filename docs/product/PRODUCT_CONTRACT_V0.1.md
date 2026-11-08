@@ -2,7 +2,7 @@
 
 -   **Status:** Draft for review
 -   **Project:** `new-hAI-agent` (`hai-agent`)
--   **Contract version:** 0.1
+-   **Contract version:** 0.1 (direction and status updated 8 November 2026; see section 1.1)
 -   **Date:** 18 October 2026
 -   **Scope:** Product behavior, runtime boundaries, safety
     expectations, acceptance evidence, and known gaps
@@ -26,6 +26,27 @@ follow-up required.
 
 A generated plan is not an execution record. An execution record is not,
 by itself, proof that the user's goal was achieved.
+
+### 1.1 Product direction (updated 8 November 2026)
+
+The product direction is a **general autonomous AI Agent platform**: a shared
+foundation plus a growing set of **agent features**. The foundation provides
+cognition (interpretation, reasoning, planning), memory and learning, a trusted
+capability registry and lifecycle, risk and approval policy, authentication and
+authorization, audit and trace, idempotency, and recovery. An agent feature is a
+module that uses this foundation for one field of work.
+
+-   **Database Agent** (reports, data changes, database creation, multiple SQL
+    engines) is the first feature and the only one currently working against real
+    external systems.
+-   Further features are planned and must be built on the same foundation without
+    creating execution paths outside its policy, approval and audit controls.
+-   A standard contract for agent features (capabilities, risk and approval
+    policy, preview, outcome verifier, API routes, UI surface) is not yet defined
+    (see G-08).
+-   Sections 4 to 8 were written when the Room simulation was the only
+    environment. Their principles apply to every feature; the simulation-specific
+    statements describe the Room environment only.
 
 ## 2. Product principles
 
@@ -374,6 +395,46 @@ broad-domain generalization.
                                                          evidence
   ------------------------------------------------------------------------------
 
+### 12.1 Status update (8 November 2026)
+
+Status is based on reading the repository, the commit history and a full backend
+test run (5220 passed, 82 skipped, 0 failed; the skipped tests are opt-in live
+database/LLM tests). It is not a new acceptance run of the P0 benchmark.
+
+  ID     Status            Note
+  ------ ----------------- -----------------------------------------------------
+  G-01   Partially closed  `api/plan_run_idempotency.py` is used by the
+                           `/execution/plan-run` route. Scope, restart behavior
+                           and external side effects remain to be specified and
+                           tested; Database Agent write paths need their own
+                           statement.
+  G-02   Open              Lifecycle is still per feature, not one task lifecycle.
+  G-03   Partially closed  The frontend client now has a plan-run function;
+                           truthful lifecycle presentation is not verified.
+  G-04   Largely closed    Keycloak JWT/JWKS authentication, role-based
+                           authorization, audit and step-up login exist.
+                           Multi-tenant boundaries and deployment controls remain
+                           open.
+  G-05   Open              No API/SDK versioning or compatibility policy.
+  G-06   Partially closed  Database connectors exist (MySQL, PostgreSQL, SQL
+                           Server, SQLite) with their own approval flow. No other
+                           connector type. Connector acceptance evidence is
+                           mostly unit and integration tests, not the P0
+                           benchmark.
+  G-07   Open              Benchmarks remain fixture-scoped.
+  G-08   New               No standard agent-feature contract; Database Agent
+                           modules are not yet verified to route through the
+                           common capability registry, gateway and approval
+                           manager. Audit and map them (Phase 1).
+  G-09   New               No persistent task queue, scheduler, trigger or
+                           restart recovery for tasks, so the agent acts only
+                           on a user request (Phase 2).
+  G-10   New               Outcome verification exists only for the Room
+                           simulation; reports and data changes rely on preview
+                           and approval, not on a verifier (Phase 2).
+  G-11   New               No application deployment package and process-local
+                           simulation state (Phase 4).
+
 ## 13. Non-goals for this contract version
 
 -   Claiming production readiness based only on Room simulation tests.
@@ -405,6 +466,8 @@ truthful outcome semantics, acceptance thresholds, and known gaps are
 documented and accepted. P0.1 completion does not mean that all gaps
 above are resolved.
 
-**Next phase:** P0.2 --- Architecture and Security Reconciliation, using
-G-01 through G-06 as inputs and preserving the current
-cognitive/execution separation.
+**Next phase:** Roadmap phase 1 (agent-feature contract and mapping of the
+Database Agent onto the shared foundation), using G-08 and the open items of
+G-01 to G-06 as inputs and preserving the current cognitive/execution
+separation. Phase 0 (documentation alignment, repository cleanup, review of
+skipped tests) was done on 8 November 2026.

@@ -1,5 +1,7 @@
 # hAI Agent API scaffold
 
+> **Catatan:** dokumen ini adalah catatan awal untuk endpoint kognitif (`/api/v1/cognitive/run`). Daftar endpoint terkini ada di [README.md](README.md#api) dan di `/docs` saat backend berjalan.
+
 This scaffold adds a FastAPI layer around the existing provider-neutral
 `AgentCognitiveRuntime` and `CognitiveOrchestrator`. It does not replace the
 Agent core.
