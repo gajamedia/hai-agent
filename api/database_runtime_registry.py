@@ -849,6 +849,20 @@ class DatabaseRuntimeRegistry:
                 raise RegistryError(f"connection '{name}' has no approved tables yet")
             return conn.service
 
+    def service_token(self, name: str | None) -> str | None:
+        """Stable fingerprint of what a report on ``name`` may touch (engine, approved tables/columns,
+        approved relations). A plan remembers it; if the approvals change, the token changes and the plan
+        is refused. Unlike object identity it survives a restart."""
+        with self._lock:
+            conn = self._get(self.resolve_name(name))
+            if conn.service is None:
+                return None
+            relations = sorted((r.table, r.column, r.ref_table, r.ref_column) for r in conn.relations)
+            body = {"name": conn.name, "engine": conn.engine, "selection": conn.selection,
+                    "relations": relations}
+            return hashlib.sha256(
+                json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
     def resolve_name(self, name: str | None) -> str:
         """Name of the connection ``service(name)`` would use, so callers can pin it."""
         with self._lock:

@@ -10,6 +10,7 @@ from .contracts import (
     Effect,
     Feature,
     Operation,
+    PlanUnsupported,
     TERMINAL_STATUSES,
     TaskStatus,
     Verdict,
@@ -18,7 +19,7 @@ from .contracts import (
 )
 from .pipeline import (
     ApprovalRequired, ConfirmationMismatch, ExecutionFailed, PermissionDenied, PipelineError, PlanError,
-    PlatformPipeline, PolicyViolation, RunContext, RunOutcome, StepUpRequired, TaskExpired,
+    PlatformPipeline, PolicyViolation, RunContext, RunOutcome, StepUpRequired, TaskExpired, TooManyTasks,
 )
 from .registry import OperationDisabled, OperationRegistry, RegistryError, UnknownOperation
 from .store import SQLiteTaskStore, TaskConflict, TaskNotFound, TaskRecord
@@ -26,7 +27,7 @@ from .store import SQLiteTaskStore, TaskConflict, TaskNotFound, TaskRecord
 __all__ = [
     "ApprovalRequired", "ConfirmationMismatch", "ExecutionFailed", "PermissionDenied", "PipelineError",
     "PlanError", "PlatformPipeline", "PolicyViolation", "RunContext", "RunOutcome", "SQLiteTaskStore",
-    "StepUpRequired", "TaskConflict", "TaskExpired", "TaskNotFound", "TaskRecord",
+    "PlanUnsupported", "StepUpRequired", "TaskConflict", "TaskExpired", "TooManyTasks", "TaskNotFound", "TaskRecord",
     "ApprovalPolicy", "ContractError", "Effect", "Feature", "Operation", "OperationDisabled",
     "OperationRegistry", "RegistryError", "TERMINAL_STATUSES", "TaskStatus", "UnknownOperation",
     "Verdict", "Verification", "can_transition",

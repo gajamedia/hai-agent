@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS platform_tasks (
     error TEXT,
     approved_by TEXT,
     run_key TEXT,
+    exec_key TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     expires_at REAL NOT NULL
@@ -82,6 +83,7 @@ class TaskRecord:
     error: Optional[str]
     approved_by: Optional[str]
     run_key: Optional[str]
+    exec_key: Optional[str]
     created_at: float
     updated_at: float
     expires_at: float
@@ -132,6 +134,7 @@ class SQLiteTaskStore:
             preview=_load(row["preview_json"]), confirm_phrase=row["confirm_phrase"],
             result=_load(row["result_json"]), verification=_load(row["verification_json"]),
             error=row["error"], approved_by=row["approved_by"], run_key=row["run_key"],
+            exec_key=row["exec_key"],
             created_at=row["created_at"], updated_at=row["updated_at"], expires_at=row["expires_at"])
 
     def _write_audit(self, conn: sqlite3.Connection, event: str, task_id: Optional[str],
@@ -167,7 +170,7 @@ class SQLiteTaskStore:
     def transition(self, task_id: str, *, expected_version: int, new_status: TaskStatus,
                    actor: Optional[str], audit_event: str, audit_detail: Mapping[str, Any],
                    result: Any = None, verification: Any = None, error: Optional[str] = None,
-                   approved_by: Optional[str] = None,
+                   approved_by: Optional[str] = None, exec_key: Optional[str] = None,
                    extend_ttl: Optional[float] = None) -> TaskRecord:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT * FROM platform_tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -183,13 +186,22 @@ class SQLiteTaskStore:
                 "UPDATE platform_tasks SET status=?, version=version+1, updated_at=?, "
                 "result_json=COALESCE(?, result_json), verification_json=COALESCE(?, verification_json), "
                 "error=COALESCE(?, error), approved_by=COALESCE(?, approved_by), "
-                "expires_at=COALESCE(?, expires_at) WHERE task_id=?",
+                "expires_at=COALESCE(?, expires_at), exec_key=COALESCE(?, exec_key) WHERE task_id=?",
                 (new_status.value, now, _dump(result), _dump(verification), error, approved_by,
-                 None if extend_ttl is None else now + extend_ttl, task_id))
+                 None if extend_ttl is None else now + extend_ttl, exec_key, task_id))
             self._write_audit(conn, audit_event, task_id, row["operation_id"], actor,
                               {"from": current.value, "to": new_status.value, **dict(audit_detail)})
             return self._record(conn.execute(
                 "SELECT * FROM platform_tasks WHERE task_id=?", (task_id,)).fetchone())
+
+    def count_active(self, operation_id: str) -> int:
+        """Tasks of this operation that are still waiting (planned, awaiting approval or approved)
+        and have not expired."""
+        with self._lock, self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM platform_tasks WHERE operation_id=? AND expires_at>? "
+                "AND status IN ('planned','awaiting_approval','approved')",
+                (operation_id, self._clock())).fetchone()[0]
 
     def audit(self, event: str, *, task_id: Optional[str] = None, operation_id: Optional[str] = None,
               actor: Optional[str] = None, detail: Optional[Mapping[str, Any]] = None) -> None:

@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
-from .contracts import Operation, TaskStatus, Verdict, Verification
+from .contracts import Operation, PlanUnsupported, TaskStatus, Verdict, Verification
 from .registry import OperationRegistry, RegistryError
 from .store import SQLiteTaskStore, TaskConflict, TaskNotFound, TaskRecord
 
@@ -47,6 +47,10 @@ class PolicyViolation(PipelineError):
 
 
 class PlanError(PipelineError):
+    pass
+
+
+class TooManyTasks(PolicyViolation):
     pass
 
 
@@ -108,7 +112,8 @@ class PlatformPipeline:
     def __init__(self, *, registry: OperationRegistry, store: SQLiteTaskStore, authorize: Authorizer,
                  clock: Callable[[], float] = time.time, ttl_seconds: float = 900,
                  approval_risk_threshold: float = 0.5, allow_self_approval: bool = False,
-                 step_up_max_age_seconds: float = 300) -> None:
+                 step_up_max_age_seconds: float = 300,
+                 max_active_per_operation: Optional[int] = None) -> None:
         if not callable(authorize):
             raise TypeError("authorize must be callable")
         self.registry, self.store, self._authorize = registry, store, authorize
@@ -116,6 +121,7 @@ class PlatformPipeline:
         self.approval_risk_threshold = approval_risk_threshold
         self.allow_self_approval = allow_self_approval
         self.step_up_max_age = step_up_max_age_seconds
+        self.max_active_per_operation = max_active_per_operation
 
     # -- helpers -----------------------------------------------------------
 
@@ -182,6 +188,10 @@ class PlatformPipeline:
                 return existing
             idempotency_key = key
 
+        if self.max_active_per_operation is not None                 and self.store.count_active(op.id) >= self.max_active_per_operation:
+            self._refuse("too_many_tasks", operation_id=op.id, actor=actor)
+            raise TooManyTasks("too many pending tasks; try again shortly")
+
         ctx = self._context(principal, actor, op)
         try:
             raw_plan = op.plan(request, ctx) if op.plan is not None else request
@@ -194,6 +204,9 @@ class PlatformPipeline:
                 if not isinstance(phrase, str) or not phrase.strip():
                     raise PlanError("the preview must give the confirm_phrase this operation requires")
                 confirm_phrase = phrase.strip()
+        except PlanUnsupported as exc:
+            self._refuse("plan_unsupported", operation_id=op.id, actor=actor, reason=exc.reason)
+            raise
         except PipelineError as exc:
             self._refuse("plan_failed", operation_id=op.id, actor=actor, reason=str(exc))
             raise
@@ -210,6 +223,9 @@ class PlatformPipeline:
                           "approval": {"confirm_phrase": op.approval.confirm_phrase,
                                        "fresh_login": op.approval.fresh_login,
                                        "second_approver": op.approval.second_approver}})
+
+    def seconds_left(self, task: TaskRecord) -> int:
+        return max(0, int(task.expires_at - self._clock()))
 
     # -- visibility --------------------------------------------------------
 
@@ -295,15 +311,27 @@ class PlatformPipeline:
 
     # -- run ---------------------------------------------------------------
 
-    def run(self, task_id: str, principal: Any, *, confirm: Optional[str] = None) -> RunOutcome:
+    def run(self, task_id: str, principal: Any, *, confirm: Optional[str] = None,
+            idempotency_key: Optional[str] = None) -> RunOutcome:
         actor = self._actor(principal)
+        exec_key = None
+        if idempotency_key is not None:
+            exec_key = idempotency_key.strip()
+            if not exec_key or len(exec_key) > 255:
+                raise PolicyViolation("idempotency key must contain 1 to 255 non-blank characters")
         task = self.store.get(task_id)
         if task.owner != actor:
             self._refuse("run_refused", operation_id=task.operation_id, task_id=task_id, actor=actor,
                          reason="not the owner")
             raise TaskNotFound("task not found")
-        if task.status in (TaskStatus.COMPLETED, TaskStatus.UNVERIFIED):
-            return RunOutcome(task, replayed=True)
+        if task.result is not None and task.status in (
+                TaskStatus.COMPLETED, TaskStatus.UNVERIFIED, TaskStatus.FAILED):
+            # The operation ran and its result is stored (a failed *verification* keeps it; an
+            # operation that raised has none). Only the same key may read it again; anything else
+            # is a second run.
+            if exec_key is not None and exec_key == task.exec_key:
+                return RunOutcome(task, replayed=True)
+            raise TaskConflict("this task was already executed; plan it again to run it anew")
         op = self._operation(task.operation_id, actor=actor, task_id=task_id)
         self._require(principal, op.permission, operation_id=op.id, task_id=task_id)
         if task.status is TaskStatus.AWAITING_APPROVAL:
@@ -326,7 +354,8 @@ class PlatformPipeline:
         # Compare-and-set: only one caller can move the task to EXECUTING.
         task = self.store.transition(task_id, expected_version=task.version,
                                      new_status=TaskStatus.EXECUTING, actor=actor,
-                                     audit_event="task_executing", audit_detail={})
+                                     audit_event="task_executing", audit_detail={},
+                                     exec_key=exec_key)
         ctx = self._context(principal, actor, op, task_id)
         try:
             raw = op.execute(task.plan, ctx)
@@ -392,5 +421,5 @@ class PlatformPipeline:
 __all__ = [
     "ApprovalRequired", "ConfirmationMismatch", "ExecutionFailed", "PermissionDenied", "PipelineError",
     "PlanError", "PlatformPipeline", "PolicyViolation", "RunContext", "RunOutcome", "StepUpRequired",
-    "TaskExpired",
+    "TaskExpired", "TooManyTasks",
 ]

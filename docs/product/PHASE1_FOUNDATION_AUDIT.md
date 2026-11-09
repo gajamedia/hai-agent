@@ -146,3 +146,22 @@ Tiap langkah kecil, bisa di-commit terpisah, dan seluruh tes tetap hijau:
 - Pilih penanganan format audit lama (konverter, atau tulis ganda sementara).
 - Putuskan apakah unifikasi planner LLM masuk Fase 1 atau ditunda.
 - Setelah itu langkah 1a dapat dimulai.
+
+## 9. Kemajuan
+
+| Langkah | Status | Catatan |
+| --- | --- | --- |
+| 1a Kontrak dan registry | Selesai (9 Nov 2026) | `src/agent/platform/contracts.py`, `registry.py` |
+| 1b Pipeline dan penyimpanan tugas | Selesai (9 Nov 2026) | `pipeline.py`, `store.py`; audit dan status satu transaksi, replay hanya dengan `Idempotency-Key` yang sama |
+| 1c `database.report` di pipeline | Selesai (9 Nov 2026) | `api/features/database_reports.py`, `api/platform_runtime.py`; rute `/table-reports/*` tidak berubah bagi frontend |
+| 1d `database.change`, `database.create` | Belum | Termasuk penulisan ganda ke audit JSONL lama |
+| 1e Penataan paket | Belum | |
+| 1f Fitur contoh | Belum | |
+
+Catatan 1c (perilaku yang sengaja dijaga atau diubah):
+
+- Rencana laporan kini tersimpan di `<work_dir>/platform.sqlite3` dan tahan restart. Sebelumnya hanya di memori.
+- **Baris laporan tidak pernah ditulis ke penyimpanan tugas.** Tugas hanya menyimpan metadata (status, id workflow, info berkas, jumlah baris). Baris ada di berkas laporan dan, untuk replay idempoten dalam proses yang sama, di cache memori. Replay setelah restart mengembalikan fakta yang sama dengan `rows: []`.
+- Pemeriksaan "koneksi berubah" kini memakai token sidik jari persetujuan (`DatabaseRuntimeRegistry.service_token`), bukan identitas objek, sehingga tetap berlaku setelah restart. Menyetujui ulang dengan tabel/kolom yang sama tidak lagi membatalkan rencana; mengubah persetujuan tetap membatalkannya.
+- Membatalkan (`DELETE`) rencana yang sudah selesai kini dijawab 409, bukan menghapus diam-diam.
+- Verifikator laporan memeriksa status keberhasilan, id workflow, dan ukuran berkas. Pemeriksaan data dan penolakan pembacaan terpotong tetap dilakukan job runner seperti sebelumnya.

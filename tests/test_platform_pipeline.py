@@ -8,8 +8,8 @@ import pytest
 from agent.platform import (
     ApprovalPolicy, ApprovalRequired, ConfirmationMismatch, Effect, ExecutionFailed, Feature,
     Operation, OperationDisabled, OperationRegistry, PermissionDenied, PlanError, PlatformPipeline,
-    PolicyViolation, SQLiteTaskStore, StepUpRequired, TaskConflict, TaskExpired, TaskNotFound,
-    TaskStatus, UnknownOperation, Verdict, Verification,
+    PlanUnsupported, PolicyViolation, SQLiteTaskStore, StepUpRequired, TaskConflict, TaskExpired,
+    TaskNotFound, TaskStatus, TooManyTasks, UnknownOperation, Verdict, Verification,
 )
 
 
@@ -267,13 +267,71 @@ def test_approving_an_operation_without_a_second_approver_is_a_conflict():
 
 # ---- once only -------------------------------------------------------------
 
-def test_running_twice_returns_the_stored_outcome_without_running_again():
+def test_a_second_run_is_refused_and_only_the_same_key_replays_the_stored_outcome():
     pipe, _, _, _, calls = build()
     task = pipe.submit("demo.look", {"target": "a"}, alice)
-    first = pipe.run(task.task_id, alice)
-    again = pipe.run(task.task_id, alice)
+    first = pipe.run(task.task_id, alice, idempotency_key="k-1")
+    again = pipe.run(task.task_id, alice, idempotency_key=" k-1 ")
     assert again.replayed and again.task.result == first.task.result
+    for key in (None, "other"):
+        with pytest.raises(TaskConflict):
+            pipe.run(task.task_id, alice, idempotency_key=key)
+    with pytest.raises(PolicyViolation):
+        pipe.run(task.task_id, alice, idempotency_key="  ")
     assert len(calls.executed) == 1
+
+
+def test_a_result_that_failed_verification_replays_but_a_crash_never_does():
+    pipe, _, registry, _, _ = build()
+    object.__setattr__(registry.get("demo.change"), "verify",
+                       lambda p, r, c: Verification(Verdict.FAILED, {"why": "no"}))
+    task = pipe.submit("demo.change", {"target": "a"}, alice)
+    first = pipe.run(task.task_id, alice, confirm="CHANGE a", idempotency_key="k")
+    assert first.task.status is TaskStatus.FAILED
+    assert pipe.run(task.task_id, alice, confirm="CHANGE a", idempotency_key="k").replayed
+    object.__setattr__(registry.get("demo.look"), "execute", lambda p, c: 1 / 0)
+    crashed = pipe.submit("demo.look", {"target": "a"}, alice)
+    with pytest.raises(ExecutionFailed):
+        pipe.run(crashed.task_id, alice, idempotency_key="k")
+    with pytest.raises(TaskConflict):
+        pipe.run(crashed.task_id, alice, idempotency_key="k")
+
+
+def test_a_run_without_a_key_can_never_be_replayed():
+    pipe, _, _, _, calls = build()
+    task = pipe.submit("demo.look", {"target": "a"}, alice)
+    pipe.run(task.task_id, alice)
+    with pytest.raises(TaskConflict):
+        pipe.run(task.task_id, alice, idempotency_key="anything")
+    assert len(calls.executed) == 1
+
+
+def test_unsupported_plans_make_no_task_and_are_audited():
+    pipe, store, registry, _, _ = build()
+
+    def refuse(request, ctx):
+        raise PlanUnsupported("cannot do that", {"hint": 1})
+
+    object.__setattr__(registry.get("demo.look"), "plan", refuse)
+    with pytest.raises(PlanUnsupported) as info:
+        pipe.submit("demo.look", {"target": "a"}, alice)
+    assert info.value.reason == "cannot do that" and info.value.details == {"hint": 1}
+    assert store.list_by_status(list(TaskStatus)) == []
+    assert "plan_unsupported" in events(store)
+
+
+def test_pending_tasks_are_capped_per_operation_and_expiry_frees_room():
+    pipe, store, _, clock, _ = build(max_active_per_operation=2, ttl_seconds=60)
+    first = pipe.submit("demo.look", {"target": "a"}, alice)
+    pipe.submit("demo.look", {"target": "b"}, alice)
+    with pytest.raises(TooManyTasks):
+        pipe.submit("demo.look", {"target": "c"}, bob)
+    pipe.submit("demo.dual", {"target": "d"}, alice)   # another operation has its own room
+    pipe.run(first.task_id, alice)                      # a finished task no longer counts
+    pipe.submit("demo.look", {"target": "e"}, alice)
+    clock.now += 61                                     # expired tasks no longer count
+    pipe.submit("demo.look", {"target": "f"}, alice)
+    assert "too_many_tasks" in events(store)
 
 
 def test_concurrent_runs_execute_once():

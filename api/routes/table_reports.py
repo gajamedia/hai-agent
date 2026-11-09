@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -17,13 +16,17 @@ from agent.workflow.table_report_service import TableReportService
 from api.database_runtime_registry import (
     DatabaseRuntimeRegistry, RegistryError, RegistryNotFound,
 )
-from api.table_report_plans import PlanConflict, PlanNotFound, PlanStore
-from agent.workflow.table_report_service import REPORT_FORMATS
+from agent.platform import (
+    ExecutionFailed, PermissionDenied, PlanError, PlanUnsupported, TaskConflict, TaskExpired, TaskNotFound,
+    TaskStatus, TooManyTasks,
+)
+from agent.workflow.table_report_service import AskOutcome, REPORT_FORMATS
+from api.features.database_reports import REPORT_OPERATION, outcome_from_metadata
+from api.platform_runtime import get_pipeline, report_outcomes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/table-reports", tags=["table-reports"])
 _PERMISSION = "report:table:run"
-_plans_lock = threading.Lock()
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -107,16 +110,51 @@ def _body(request: Request, outcome, principal=None, database: str | None = None
     }
 
 
-def _plans(request: Request) -> PlanStore:
-    state = request.app.state
-    store = getattr(state, "table_report_plans", None)
-    if not isinstance(store, PlanStore):
-        with _plans_lock:
-            store = getattr(state, "table_report_plans", None)
-            if not isinstance(store, PlanStore):
-                store = PlanStore()
-                state.table_report_plans = store
-    return store
+def _pipeline(request: Request):
+    return get_pipeline(request.app)
+
+
+def _plan_error(exc: PlanError) -> HTTPException:
+    cause = exc.__cause__
+    if isinstance(cause, ValueError):
+        return _error(422, "invalid_question", str(cause))
+    if isinstance(cause, AllProvidersFailedError):
+        logger.warning("Table report planning: no LLM provider answered: %s", cause)
+        return _error(503, "llm_unavailable", "The AI model did not answer in time, so no plan was made. Try again "
+                      "in a minute; if it keeps happening an administrator can run scripts/check_llm_provider.py.")
+    logger.error("Table report planning failed.", exc_info=exc)
+    return _error(503, "table_report_failed", "A plan could not be produced right now.")
+
+
+def _submit(request: Request, principal, question: str, database: str | None,
+            report_format: str | None):
+    """Plan through the platform pipeline. Returns the task; raises PlanUnsupported when there is no plan."""
+    try:
+        return _pipeline(request).submit(
+            REPORT_OPERATION, {"question": question, "database": database, "format": report_format},
+            principal)
+    except PermissionDenied as exc:
+        raise _error(403, "permission_denied", f"The principal lacks the {_PERMISSION} permission.") from exc
+    except TooManyTasks as exc:
+        raise _error(429, "too_many_plans", str(exc)) from exc
+    except PlanError as exc:
+        raise _plan_error(exc) from exc
+
+
+_PROPOSED_RELATIONS_REASON = (
+    "This question needs tables to be combined in a way nobody approved yet. "
+    "Make a plan, check it, and run it to approve the relation.")
+
+
+def _finished_body(request: Request, task, principal) -> dict[str, Any]:
+    """The response for a finished task: the exact earlier body if this process still has it,
+    otherwise rebuilt from the stored facts (no rows; they are in the report file)."""
+    cache = report_outcomes(request.app)
+    body = cache.body(task.task_id)
+    if body is not None:
+        return body
+    outcome = cache.outcome(task.task_id) or outcome_from_metadata(task.plan, task.result)
+    return _body(request, outcome, principal, task.plan.get("database"))
 
 
 @router.post("")
@@ -124,16 +162,33 @@ def ask_table_report(request: Request, payload: dict[str, Any] = Body(...)):
     """Plan and run in one call: a validated, read-only table report."""
     principal = _principal(request)
     question, database, report_format = _parse(payload)
-    service, name = _service(request, database)
+    _, name = _service(request, database)
     try:
-        outcome = service.ask(question, execution_context=TrustedExecutionContext(principal),
-                              report_format=report_format)
-    except ValueError as exc:
-        raise _error(422, "invalid_question", str(exc)) from exc
+        task = _submit(request, principal, question, name or database, report_format)
+    except PlanUnsupported as exc:
+        details = exc.details
+        outcome = AskOutcome("unsupported", question, reason=exc.reason, provider=details.get("provider"),
+                             attempts=details.get("attempts", 0))
+        return _body(request, outcome, principal, name)
+    except HTTPException as exc:
+        if exc.status_code in (422, 403, 429):
+            raise
+        raise _error(503, "table_report_failed", "The report could not be produced right now.") from exc
+    pipeline = _pipeline(request)
+    if task.plan["proposed_relations"]:
+        # Nobody has looked at the relation the AI found; only the review-then-run flow may use it.
+        pipeline.cancel(task.task_id, principal)
+        outcome = AskOutcome("unsupported", question, provider=task.plan.get("provider"),
+                             attempts=task.plan.get("attempts", 0), reason=_PROPOSED_RELATIONS_REASON)
+        return _body(request, outcome, principal, name)
+    try:
+        pipeline.run(task.task_id, principal)
     except Exception as exc:  # LLM unavailable, store failure, ...
         logger.exception("Table report request failed.")
         raise _error(503, "table_report_failed",
                      "The report could not be produced right now.") from exc
+    done = pipeline.get_task(task.task_id, principal)
+    outcome = report_outcomes(request.app).outcome(done.task_id) or outcome_from_metadata(done.plan, done.result)
     return _body(request, outcome, principal, name)
 
 
@@ -142,34 +197,21 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
     """Phase 1: generate a plan for review. No data is read."""
     principal = _principal(request)
     question, database, report_format = _parse(payload)
-    service, name = _service(request, database)
+    _, name = _service(request, database)
     try:
-        plan = service.plan(question, report_format)
-    except ValueError as exc:
-        raise _error(422, "invalid_question", str(exc)) from exc
-    except AllProvidersFailedError as exc:
-        logger.warning("Table report planning: no LLM provider answered: %s", exc)
-        raise _error(503, "llm_unavailable", "The AI model did not answer in time, so no plan was made. Try again "
-                     "in a minute; if it keeps happening an administrator can run scripts/check_llm_provider.py.") from exc
-    except Exception as exc:
-        logger.exception("Table report planning failed.")
-        raise _error(503, "table_report_failed", "A plan could not be produced right now.") from exc
-    if not plan.ok:
+        task = _submit(request, principal, question, name or database, report_format)
+    except PlanUnsupported as exc:
         return JSONResponse(status_code=200, content={
-            "status": "unsupported", "question": plan.question, "reason": plan.reason,
-            "provider": plan.provider, "plan_id": None,
-            "needs_join": bool(getattr(plan, "needs_join", False))})
-    store = _plans(request)
-    try:
-        stored = store.create(owner=principal.actor_id, database=name, question=plan.question,
-                              plan_result=plan,
-                              summary=service.summarize(plan.request, getattr(plan, "proposed_relations", ())),
-                              service=service)
-    except PlanConflict as exc:
-        raise _error(429, "too_many_plans", str(exc)) from exc
-    return {"status": "planned", "plan_id": stored.plan_id, "question": stored.question,
-            "database": name, "plan": stored.summary, "provider": plan.provider,
-            "expires_in_seconds": store.seconds_left(stored)}
+            "status": "unsupported", "question": exc.details.get("question", question), "reason": exc.reason,
+            "provider": exc.details.get("provider"), "plan_id": None,
+            "needs_join": bool(exc.details.get("needs_join", False))})
+    plan = task.plan
+    return {"status": "planned", "plan_id": task.task_id, "question": plan["question"],
+            "database": plan["database"], "plan": plan["summary"], "provider": plan["provider"],
+            "expires_in_seconds": _pipeline(request).seconds_left(task)}
+
+
+_DONE = (TaskStatus.COMPLETED, TaskStatus.UNVERIFIED, TaskStatus.FAILED)
 
 
 @router.post("/plans/{plan_id}/run")
@@ -184,36 +226,40 @@ def run_plan(plan_id: str, request: Request, payload: dict[str, Any] = Body(defa
         if not key or len(key) > 255:
             raise _error(400, "invalid_idempotency_key",
                          "Idempotency-Key must contain 1 to 255 non-whitespace characters.")
-    store = _plans(request)
+    pipeline = _pipeline(request)
     try:
-        mode, stored = store.begin_run(plan_id, principal.actor_id, key)
-    except PlanNotFound as exc:
-        raise _error(404, "plan_not_found", str(exc)) from exc
-    except PlanConflict as exc:
-        raise _error(409, "plan_not_runnable", str(exc)) from exc
-    if mode == "replay":
-        return {**stored.result, "replayed": True}
+        task = pipeline.get_task(plan_id, principal)
+    except TaskNotFound as exc:
+        raise _error(404, "plan_not_found", "plan not found or expired") from exc
+    if task.operation_id != REPORT_OPERATION or task.status in (TaskStatus.CANCELLED, TaskStatus.REJECTED):
+        raise _error(404, "plan_not_found", "plan not found or expired")
 
-    # The connection must be the very one the plan was made for (same approval).
+    if task.status not in _DONE:
+        # The connection must be the very one the plan was made for (same approvals).
+        _service(request, task.plan["database"])  # 404 / 422 when it is gone or not ready
+        registry = getattr(request.app.state, "database_runtime_registry", None)
+        if isinstance(registry, DatabaseRuntimeRegistry):
+            if registry.service_token(task.plan["database"]) != task.plan["connection"]:
+                raise _error(409, "connection_changed",
+                             "The database connection changed since this plan was made; ask again.")
     try:
-        current, _ = _service(request, stored.database)
-    except HTTPException:
-        store.release(stored)
-        raise
-    if current is not stored.service:
-        store.release(stored)
-        raise _error(409, "connection_changed",
-                     "The database connection changed since this plan was made; ask again.")
-    try:
-        outcome = stored.service.run_plan(stored.question, stored.plan_result,
-                                          execution_context=TrustedExecutionContext(principal))
-    except Exception as exc:
-        store.mark_unknown(stored)
-        logger.exception("Table report run failed.")
+        outcome = pipeline.run(plan_id, principal, idempotency_key=key)
+    except (TaskNotFound, TaskExpired) as exc:
+        raise _error(404, "plan_not_found", "plan not found or expired") from exc
+    except TaskConflict as exc:
+        raise _error(409, "plan_not_runnable", str(exc)) from exc
+    except PermissionDenied as exc:
+        raise _error(403, "permission_denied", f"The principal lacks the {_PERMISSION} permission.") from exc
+    except ExecutionFailed as exc:
+        logger.error("Table report run failed.", exc_info=exc)
         raise _error(503, "table_report_failed",
                      "The report could not be produced right now.") from exc
-    result = _body(request, outcome, principal, stored.database)
-    store.finish(stored, result)
+    if outcome.replayed:
+        return {**_finished_body(request, outcome.task, principal), "replayed": True}
+    cache = report_outcomes(request.app)
+    result = _body(request, cache.outcome(plan_id) or outcome_from_metadata(outcome.task.plan, outcome.task.result),
+                   principal, task.plan["database"])
+    cache.put_body(plan_id, result)
     return {**result, "replayed": False}
 
 
@@ -250,10 +296,10 @@ def download_report(workflow_id: str, request: Request):
 def cancel_plan(plan_id: str, request: Request):
     principal = _principal(request)
     try:
-        _plans(request).cancel(plan_id, principal.actor_id)
-    except PlanNotFound as exc:
-        raise _error(404, "plan_not_found", str(exc)) from exc
-    except PlanConflict as exc:
+        _pipeline(request).cancel(plan_id, principal)
+    except TaskNotFound as exc:
+        raise _error(404, "plan_not_found", "plan not found or expired") from exc
+    except TaskConflict as exc:
         raise _error(409, "plan_not_runnable", str(exc)) from exc
     return {"plan_id": plan_id, "status": "cancelled"}
 

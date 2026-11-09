@@ -28,6 +28,19 @@ class ContractError(ValueError):
     """The feature or operation description is invalid."""
 
 
+class PlanUnsupported(Exception):
+    """Raised by an operation's ``plan`` when the request cannot be turned into a plan.
+
+    That is a normal answer, not a failure: the pipeline records it, creates no task, and
+    re-raises it so the caller can show ``reason`` (and any ``details``) to the person.
+    """
+
+    def __init__(self, reason: str, details: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.details = dict(details or {})
+
+
 class Effect(str, Enum):
     READ = "read"
     WRITE = "write"
@@ -224,6 +237,6 @@ class Feature:
 
 
 __all__ = [
-    "ApprovalPolicy", "ContractError", "Effect", "Feature", "Operation", "TERMINAL_STATUSES",
+    "ApprovalPolicy", "ContractError", "Effect", "Feature", "Operation", "PlanUnsupported", "TERMINAL_STATUSES",
     "TaskStatus", "Verdict", "Verification", "can_transition",
 ]
