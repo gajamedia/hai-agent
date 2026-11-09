@@ -115,8 +115,26 @@ class SQLiteTaskStore:
         self._shared: Optional[sqlite3.Connection] = None
         if not self._memory:
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        with self._conn() as conn:
+        with self._lock, self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring a task file made by an older version up to the current schema, keeping its tasks.
+
+        ``CREATE TABLE IF NOT EXISTS`` never adds a column to a table that already exists, so every
+        column added after the first release is listed here.
+        """
+        have = {row[1] for row in conn.execute("PRAGMA table_info(platform_tasks)")}
+        if "exec_key" not in have:
+            conn.execute("ALTER TABLE platform_tasks ADD COLUMN exec_key TEXT")
+        if "approval_json" not in have:
+            conn.execute("ALTER TABLE platform_tasks ADD COLUMN approval_json TEXT")
+        # Tasks made before approval policies were stored are report tasks: no approval was ever asked.
+        conn.execute(
+            "UPDATE platform_tasks SET approval_json=? WHERE approval_json IS NULL",
+            ('{"confirm_phrase":false,"fresh_login":false,"second_approver":false}',))
 
     def _conn(self) -> sqlite3.Connection:
         if self._memory:
