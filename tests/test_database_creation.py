@@ -471,7 +471,7 @@ def test_http_flow_needs_the_permission_a_fresh_login_and_the_exact_phrase(my_cr
         return client.request(method, f"{base}{path}", headers={"X-Test-User": user}, **kw)
 
     with TestClient(app) as client:
-        assert call("GET", "/config").json()["profiles"] == [{"name": "my_all", "prefix": "hai_"}]
+        assert call("GET", "/config").json()["profiles"] == [{"name": "my_all", "prefix": "hai_", "type": "mysql"}]
         assert call("POST", "/plans", "nocreate", json={"question": "q"}).status_code == 403
         body = call("POST", "/plans", json={"question": "buat toko"}).json()
         assert body["status"] == "planned" and body["confirm_phrase"] == f"BUAT DATABASE {db}"
