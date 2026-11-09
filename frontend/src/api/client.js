@@ -388,3 +388,15 @@ export async function cancelDatabasePlan(planId, signal) {
     signal,
   });
 }
+
+// Task history: your own tasks on the shared pipeline (reports, data changes, ...), newest first.
+// status: "waiting" | "running" | "done" | "problem" (omit for all).
+export async function listTasks({ status, limit = 50, signal } = {}) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (status) query.set("status", status);
+  return request(`${API_V1}/tasks?${query.toString()}`, { signal });
+}
+
+export async function getTask(taskId, signal) {
+  return request(`${API_V1}/tasks/${encodeURIComponent(taskId)}`, { signal });
+}

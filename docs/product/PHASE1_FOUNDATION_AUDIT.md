@@ -155,7 +155,8 @@ Tiap langkah kecil, bisa di-commit terpisah, dan seluruh tes tetap hijau:
 | 1b Pipeline dan penyimpanan tugas | Selesai (9 Nov 2026) | `pipeline.py`, `store.py`; audit dan status satu transaksi, replay hanya dengan `Idempotency-Key` yang sama |
 | 1c `database.report` di pipeline | Selesai (9 Nov 2026) | `api/features/database_reports.py`, `api/platform_runtime.py`; rute `/table-reports/*` tidak berubah bagi frontend |
 | 1d-1 `database.change` | Selesai (9 Nov 2026) | `api/features/database_changes.py`; audit JSONL lama tetap ditulis berdampingan |
-| 1d-2 `database.create` | Belum | |
+| 1d-2 `database.create` | Belum | Menunggu garis dasar tes MySQL langsung dari pemilik server |
+| Fase 2a Riwayat tugas | Selesai (10 Nov 2026) | `api/routes/tasks.py`, `frontend/src/pages/Tasks.jsx`; hanya membaca |
 | 1e Penataan paket | Belum | |
 | 1f Fitur contoh | Belum | |
 
@@ -174,3 +175,10 @@ Catatan 1d-1 (ubah data):
 - Perubahan perilaku yang disengaja: setelah `change_refused` (data berubah sejak pratinjau) rencana tidak bisa dijalankan ulang, harus direncanakan lagi (sebelumnya dilepas kembali). Membatalkan rencana yang sudah selesai dijawab 409. Respons run mendapat satu kolom baru, `verification`.
 - Pemeriksaan "koneksi berubah" memakai `DatabaseRuntimeRegistry.change_token` (sidik jari tabel, kolom, dan operasi yang boleh ditulis).
 - Audit JSONL lama (`audit/changes-<db>.jsonl`, termasuk before-image) tidak berubah dan tetap menjadi catatan forensik utama; audit platform menambah siapa, kapan, dan status tiap langkah tanpa memuat data.
+
+Catatan Fase 2a (riwayat tugas):
+
+- Menjawab sebagian G-02: satu tempat untuk melihat status siklus hidup semua tugas pipeline. Fitur berikutnya muncul di sini tanpa perubahan kode, cukup dengan `label` dan `describe` pada operasinya.
+- Kontrak operasi mendapat `label` dan `describe(plan, result)`. Deskripsi harus tetap bermakna setelah rencana dihapus (`sensitive`), jadi ia memakai hasil tugas, bukan nilai dari rencana.
+- Yang ditampilkan dibatasi: hanya tugas milik sendiri, hanya untuk operasi yang izin merencanakannya masih dimiliki, hasil hanya metadata (kunci yang diizinkan), audit hanya kolom `from`, `to`, `verdict`, `self_approved`. Tugas dengan hasil `unverified` ditampilkan sebagai "Selesai, hasil belum terverifikasi", bukan "Selesai".
+- Belum ada: membuat atau melanjutkan tugas dari halaman riwayat, pembatalan dari riwayat, notifikasi saat approval menunggu, dan retensi otomatis tugas lama.

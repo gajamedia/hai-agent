@@ -301,6 +301,47 @@ class PlatformPipeline:
             return task
         raise TaskNotFound("task not found")
 
+    def _may_use(self, principal: Any, op: Operation) -> bool:
+        try:
+            self._authorize(principal, op.plan_permission or op.permission)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def list_tasks(self, principal: Any, *, statuses: Optional[list[TaskStatus]] = None,
+                   limit: int = 50) -> tuple[list[tuple[TaskRecord, Operation]], bool]:
+        """The caller's own tasks, newest first, for operations they may still use.
+
+        Returns ``(items, has_more)``. A task whose operation is unknown, or that the person
+        no longer has the permission to plan, is left out (fail closed).
+        """
+        actor = self._actor(principal)
+        found: list[tuple[TaskRecord, Operation]] = []
+        offset, page = 0, 200
+        while len(found) <= limit and offset < 5000:
+            batch = self.store.list_for_owner(actor, statuses=statuses, limit=page, offset=offset)
+            for task in batch:
+                try:
+                    op = self.registry.lookup(task.operation_id)
+                except RegistryError:
+                    continue
+                if self._may_use(principal, op):
+                    found.append((task, op))
+                    if len(found) > limit:
+                        break
+            if len(batch) < page:
+                break
+            offset += page
+        return found[:limit], len(found) > limit
+
+    def timeline(self, task_id: str, principal: Any) -> list[dict[str, Any]]:
+        """Audit records of one of the caller's own tasks, oldest first."""
+        actor = self._actor(principal)
+        task = self.store.get(task_id)
+        if task.owner != actor:
+            raise TaskNotFound("task not found")
+        return self.store.audit_records(task_id)
+
     def waiting_for_approval(self, principal: Any) -> list[TaskRecord]:
         actor = self._actor(principal)
         include_own = bool(self._setting(self.allow_self_approval))

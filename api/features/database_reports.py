@@ -156,6 +156,12 @@ def outcome_from_metadata(plan: Mapping[str, Any], meta: Mapping[str, Any]) -> A
 Resolver = Callable[[Optional[str]], tuple[TableReportService, Optional[str], Optional[str]]]
 
 
+def describe_report(plan: Optional[Mapping[str, Any]], result: Optional[Mapping[str, Any]]) -> str:
+    text = (plan or {}).get("question") or "Laporan tabel"
+    count = (result or {}).get("row_count")
+    return f"{text} ({count} baris)" if count is not None else text
+
+
 def build_report_operation(resolve: Resolver, cache: OutcomeCache) -> Operation:
     def plan(request: Mapping[str, Any], ctx) -> dict[str, Any]:
         service, name, token = resolve(request.get("database"))
@@ -204,7 +210,8 @@ def build_report_operation(resolve: Resolver, cache: OutcomeCache) -> Operation:
     return Operation(
         feature=FEATURE, name="report", effect=Effect.READ, permission=REPORT_PERMISSION, risk=0.1,
         approval=ApprovalPolicy.none(), description="Read-only table report from a question",
-        plan=plan, preview=preview, execute=execute, verify=verify, max_active=200)
+        plan=plan, preview=preview, execute=execute, verify=verify, max_active=200,
+        label="Laporan tabel", describe=describe_report)
 
 
 def build_report_feature(resolve: Resolver, cache: OutcomeCache) -> Feature:
@@ -213,6 +220,6 @@ def build_report_feature(resolve: Resolver, cache: OutcomeCache) -> Feature:
 
 __all__ = [
     "ConnectionChanged", "FEATURE", "OutcomeCache", "REPORT_OPERATION", "REPORT_PERMISSION",
-    "build_report_feature", "build_report_operation", "outcome_from_metadata", "outcome_metadata", "plan_result_from_task_plan",
+    "build_report_feature", "build_report_operation", "describe_report", "outcome_from_metadata", "outcome_metadata", "plan_result_from_task_plan",
     "request_from_json", "request_to_json",
 ]

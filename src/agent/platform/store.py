@@ -233,6 +233,18 @@ class SQLiteTaskStore:
                 "AND status IN ('planned','awaiting_approval','approved')",
                 (operation_id, self._clock())).fetchone()[0]
 
+    def list_for_owner(self, owner: str, *, statuses: Optional[Sequence[TaskStatus]] = None,
+                       limit: int = 50, offset: int = 0) -> list[TaskRecord]:
+        sql, args = "SELECT * FROM platform_tasks WHERE owner=?", [owner]
+        if statuses:
+            sql += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
+            args += [s.value for s in statuses]
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
+        args += [int(limit), int(offset)]
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._record(r) for r in rows]
+
     def list_expired_waiting(self) -> list[TaskRecord]:
         with self._lock, self._conn() as conn:
             rows = conn.execute(

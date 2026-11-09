@@ -195,6 +195,11 @@ class Operation:
     sensitive: bool = False
     # Cap on tasks of this operation that are waiting at the same time (None: the pipeline's cap).
     max_active: Optional[int] = None
+    # How the operation is shown in the task list: a short name, and ``describe(plan, result)`` that
+    # returns one line about a task. ``plan`` may have been erased (``{"scrubbed": True, ...}``) and
+    # ``result`` is None until the task has run, so a describer must cope with both.
+    label: str = ""
+    describe: Optional[Callable[[Mapping[str, Any], Optional[Mapping[str, Any]]], str]] = None
 
     def __post_init__(self) -> None:
         _check_name("feature", self.feature)
@@ -208,7 +213,7 @@ class Operation:
             raise ContractError("risk must be a number between 0 and 1")
         if not isinstance(self.approval, ApprovalPolicy):
             raise ContractError("approval must be an ApprovalPolicy")
-        for field_name in ("plan", "preview", "execute", "verify", "approval_for"):
+        for field_name in ("plan", "preview", "execute", "verify", "approval_for", "describe"):
             value = getattr(self, field_name)
             if value is not None and not callable(value):
                 raise ContractError(f"{field_name} must be callable")

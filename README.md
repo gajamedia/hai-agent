@@ -36,7 +36,8 @@ Platform ini disusun sebagai **pondasi bersama + fitur agent**:
 | Pondasi kognitif | Berfungsi, teruji di simulasi | Orchestrator LLM, memori, pembelajaran, replanning adaptif, telemetry. Bukti benchmark hanya pada fixture simulasi Room. |
 | Keamanan | Berfungsi | Keycloak (JWT/JWKS), otorisasi per peran, audit, approval berlapis. |
 | Pengujian otonom | Berfungsi | Skenario, injeksi kegagalan, dan evaluasi pemulihan (halaman *Autonomous Testing*). |
-| Siklus tugas terpadu di UI | **Belum** | Submit → rencana → kebijakan → approval → eksekusi → verifikasi → hasil masih terpisah per fitur. |
+| Riwayat tugas (menu *Riwayat tugas*) | Berfungsi | Daftar tugas milik Anda dari semua fitur di pipeline platform (laporan, ubah data), dengan status, verifikasi, jejak audit, dan unduhan berkas laporan. Hanya membaca; tugas dibuat dan dilanjutkan di halaman fiturnya. |
+| Siklus tugas terpadu di UI | **Sebagian** | Riwayat sudah terpadu. Membuat, menyetujui, dan menjalankan masih di halaman tiap fitur; buat database belum memakai pipeline. |
 | Tugas persisten, penjadwal, pemicu | **Belum** | Agen belum bekerja sendiri tanpa permintaan pengguna. |
 | Kontrak "fitur agent" yang baku | **Belum** | Fitur baru belum punya cara standar untuk mendaftarkan diri ke pondasi. |
 | Fitur agent lain (berkas, HTTP/API, email, dan sebagainya) | **Belum** | Direncanakan. |
@@ -192,6 +193,7 @@ Referensi interaktif lengkap ada di `/docs` saat backend berjalan. Ringkasan per
 | `/database-onboarding/*`, `/database-engine-requests/*` | Allowlist awal dan tiket permintaan engine baru. |
 | `/capability-proposals/*`, `/capabilities/*` | Siklus hidup kapabilitas: usul, approval, aktivasi, nonaktif, cabut. |
 | `/capability-reads`, `/trusted-capability-invocations` | Eksekusi kapabilitas tepercaya lewat gateway. |
+| `/tasks`, `/tasks/{id}` | Riwayat tugas Anda sendiri (filter `waiting`, `running`, `done`, `problem`) dan rincian dengan jejak audit. |
 | `/autonomous-testing/*` | Batch pengujian otonom dan rekonsiliasinya. |
 | `/telemetry/capabilities`, `/strategies` | Telemetry kapabilitas dan informasi strategi. |
 | `GET /health` (tanpa prefix) | Pemeriksaan hidup. |

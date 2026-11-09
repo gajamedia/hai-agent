@@ -15,6 +15,7 @@ import {
   FileJson,
   Database,
   FlaskConical,
+  ListChecks,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -1523,6 +1524,9 @@ export default function Dashboard() {
         {/* Router links, not plain anchors: no full reload, so the Keycloak token is kept. */}
         <Link className="nav" to="/database-agent">
           <Database size={16} /> Database Agent
+        </Link>
+        <Link className="nav" to="/tasks">
+          <ListChecks size={16} /> Riwayat tugas
         </Link>
         <Link className="nav" to="/autonomous-testing">
           <FlaskConical size={16} /> Autonomous Testing

@@ -60,6 +60,19 @@ def change_request_from_json(data: Mapping[str, Any]) -> ChangeRequest:
 
 # --------------------------------------------------------------------------- the feature
 
+_VERB = {"insert": "Tambah data", "update": "Ubah data", "delete": "Hapus data"}
+
+
+def describe_change(plan: Optional[Mapping[str, Any]], result: Optional[Mapping[str, Any]]) -> str:
+    """One line that never needs the erased plan: the outcome once it ran, the kind and table before."""
+    if result:
+        return f"{_VERB.get(result.get('operation'), 'Ubah data')}: {result.get('rows_affected')} baris di {result.get('table')}"
+    summary = (plan or {}).get("summary")
+    if summary:
+        return f"{_VERB.get(summary.get('operation'), 'Ubah data')} pada tabel {summary.get('table')}"
+    return "Perubahan data (rincian sudah dihapus)"
+
+
 def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) -> Operation:
     """``get_registry`` returns the live database registry (raising if it is not configured)."""
 
@@ -122,8 +135,9 @@ def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) 
         approval=ApprovalPolicy(confirm_phrase=True, fresh_login=True),
         description="Insert, update or delete rows in tables approved for writing",
         plan=plan, preview=preview, execute=execute, verify=verify, approver_permission=APPROVE,
-        plan_permission=PLAN, approval_for=approval_for, sensitive=True, max_active=100)
+        plan_permission=PLAN, approval_for=approval_for, sensitive=True, max_active=100,
+        label="Ubah data", describe=describe_change)
 
 
-__all__ = ["CHANGE_OPERATION", "ConnectionChanged", "build_change_operation",
+__all__ = ["CHANGE_OPERATION", "ConnectionChanged", "build_change_operation", "describe_change",
            "change_request_from_json", "change_request_to_json"]

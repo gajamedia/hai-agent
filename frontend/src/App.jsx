@@ -5,6 +5,7 @@ import DataChanges from "./pages/DataChanges.jsx";
 import DatabaseCreation from "./pages/DatabaseCreation.jsx";
 import DataReports from "./pages/DataReports.jsx";
 import DatabaseAgent from "./pages/DatabaseAgent.jsx";
+import Tasks from "./pages/Tasks.jsx";
 import { AuthProvider, useAuth } from "./auth/AuthProvider.jsx";
 
 function AuthenticatedApplication() {
@@ -49,6 +50,7 @@ function AuthenticatedApplication() {
       </div>
       <Routes>
         <Route path="/" element={<Dashboard />} />
+        <Route path="/tasks" element={<Tasks />} />
         <Route path="/autonomous-testing" element={<AutonomousTesting />} />
         <Route path="/database-agent" element={<DatabaseAgent />}>
           <Route index element={<Navigate to="reports" replace />} />
