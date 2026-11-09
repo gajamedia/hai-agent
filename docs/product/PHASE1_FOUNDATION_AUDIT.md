@@ -154,7 +154,8 @@ Tiap langkah kecil, bisa di-commit terpisah, dan seluruh tes tetap hijau:
 | 1a Kontrak dan registry | Selesai (9 Nov 2026) | `src/agent/platform/contracts.py`, `registry.py` |
 | 1b Pipeline dan penyimpanan tugas | Selesai (9 Nov 2026) | `pipeline.py`, `store.py`; audit dan status satu transaksi, replay hanya dengan `Idempotency-Key` yang sama |
 | 1c `database.report` di pipeline | Selesai (9 Nov 2026) | `api/features/database_reports.py`, `api/platform_runtime.py`; rute `/table-reports/*` tidak berubah bagi frontend |
-| 1d `database.change`, `database.create` | Belum | Termasuk penulisan ganda ke audit JSONL lama |
+| 1d-1 `database.change` | Selesai (9 Nov 2026) | `api/features/database_changes.py`; audit JSONL lama tetap ditulis berdampingan |
+| 1d-2 `database.create` | Belum | |
 | 1e Penataan paket | Belum | |
 | 1f Fitur contoh | Belum | |
 
@@ -165,3 +166,11 @@ Catatan 1c (perilaku yang sengaja dijaga atau diubah):
 - Pemeriksaan "koneksi berubah" kini memakai token sidik jari persetujuan (`DatabaseRuntimeRegistry.service_token`), bukan identitas objek, sehingga tetap berlaku setelah restart. Menyetujui ulang dengan tabel/kolom yang sama tidak lagi membatalkan rencana; mengubah persetujuan tetap membatalkannya.
 - Membatalkan (`DELETE`) rencana yang sudah selesai kini dijawab 409, bukan menghapus diam-diam.
 - Verifikator laporan memeriksa status keberhasilan, id workflow, dan ukuran berkas. Pemeriksaan data dan penolakan pembacaan terpotong tetap dilakukan job runner seperti sebelumnya.
+
+Catatan 1d-1 (ubah data):
+
+- Kontrak platform diperluas karena ubah data membutuhkannya: kebijakan approval yang dihitung per rencana (hanya boleh lebih ketat dari baseline operasi), izin merencanakan berbeda dari izin menjalankan, `sensitive` (rencana dan pratinjau yang memuat data bisnis **dihapus dari penyimpanan tugas begitu tugas berakhir**, hanya hash yang tersisa), batas tugas per operasi, dan pengaturan server (self-approval, batas login segar) yang dibaca saat dibutuhkan.
+- Verifikasi setelah commit: delete dicek dengan membaca ulang (tidak ada baris yang masih cocok), update dengan membaca ulang baris berisi nilai baru, insert dan update yang mengubah kolom pemilihnya memakai jumlah baris yang dilaporkan database. Kalau hasil baca ulang tidak cocok, status `unverified`, bukan `completed`.
+- Perubahan perilaku yang disengaja: setelah `change_refused` (data berubah sejak pratinjau) rencana tidak bisa dijalankan ulang, harus direncanakan lagi (sebelumnya dilepas kembali). Membatalkan rencana yang sudah selesai dijawab 409. Respons run mendapat satu kolom baru, `verification`.
+- Pemeriksaan "koneksi berubah" memakai `DatabaseRuntimeRegistry.change_token` (sidik jari tabel, kolom, dan operasi yang boleh ditulis).
+- Audit JSONL lama (`audit/changes-<db>.jsonl`, termasuk before-image) tidak berubah dan tetap menjadi catatan forensik utama; audit platform menambah siapa, kapan, dan status tiap langkah tanpa memuat data.

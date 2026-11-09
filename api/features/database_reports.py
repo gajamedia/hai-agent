@@ -156,7 +156,7 @@ def outcome_from_metadata(plan: Mapping[str, Any], meta: Mapping[str, Any]) -> A
 Resolver = Callable[[Optional[str]], tuple[TableReportService, Optional[str], Optional[str]]]
 
 
-def build_report_feature(resolve: Resolver, cache: OutcomeCache) -> Feature:
+def build_report_operation(resolve: Resolver, cache: OutcomeCache) -> Operation:
     def plan(request: Mapping[str, Any], ctx) -> dict[str, Any]:
         service, name, token = resolve(request.get("database"))
         result = service.plan(request["question"], request.get("format"))
@@ -201,15 +201,18 @@ def build_report_feature(resolve: Resolver, cache: OutcomeCache) -> Feature:
             return Verification(Verdict.UNVERIFIED, evidence)
         return Verification(Verdict.VERIFIED, evidence)
 
-    operation = Operation(
+    return Operation(
         feature=FEATURE, name="report", effect=Effect.READ, permission=REPORT_PERMISSION, risk=0.1,
         approval=ApprovalPolicy.none(), description="Read-only table report from a question",
-        plan=plan, preview=preview, execute=execute, verify=verify)
-    return Feature(FEATURE, "Database Agent", (operation,))
+        plan=plan, preview=preview, execute=execute, verify=verify, max_active=200)
+
+
+def build_report_feature(resolve: Resolver, cache: OutcomeCache) -> Feature:
+    return Feature(FEATURE, "Database Agent", (build_report_operation(resolve, cache),))
 
 
 __all__ = [
     "ConnectionChanged", "FEATURE", "OutcomeCache", "REPORT_OPERATION", "REPORT_PERMISSION",
-    "build_report_feature", "outcome_from_metadata", "outcome_metadata", "plan_result_from_task_plan",
+    "build_report_feature", "build_report_operation", "outcome_from_metadata", "outcome_metadata", "plan_result_from_task_plan",
     "request_from_json", "request_to_json",
 ]

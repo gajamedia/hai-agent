@@ -11,14 +11,15 @@ from __future__ import annotations
 import threading
 from typing import Any, Optional
 
-from agent.platform import OperationRegistry, PlatformPipeline, SQLiteTaskStore
+from agent.platform import Feature, OperationRegistry, PlatformPipeline, SQLiteTaskStore
 from api.database_runtime_registry import DatabaseRuntimeRegistry
-from api.features.database_reports import OutcomeCache, build_report_feature
+from api.data_change_settings import settings as change_settings
+from api.features.database_changes import build_change_operation
+from api.features.database_reports import OutcomeCache, build_report_operation
 from api.security.authorization import AuthorizationPolicy
 from agent.workflow.table_report_service import TableReportService
 
 _lock = threading.Lock()
-MAX_PENDING_REPORT_PLANS = 200
 
 
 def _resolver(app: Any):
@@ -56,10 +57,14 @@ def get_pipeline(app: Any) -> PlatformPipeline:
         store = SQLiteTaskStore(path, clock=time.time)
         operations = OperationRegistry()
         cache = OutcomeCache()
-        operations.register(build_report_feature(_resolver(app), cache))
+        database_operations = [build_report_operation(_resolver(app), cache)]
+        if isinstance(registry, DatabaseRuntimeRegistry):
+            database_operations.append(build_change_operation(lambda: app.state.database_runtime_registry))
+        operations.register(Feature("database", "Database Agent", tuple(database_operations)))
         pipeline = PlatformPipeline(
-            registry=operations, store=store, authorize=authorize, clock=time.time,
-            ttl_seconds=900, max_active_per_operation=MAX_PENDING_REPORT_PLANS)
+            registry=operations, store=store, authorize=authorize, clock=time.time, ttl_seconds=900,
+            allow_self_approval=lambda: change_settings()["self_approval"],
+            step_up_max_age_seconds=lambda: change_settings()["step_up_max_age_seconds"])
         pipeline.recover_interrupted()
         operations.report_outcomes = cache  # shared by every pipeline built over these operations
         app.state.platform_pipeline = pipeline

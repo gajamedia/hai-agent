@@ -64,6 +64,14 @@ class OperationRegistry:
                 raise OperationDisabled(f"operation is disabled: {operation_id}")
             return op
 
+    def lookup(self, operation_id: str) -> Operation:
+        """The operation whether or not it is enabled (for bookkeeping, never for running it)."""
+        with self._lock:
+            op = self._operations.get(operation_id)
+            if op is None:
+                raise UnknownOperation(f"unknown operation: {operation_id}")
+            return op
+
     def is_enabled(self, operation_id: str) -> bool:
         try:
             self.get(operation_id)

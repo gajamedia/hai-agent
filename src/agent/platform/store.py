@@ -12,6 +12,7 @@ restart. Audit records hold a hash of the plan, never its contents.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS platform_tasks (
     plan_json TEXT NOT NULL,
     preview_json TEXT,
     confirm_phrase TEXT,
+    approval_json TEXT,
     result_json TEXT,
     verification_json TEXT,
     error TEXT,
@@ -78,6 +80,7 @@ class TaskRecord:
     plan: Mapping[str, Any]
     preview: Optional[Mapping[str, Any]]
     confirm_phrase: Optional[str]
+    approval: Optional[Mapping[str, Any]]
     result: Optional[Mapping[str, Any]]
     verification: Optional[Mapping[str, Any]]
     error: Optional[str]
@@ -132,6 +135,7 @@ class SQLiteTaskStore:
             task_id=row["task_id"], operation_id=row["operation_id"], owner=row["owner"],
             status=TaskStatus(row["status"]), version=row["version"], plan=_load(row["plan_json"]),
             preview=_load(row["preview_json"]), confirm_phrase=row["confirm_phrase"],
+            approval=_load(row["approval_json"]),
             result=_load(row["result_json"]), verification=_load(row["verification_json"]),
             error=row["error"], approved_by=row["approved_by"], run_key=row["run_key"],
             exec_key=row["exec_key"],
@@ -149,7 +153,7 @@ class SQLiteTaskStore:
 
     def create(self, *, operation_id: str, owner: str, status: TaskStatus, plan: Mapping[str, Any],
                preview: Optional[Mapping[str, Any]], confirm_phrase: Optional[str],
-               run_key: Optional[str], ttl_seconds: float, audit_event: str,
+               approval: Optional[Mapping[str, Any]], run_key: Optional[str], ttl_seconds: float, audit_event: str,
                audit_detail: Mapping[str, Any]) -> TaskRecord:
         now = self._clock()
         task_id = uuid.uuid4().hex
@@ -157,10 +161,10 @@ class SQLiteTaskStore:
             try:
                 conn.execute(
                     "INSERT INTO platform_tasks(task_id, operation_id, owner, status, version, plan_json, "
-                    "preview_json, confirm_phrase, run_key, created_at, updated_at, expires_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "preview_json, confirm_phrase, approval_json, run_key, created_at, updated_at, expires_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (task_id, operation_id, owner, status.value, 1, _dump(plan), _dump(preview),
-                     confirm_phrase, run_key, now, now, now + ttl_seconds))
+                     confirm_phrase, _dump(approval), run_key, now, now, now + ttl_seconds))
             except sqlite3.IntegrityError as exc:
                 raise TaskConflict("a task with this idempotency key already exists") from exc
             self._write_audit(conn, audit_event, task_id, operation_id, owner, audit_detail)
@@ -171,7 +175,7 @@ class SQLiteTaskStore:
                    actor: Optional[str], audit_event: str, audit_detail: Mapping[str, Any],
                    result: Any = None, verification: Any = None, error: Optional[str] = None,
                    approved_by: Optional[str] = None, exec_key: Optional[str] = None,
-                   extend_ttl: Optional[float] = None) -> TaskRecord:
+                   scrub: bool = False, extend_ttl: Optional[float] = None) -> TaskRecord:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT * FROM platform_tasks WHERE task_id=?", (task_id,)).fetchone()
             if row is None:
@@ -189,6 +193,14 @@ class SQLiteTaskStore:
                 "expires_at=COALESCE(?, expires_at), exec_key=COALESCE(?, exec_key) WHERE task_id=?",
                 (new_status.value, now, _dump(result), _dump(verification), error, approved_by,
                  None if extend_ttl is None else now + extend_ttl, exec_key, task_id))
+            if scrub:
+                # business data leaves the store together with the task; only the plan's hash stays
+                old_plan = _load(row["plan_json"])
+                digest = hashlib.sha256(json.dumps(
+                    old_plan, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                conn.execute(
+                    "UPDATE platform_tasks SET plan_json=?, preview_json=NULL, confirm_phrase=NULL "
+                    "WHERE task_id=?", (_dump({"scrubbed": True, "plan_sha256": digest}), task_id))
             self._write_audit(conn, audit_event, task_id, row["operation_id"], actor,
                               {"from": current.value, "to": new_status.value, **dict(audit_detail)})
             return self._record(conn.execute(
@@ -202,6 +214,14 @@ class SQLiteTaskStore:
                 "SELECT COUNT(*) FROM platform_tasks WHERE operation_id=? AND expires_at>? "
                 "AND status IN ('planned','awaiting_approval','approved')",
                 (operation_id, self._clock())).fetchone()[0]
+
+    def list_expired_waiting(self) -> list[TaskRecord]:
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM platform_tasks WHERE expires_at<=? "
+                "AND status IN ('planned','awaiting_approval','approved') ORDER BY created_at",
+                (self._clock(),)).fetchall()
+        return [self._record(r) for r in rows]
 
     def audit(self, event: str, *, task_id: Optional[str] = None, operation_id: Optional[str] = None,
               actor: Optional[str] = None, detail: Optional[Mapping[str, Any]] = None) -> None:

@@ -707,6 +707,24 @@ class DatabaseRuntimeRegistry:
                 raise RegistryError("no table of this connection is approved for changing data")
             return conn.changes
 
+    def change_token(self, name: Any) -> str | None:
+        """Fingerprint of what data changes on ``name`` may touch (tables, columns, operations and the
+        engine). A change plan remembers it; if the writable approvals change, the token changes and the
+        plan is refused. Unlike object identity it survives a restart."""
+        with self._lock:
+            conn = self._get(name)
+            if conn.changes is None:
+                return None
+            tables = []
+            for table, writable in sorted(conn.changes.planner.tables.items()):
+                entry = writable.entry
+                tables.append([table, sorted((c, str(t)) for c, t in entry.columns.items()),
+                               sorted(entry.filterable_columns), entry.key_column,
+                               sorted(entry.required_non_null_columns), sorted(writable.operations),
+                               sorted(writable.writable_columns)])
+            body = {"name": conn.name, "engine": conn.engine, "tables": tables}
+            return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+
     def resolve_change_name(self, name: Any = None) -> str:
         """The connection to use for a change: the named one, or the only one that can change data."""
         with self._lock:

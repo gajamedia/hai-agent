@@ -67,6 +67,21 @@ class ApprovalPolicy:
     def required(self) -> bool:
         return self.confirm_phrase or self.fresh_login or self.second_approver
 
+    def covers(self, baseline: "ApprovalPolicy") -> bool:
+        """True when this policy demands at least everything ``baseline`` demands."""
+        return ((self.confirm_phrase or not baseline.confirm_phrase)
+                and (self.fresh_login or not baseline.fresh_login)
+                and (self.second_approver or not baseline.second_approver))
+
+    def as_dict(self) -> dict:
+        return {"confirm_phrase": self.confirm_phrase, "fresh_login": self.fresh_login,
+                "second_approver": self.second_approver}
+
+    @classmethod
+    def from_dict(cls, data) -> "ApprovalPolicy":
+        return cls(confirm_phrase=bool(data["confirm_phrase"]), fresh_login=bool(data["fresh_login"]),
+                   second_approver=bool(data["second_approver"]))
+
     @classmethod
     def none(cls) -> "ApprovalPolicy":
         return cls()
@@ -170,6 +185,16 @@ class Operation:
     verify_waived_reason: Optional[str] = None
     # Permission a *different* person needs to approve a run (required when approval.second_approver).
     approver_permission: Optional[str] = None
+    # Permission needed to *plan* (submit) when it differs from the one needed to run.
+    plan_permission: Optional[str] = None
+    # Decides the approval policy of one plan (for example "a delete needs a second person").
+    # The result must include everything ``approval`` demands; it may only add conditions.
+    approval_for: Optional[Callable[..., ApprovalPolicy]] = None
+    # The plan and preview hold business data. They are erased from the task store when the
+    # task ends (only a hash of the plan is kept).
+    sensitive: bool = False
+    # Cap on tasks of this operation that are waiting at the same time (None: the pipeline's cap).
+    max_active: Optional[int] = None
 
     def __post_init__(self) -> None:
         _check_name("feature", self.feature)
@@ -183,7 +208,7 @@ class Operation:
             raise ContractError("risk must be a number between 0 and 1")
         if not isinstance(self.approval, ApprovalPolicy):
             raise ContractError("approval must be an ApprovalPolicy")
-        for field_name in ("plan", "preview", "execute", "verify"):
+        for field_name in ("plan", "preview", "execute", "verify", "approval_for"):
             value = getattr(self, field_name)
             if value is not None and not callable(value):
                 raise ContractError(f"{field_name} must be callable")
@@ -196,8 +221,15 @@ class Operation:
         if self.approval.second_approver and not (
                 isinstance(self.approver_permission, str) and self.approver_permission.strip()):
             raise ContractError(f"{self.id}: second_approver needs an approver_permission")
-        if self.approver_permission is not None and not self.approval.second_approver:
+        if self.approver_permission is not None and not self.approval.second_approver \
+                and self.approval_for is None:
             raise ContractError(f"{self.id}: approver_permission without second_approver")
+        if self.plan_permission is not None and not self.plan_permission.strip():
+            raise ContractError("plan_permission must not be blank")
+        if self.max_active is not None and (
+                isinstance(self.max_active, bool) or not isinstance(self.max_active, int)
+                or self.max_active < 1):
+            raise ContractError("max_active must be a positive integer")
         if self.effect.changes_world:
             if self.preview is None:
                 raise ContractError(

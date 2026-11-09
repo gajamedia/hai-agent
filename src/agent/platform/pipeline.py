@@ -1,7 +1,7 @@
 """The one path every operation run goes through.
 
     submit  -> authorize, check policy, plan, preview          (no side effects)
-    approve -> a different person, when the operation asks for it
+    approve -> a different person, when the plan's approval policy asks for it
     run     -> re-authorize, fresh login, exact phrase, execute exactly the stored plan, verify
     cancel  -> owner withdraws a task that has not started
 
@@ -11,11 +11,14 @@ Rules this module enforces for every feature:
   authorizer, an unwritable audit record, or an invalid plan all stop the run;
 * the server keeps the plan; callers only ever send the task id, so nothing can
   change between the preview a person reviewed and the execution;
-* a task runs at most once (compare-and-set on its version), and a replay of a
-  finished task returns the stored outcome instead of running again;
-* a result is ``completed`` only when the verifier confirmed it (or the
-  operation declared, in its contract, that it cannot be verified);
-* every step is audited in the same transaction as the status change it records.
+* the approval policy of a plan is decided when it is planned and stored with the task;
+  it can only be stricter than the operation's declared baseline;
+* a task runs at most once (compare-and-set on its version), and a finished task is only
+  read again with the very idempotency key it ran under;
+* a result is ``completed`` only when the verifier confirmed it (or the operation declared,
+  in its contract, that it cannot be verified);
+* every step is audited in the same transaction as the status change it records, and the
+  plan and preview of an operation marked ``sensitive`` are erased when its task ends.
 """
 
 from __future__ import annotations
@@ -25,9 +28,11 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Union
 
-from .contracts import Operation, PlanUnsupported, TaskStatus, Verdict, Verification
+from .contracts import (
+    ApprovalPolicy, Operation, PlanUnsupported, TaskStatus, Verdict, Verification,
+)
 from .registry import OperationRegistry, RegistryError
 from .store import SQLiteTaskStore, TaskConflict, TaskNotFound, TaskRecord
 
@@ -82,6 +87,7 @@ class RunContext:
     actor_id: str
     operation_id: str
     task_id: Optional[str] = None
+    approved_by: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ class RunOutcome:
 
 
 Authorizer = Callable[[Any, str], Any]
+Setting = Union[bool, float, Callable[[], Any]]
 
 
 def _plan_hash(plan: Mapping[str, Any]) -> str:
@@ -111,9 +118,11 @@ def _json_mapping(value: Any, what: str) -> dict[str, Any]:
 class PlatformPipeline:
     def __init__(self, *, registry: OperationRegistry, store: SQLiteTaskStore, authorize: Authorizer,
                  clock: Callable[[], float] = time.time, ttl_seconds: float = 900,
-                 approval_risk_threshold: float = 0.5, allow_self_approval: bool = False,
-                 step_up_max_age_seconds: float = 300,
+                 approval_risk_threshold: float = 0.5, allow_self_approval: Setting = False,
+                 step_up_max_age_seconds: Setting = 300,
                  max_active_per_operation: Optional[int] = None) -> None:
+        """``allow_self_approval`` and ``step_up_max_age_seconds`` may be callables, read at the
+        moment they are needed, so a server setting changed while it runs takes effect."""
         if not callable(authorize):
             raise TypeError("authorize must be callable")
         self.registry, self.store, self._authorize = registry, store, authorize
@@ -124,6 +133,10 @@ class PlatformPipeline:
         self.max_active_per_operation = max_active_per_operation
 
     # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _setting(value: Setting) -> Any:
+        return value() if callable(value) else value
 
     @staticmethod
     def _actor(principal: Any) -> str:
@@ -161,9 +174,41 @@ class PlatformPipeline:
                          actor=actor, reason=str(exc))
             raise
 
-    def _context(self, principal: Any, actor: str, op: Operation,
-                 task_id: Optional[str] = None) -> RunContext:
-        return RunContext(principal=principal, actor_id=actor, operation_id=op.id, task_id=task_id)
+    @staticmethod
+    def _context(principal: Any, actor: str, op: Operation, task_id: Optional[str] = None,
+                 approved_by: Optional[str] = None) -> RunContext:
+        return RunContext(principal=principal, actor_id=actor, operation_id=op.id, task_id=task_id,
+                          approved_by=approved_by)
+
+    @staticmethod
+    def _policy(task: TaskRecord) -> ApprovalPolicy:
+        """The approval policy this task was planned under (never recomputed later)."""
+        return ApprovalPolicy.from_dict(task.approval)
+
+    def _move(self, task: TaskRecord, op: Optional[Operation], new_status: TaskStatus, *,
+              actor: Optional[str], event: str, detail: Optional[Mapping[str, Any]] = None,
+              **fields: Any) -> TaskRecord:
+        """One status change, its audit record and (for sensitive operations that end) the erasure of
+        the plan, all in one transaction."""
+        scrub = bool(op is not None and op.sensitive and new_status.terminal)
+        return self.store.transition(
+            task.task_id, expected_version=task.version, new_status=new_status, actor=actor,
+            audit_event=event, audit_detail=detail or {}, scrub=scrub, **fields)
+
+    def seconds_left(self, task: TaskRecord) -> int:
+        return max(0, int(task.expires_at - self._clock()))
+
+    def _sweep(self) -> None:
+        """End tasks that waited too long, so their data does not stay in the store."""
+        try:
+            for task in self.store.list_expired_waiting():
+                try:
+                    op = self.registry.lookup(task.operation_id)
+                except RegistryError:
+                    op = None
+                self._move(task, op, TaskStatus.CANCELLED, actor="system", event="task_expired")
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not sweep expired tasks")
 
     # -- submit ------------------------------------------------------------
 
@@ -171,9 +216,9 @@ class PlatformPipeline:
                idempotency_key: Optional[str] = None) -> TaskRecord:
         actor = self._actor(principal)
         op = self._operation(operation_id, actor=actor)
-        self._require(principal, op.permission, operation_id=op.id)
-        if op.effect.changes_world and op.risk >= self.approval_risk_threshold \
-                and not op.approval.required:
+        self._require(principal, op.plan_permission or op.permission, operation_id=op.id)
+        risky = op.effect.changes_world and op.risk >= self.approval_risk_threshold
+        if risky and not op.approval.required and op.approval_for is None:
             self._refuse("policy_violation", operation_id=op.id, actor=actor,
                          reason="risky operation declares no approval")
             raise PolicyViolation(
@@ -188,7 +233,9 @@ class PlatformPipeline:
                 return existing
             idempotency_key = key
 
-        if self.max_active_per_operation is not None                 and self.store.count_active(op.id) >= self.max_active_per_operation:
+        self._sweep()
+        cap = op.max_active if op.max_active is not None else self.max_active_per_operation
+        if cap is not None and self.store.count_active(op.id) >= cap:
             self._refuse("too_many_tasks", operation_id=op.id, actor=actor)
             raise TooManyTasks("too many pending tasks; try again shortly")
 
@@ -196,10 +243,17 @@ class PlatformPipeline:
         try:
             raw_plan = op.plan(request, ctx) if op.plan is not None else request
             plan = _json_mapping(raw_plan, "plan")
+            policy = op.approval_for(plan, ctx) if op.approval_for is not None else op.approval
+            if not isinstance(policy, ApprovalPolicy) or not policy.covers(op.approval):
+                raise PolicyViolation(f"{op.id}: the approval policy of a plan may only add conditions")
+            if policy.second_approver and not op.approver_permission:
+                raise PolicyViolation(f"{op.id}: a second approver needs an approver_permission")
+            if risky and not policy.required:
+                raise PolicyViolation(f"{op.id}: risk {op.risk} needs an approval policy")
             preview = confirm_phrase = None
             if op.preview is not None:
                 preview = _json_mapping(op.preview(plan, ctx), "preview")
-            if op.approval.confirm_phrase:
+            if policy.confirm_phrase:
                 phrase = (preview or {}).get("confirm_phrase")
                 if not isinstance(phrase, str) or not phrase.strip():
                     raise PlanError("the preview must give the confirm_phrase this operation requires")
@@ -214,23 +268,18 @@ class PlatformPipeline:
             self._refuse("plan_failed", operation_id=op.id, actor=actor, error=type(exc).__name__)
             raise PlanError(str(exc)) from exc
 
-        status = TaskStatus.AWAITING_APPROVAL if op.approval.second_approver else TaskStatus.APPROVED
+        status = TaskStatus.AWAITING_APPROVAL if policy.second_approver else TaskStatus.APPROVED
         return self.store.create(
             operation_id=op.id, owner=actor, status=status, plan=plan, preview=preview,
-            confirm_phrase=confirm_phrase, run_key=idempotency_key, ttl_seconds=self.ttl,
-            audit_event="task_planned",
+            confirm_phrase=confirm_phrase, approval=policy.as_dict(), run_key=idempotency_key,
+            ttl_seconds=self.ttl, audit_event="task_planned",
             audit_detail={"effect": op.effect.value, "risk": op.risk, "plan_sha256": _plan_hash(plan),
-                          "approval": {"confirm_phrase": op.approval.confirm_phrase,
-                                       "fresh_login": op.approval.fresh_login,
-                                       "second_approver": op.approval.second_approver}})
-
-    def seconds_left(self, task: TaskRecord) -> int:
-        return max(0, int(task.expires_at - self._clock()))
+                          "approval": policy.as_dict()})
 
     # -- visibility --------------------------------------------------------
 
-    def _can_approve(self, principal: Any, op: Operation) -> bool:
-        if not op.approval.second_approver or op.approver_permission is None:
+    def _can_approve(self, principal: Any, op: Operation, task: TaskRecord) -> bool:
+        if not self._policy(task).second_approver or op.approver_permission is None:
             return False
         try:
             self._authorize(principal, op.approver_permission)
@@ -245,59 +294,67 @@ class PlatformPipeline:
         if task.owner == actor:
             return task
         try:
-            op = self.registry.get(task.operation_id)
+            op = self.registry.lookup(task.operation_id)
         except RegistryError:
             raise TaskNotFound("task not found") from None
-        if self._can_approve(principal, op):
+        if self._can_approve(principal, op, task):
             return task
         raise TaskNotFound("task not found")
 
     def waiting_for_approval(self, principal: Any) -> list[TaskRecord]:
         actor = self._actor(principal)
+        include_own = bool(self._setting(self.allow_self_approval))
         found = []
         for task in self.store.list_by_status([TaskStatus.AWAITING_APPROVAL]):
             if task.expires_at <= self._clock():
                 continue
-            if task.owner == actor and not self.allow_self_approval:
+            if task.owner == actor and not include_own:
                 continue
             try:
-                op = self.registry.get(task.operation_id)
+                op = self.registry.lookup(task.operation_id)
             except RegistryError:
                 continue
-            if self._can_approve(principal, op):
+            if self._can_approve(principal, op, task):
                 found.append(task)
         return found
 
     # -- approve / cancel --------------------------------------------------
 
-    def _expire_if_due(self, task: TaskRecord, actor: str) -> None:
-        if task.expires_at <= self._clock() and not task.status.terminal \
-                and task.status in (TaskStatus.PLANNED, TaskStatus.AWAITING_APPROVAL,
-                                    TaskStatus.APPROVED):
-            self.store.transition(task.task_id, expected_version=task.version,
-                                  new_status=TaskStatus.CANCELLED, actor=actor,
-                                  audit_event="task_expired", audit_detail={})
+    def _expire_if_due(self, task: TaskRecord, op: Operation, actor: str) -> None:
+        if task.expires_at <= self._clock() and task.status in (
+                TaskStatus.PLANNED, TaskStatus.AWAITING_APPROVAL, TaskStatus.APPROVED):
+            self._move(task, op, TaskStatus.CANCELLED, actor=actor, event="task_expired")
             raise TaskExpired("this task expired; plan it again")
+
+    def _require_fresh_login(self, principal: Any, op: Operation, actor: str,
+                             task_id: str) -> None:
+        auth_time = getattr(principal, "auth_time", None)
+        window = self._setting(self.step_up_max_age)
+        if auth_time is None or not (0 <= self._clock() - auth_time <= window):
+            self._refuse("step_up_required", operation_id=op.id, task_id=task_id, actor=actor)
+            raise StepUpRequired("sign in again to confirm it is you")
 
     def approve(self, task_id: str, principal: Any, *, reject: bool = False) -> TaskRecord:
         actor = self._actor(principal)
         task = self.store.get(task_id)
         op = self._operation(task.operation_id, actor=actor, task_id=task_id)
-        if not op.approval.second_approver or op.approver_permission is None:
+        policy = self._policy(task)
+        if not policy.second_approver or op.approver_permission is None:
             raise TaskConflict("this operation does not use a second approver")
         self._require(principal, op.approver_permission, operation_id=op.id, task_id=task_id)
+        if not reject and policy.fresh_login:
+            self._require_fresh_login(principal, op, actor, task_id)
         if task.status is not TaskStatus.AWAITING_APPROVAL:
             raise TaskConflict("this task is not waiting for approval")
-        self._expire_if_due(task, actor)
+        self._expire_if_due(task, op, actor)
         self_approved = task.owner == actor
-        if self_approved and not self.allow_self_approval:
+        if self_approved and not self._setting(self.allow_self_approval):
             self._refuse("self_approval_refused", operation_id=op.id, task_id=task_id, actor=actor)
             raise PolicyViolation("you cannot approve your own task")
-        return self.store.transition(
-            task_id, expected_version=task.version,
-            new_status=TaskStatus.REJECTED if reject else TaskStatus.APPROVED, actor=actor,
-            audit_event="task_rejected" if reject else "task_approved",
-            audit_detail={"self_approved": self_approved}, approved_by=actor)
+        return self._move(
+            task, op, TaskStatus.REJECTED if reject else TaskStatus.APPROVED, actor=actor,
+            event="task_rejected" if reject else "task_approved",
+            detail={"self_approved": self_approved}, approved_by=actor)
 
     def cancel(self, task_id: str, principal: Any) -> TaskRecord:
         actor = self._actor(principal)
@@ -305,9 +362,11 @@ class PlatformPipeline:
         if task.owner != actor:
             self._refuse("cancel_refused", operation_id=task.operation_id, task_id=task_id, actor=actor)
             raise TaskNotFound("task not found")
-        return self.store.transition(task_id, expected_version=task.version,
-                                     new_status=TaskStatus.CANCELLED, actor=actor,
-                                     audit_event="task_cancelled", audit_detail={})
+        try:
+            op = self.registry.lookup(task.operation_id)
+        except RegistryError:
+            op = None
+        return self._move(task, op, TaskStatus.CANCELLED, actor=actor, event="task_cancelled")
 
     # -- run ---------------------------------------------------------------
 
@@ -334,43 +393,37 @@ class PlatformPipeline:
             raise TaskConflict("this task was already executed; plan it again to run it anew")
         op = self._operation(task.operation_id, actor=actor, task_id=task_id)
         self._require(principal, op.permission, operation_id=op.id, task_id=task_id)
+        policy = self._policy(task)
         if task.status is TaskStatus.AWAITING_APPROVAL:
             raise ApprovalRequired("this task needs approval from someone else first")
         if task.status is not TaskStatus.APPROVED:
             raise TaskConflict(f"this task cannot run from state {task.status.value}")
-        self._expire_if_due(task, actor)
+        self._expire_if_due(task, op, actor)
 
-        if op.approval.fresh_login:
-            auth_time = getattr(principal, "auth_time", None)
-            now = self._clock()
-            if auth_time is None or not (0 <= now - auth_time <= self.step_up_max_age):
-                self._refuse("step_up_required", operation_id=op.id, task_id=task_id, actor=actor)
-                raise StepUpRequired("sign in again to confirm it is you")
-        if op.approval.confirm_phrase and (
+        if policy.fresh_login:
+            self._require_fresh_login(principal, op, actor, task_id)
+        if policy.confirm_phrase and (
                 not isinstance(confirm, str) or confirm.strip() != task.confirm_phrase):
             self._refuse("confirmation_mismatch", operation_id=op.id, task_id=task_id, actor=actor)
             raise ConfirmationMismatch("the confirmation phrase does not match")
 
         # Compare-and-set: only one caller can move the task to EXECUTING.
-        task = self.store.transition(task_id, expected_version=task.version,
-                                     new_status=TaskStatus.EXECUTING, actor=actor,
-                                     audit_event="task_executing", audit_detail={},
-                                     exec_key=exec_key)
-        ctx = self._context(principal, actor, op, task_id)
+        task = self._move(task, op, TaskStatus.EXECUTING, actor=actor, event="task_executing",
+                          exec_key=exec_key)
+        ctx = self._context(principal, actor, op, task_id, task.approved_by)
         try:
             raw = op.execute(task.plan, ctx)
             result = _json_mapping(raw if isinstance(raw, Mapping) else {"value": raw}, "result")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Operation %s failed", op.id)
-            self.store.transition(
-                task_id, expected_version=task.version, new_status=TaskStatus.FAILED, actor=actor,
-                audit_event="task_failed", audit_detail={"error": type(exc).__name__},
+            self._move(
+                task, op, TaskStatus.FAILED, actor=actor, event="task_failed",
+                detail={"error": type(exc).__name__},
                 error=f"{type(exc).__name__}: the operation raised; if it changes data, check the "
                       f"target to see whether the change happened")
             raise ExecutionFailed(f"{op.id} failed") from exc
-        task = self.store.transition(task_id, expected_version=task.version,
-                                     new_status=TaskStatus.VERIFYING, actor=actor,
-                                     audit_event="task_executed", audit_detail={}, result=result)
+        task = self._move(task, op, TaskStatus.VERIFYING, actor=actor, event="task_executed",
+                          result=result)
         return RunOutcome(self._verify(op, task, ctx, actor))
 
     def _verify(self, op: Operation, task: TaskRecord, ctx: RunContext, actor: str) -> TaskRecord:
@@ -378,15 +431,14 @@ class PlatformPipeline:
             reason = op.verify_waived_reason
             verification = {"verdict": "waived", "reason": reason} if reason \
                 else {"verdict": "not_applicable"}
-            return self.store.transition(
-                task.task_id, expected_version=task.version, new_status=TaskStatus.COMPLETED,
-                actor=actor, audit_event="task_completed", audit_detail=verification,
-                verification=verification)
+            return self._move(task, op, TaskStatus.COMPLETED, actor=actor, event="task_completed",
+                              detail=verification, verification=verification)
         try:
             outcome = op.verify(task.plan, task.result, ctx)
             if not isinstance(outcome, Verification):
                 raise TypeError("verify must return a Verification")
-            record = {"verdict": outcome.verdict.value, "evidence": _json_mapping(outcome.evidence, "evidence")}
+            record = {"verdict": outcome.verdict.value,
+                      "evidence": _json_mapping(outcome.evidence, "evidence")}
         except Exception as exc:  # noqa: BLE001
             logger.exception("Verifier of %s failed", op.id)
             record = {"verdict": Verdict.UNVERIFIED.value,
@@ -394,10 +446,9 @@ class PlatformPipeline:
         status = {Verdict.VERIFIED.value: TaskStatus.COMPLETED,
                   Verdict.UNVERIFIED.value: TaskStatus.UNVERIFIED,
                   Verdict.FAILED.value: TaskStatus.FAILED}[record["verdict"]]
-        return self.store.transition(
-            task.task_id, expected_version=task.version, new_status=status, actor=actor,
-            audit_event=f"task_{status.value}", audit_detail={"verdict": record["verdict"]},
-            verification=record,
+        return self._move(
+            task, op, status, actor=actor, event=f"task_{status.value}",
+            detail={"verdict": record["verdict"]}, verification=record,
             error="verification failed" if status is TaskStatus.FAILED else None)
 
     # -- restart recovery --------------------------------------------------
@@ -407,14 +458,18 @@ class PlatformPipeline:
         stopped is marked failed (outcome unknown), one that was being verified is unverified."""
         recovered = []
         for task in self.store.list_by_status([TaskStatus.EXECUTING, TaskStatus.VERIFYING]):
+            try:
+                op = self.registry.lookup(task.operation_id)
+            except RegistryError:
+                op = None
             if task.status is TaskStatus.EXECUTING:
                 new, error = TaskStatus.FAILED, \
                     "interrupted by a restart; the outcome is unknown, check the target"
             else:
                 new, error = TaskStatus.UNVERIFIED, "interrupted by a restart before verification"
-            recovered.append(self.store.transition(
-                task.task_id, expected_version=task.version, new_status=new, actor="system",
-                audit_event="task_recovered", audit_detail={}, error=error))
+            recovered.append(self._move(task, op, new, actor="system", event="task_recovered",
+                                        error=error))
+        self._sweep()
         return recovered
 
 

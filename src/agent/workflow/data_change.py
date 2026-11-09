@@ -432,6 +432,46 @@ class DataChangeService:
         self._audit(record)
         return ChangeResult(affected, tuple(before))
 
+    def verify(self, request: ChangeRequest, expected_rows: int) -> dict[str, Any]:
+        """After the commit: read the table again and say what is observed.
+
+        * delete: no row matches the conditions any more;
+        * update: when the conditions do not mention a column that was set, exactly ``expected_rows``
+          rows match the conditions *and* carry the new values;
+        * insert, and updates whose conditions the update itself changed: the rows cannot be found
+          again, so the evidence is the row count the database reported inside the committed
+          transaction (``method`` says which).
+
+        Returns ``{"method", "expected_rows", "observed_rows", "confirmed"}``.
+        """
+        set_columns = {c for c, _ in request.set_values}
+        condition_columns = {c for c, _, _ in request.conditions}
+        if request.operation == "insert" or (request.operation == "update" and set_columns & condition_columns):
+            return {"method": "database_reported_rowcount", "expected_rows": expected_rows,
+                    "observed_rows": expected_rows, "confirmed": True}
+        conditions = tuple(request.conditions)
+        if request.operation == "update":
+            conditions += tuple((c, "is_null", None) if v is None else (c, "eq", v)
+                                for c, v in request.set_values)
+        columns = self._columns(request)[:1]
+        sql, params = self.builder.select(request.table, columns, conditions, limit=expected_rows + 1)
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(sql, params)
+                observed = len(cursor.fetchall())
+            finally:
+                cursor.close()
+        finally:
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
+        wanted = 0 if request.operation == "delete" else expected_rows
+        return {"method": "reread_after_commit", "expected_rows": wanted, "observed_rows": observed,
+                "confirmed": observed == wanted}
+
     def audit(self, event: str, **fields: Any) -> None:
         """Record a decision that is not an execution (approval, rejection, refusal)."""
         self._audit({"event": event, **fields})

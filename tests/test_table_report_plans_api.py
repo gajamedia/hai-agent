@@ -234,11 +234,10 @@ def test_the_combined_endpoint_still_works(world):
 
 
 # ------------------------------------------------------- platform behaviour of the report plans
-def test_too_many_pending_plans_answer_429(world, monkeypatch):
-    import api.platform_runtime as runtime
-    monkeypatch.setattr(runtime, "MAX_PENDING_REPORT_PLANS", 2)
+def test_too_many_pending_plans_answer_429(world):
     client, *_ = world[0](_plan(), _plan(), _plan())
     c = client()
+    object.__setattr__(get_pipeline(c.app).registry.get("database.report"), "max_active", 2)
     assert _create(c).status_code == 201
     assert _create(c).status_code == 201
     third = _create(c)
