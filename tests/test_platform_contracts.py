@@ -179,3 +179,12 @@ def test_lifecycle_cannot_skip_approval_or_verification():
     assert not can_transition(TaskStatus.EXECUTING, TaskStatus.COMPLETED)
     assert not can_transition(TaskStatus.PLANNED, TaskStatus.EXECUTING)
     assert not can_transition(TaskStatus.REJECTED, TaskStatus.APPROVED)
+
+
+def test_second_approver_needs_an_approver_permission_and_not_the_other_way_round():
+    with pytest.raises(ContractError, match="approver_permission"):
+        write_op(approval=ApprovalPolicy(second_approver=True))
+    with pytest.raises(ContractError, match="approver_permission"):
+        write_op(approver_permission="demo:approve")
+    op = write_op(approval=ApprovalPolicy(second_approver=True), approver_permission="demo:approve")
+    assert op.approver_permission == "demo:approve"

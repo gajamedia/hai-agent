@@ -155,6 +155,8 @@ class Operation:
     execute: Optional[Callable[..., Any]] = None
     verify: Optional[Callable[..., Verification]] = None
     verify_waived_reason: Optional[str] = None
+    # Permission a *different* person needs to approve a run (required when approval.second_approver).
+    approver_permission: Optional[str] = None
 
     def __post_init__(self) -> None:
         _check_name("feature", self.feature)
@@ -178,6 +180,11 @@ class Operation:
             raise ContractError("an operation with a verifier cannot also waive verification")
         if self.execute is None:
             raise ContractError("execute is required")
+        if self.approval.second_approver and not (
+                isinstance(self.approver_permission, str) and self.approver_permission.strip()):
+            raise ContractError(f"{self.id}: second_approver needs an approver_permission")
+        if self.approver_permission is not None and not self.approval.second_approver:
+            raise ContractError(f"{self.id}: approver_permission without second_approver")
         if self.effect.changes_world:
             if self.preview is None:
                 raise ContractError(
