@@ -79,6 +79,10 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
     ("DELETE", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
     ("POST", r"^/api/v1/database-creation/plans/[^/]+/run$", "database:create:manage"),
+    # Task history: your own tasks. The permission comes with the roles that run features; the handler
+    # then shows only your tasks, and only for operations you may still use.
+    ("GET", r"^/api/v1/tasks$", "task:history:read"),
+    ("GET", r"^/api/v1/tasks/[^/]+$", "task:history:read"),
     # Engine requests: anyone who may ask can list (the handler narrows it to their own
     # unless they are a reviewer); only reviewers can change a request.
     ("POST", r"^/api/v1/database-engine-requests$", "database:engine:request"),

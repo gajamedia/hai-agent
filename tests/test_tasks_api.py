@@ -1,6 +1,7 @@
 """The task history: only your own tasks, for operations you may still use, with nothing erased shown."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import time
@@ -15,8 +16,14 @@ from tests.test_table_report_plans_api import BASE as REPORTS, _create, _plan as
 from tests.test_table_report_plans_api import world as report_world  # noqa: F401
 
 TASKS = "/api/v1/tasks"
+HISTORY = "task:history:read"
+# every person in these tests may read their history, except where a test says otherwise
+for _name in ("alice", "bob"):
+    USERS[_name] = dataclasses.replace(USERS[_name], permissions=USERS[_name].permissions + (HISTORY,))
 USERS["alice-readonly"] = AuthenticatedPrincipal(
-    actor_id="alice", permissions=("report:table:run",), auth_time=int(time.time()))
+    actor_id="alice", permissions=("report:table:run", HISTORY), auth_time=int(time.time()))
+USERS["alice-nohistory"] = AuthenticatedPrincipal(
+    actor_id="alice", permissions=("data:change:plan", "data:change:execute"), auth_time=int(time.time()))
 
 
 def _get(client, path="", user="alice", **params):
@@ -45,6 +52,22 @@ def test_your_tasks_are_listed_newest_first_with_a_label_and_a_line_about_each(w
     assert done["status"] == "completed" and done["verification"] == "verified"
     assert done["title"].startswith("Ubah data: ") and done["title"].endswith(" baris di sales")
     assert done["expires_in_seconds"] is None and body["has_more"] is False
+
+
+def test_the_history_permission_is_required(world):
+    client, *_ = world
+    for path in ("", "/anything"):
+        r = _get(client, path, user="alice-nohistory")
+        assert r.status_code == 403 and r.json()["detail"]["error"] == "permission_denied"
+
+
+def test_the_roles_that_run_features_carry_the_history_permission():
+    from api.security.authorization_config import _role_map_for_keycloak
+    roles = _role_map_for_keycloak("hai-api")
+    for role in ("data-reports-user", "data-writer", "data-schema-creator"):
+        assert HISTORY in roles[f"client:hai-api:{role}"], role
+    # an approver only approves; having no task history of their own is correct
+    assert HISTORY not in roles["client:hai-api:data-change-approver"]
 
 
 def test_nobody_sees_someone_elses_tasks(world):
@@ -142,7 +165,7 @@ def test_a_failed_change_shows_why_it_is_failed_not_how(world):
 def test_a_report_task_shows_its_question_and_links_to_the_file(report_world):
     build, _tmp = report_world
     make_client, *_ = build(report_answer())
-    client = make_client()
+    client = make_client("alice", "report:table:run", "business:database:read", HISTORY)
     created = _create(client, "omzet per wilayah").json()
     ran = client.post(f"{REPORTS}/plans/{created['plan_id']}/run").json()
     assert ran["status"] == "succeeded"

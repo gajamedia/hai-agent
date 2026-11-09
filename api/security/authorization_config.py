@@ -74,13 +74,14 @@ def _role_map_for_keycloak(api_client_id: str) -> dict[str, tuple[str, ...]]:
             api["table_report_run"],
             api["business_database_read"],
             api["database_engine_request"],
+            api["task_history_read"],
         ),
         f"{prefix}database-connection-manager": (api["database_connection_manage"],),
         # Changing data (insert/update/delete) is separate from reading: the writer may plan and
         # execute; a different person with the approver role approves what needs a second pair of eyes.
-        f"{prefix}data-writer": (api["data_change_plan"], api["data_change_execute"]),
+        f"{prefix}data-writer": (api["data_change_plan"], api["data_change_execute"], api["task_history_read"]),
         f"{prefix}data-change-approver": (api["data_change_approve"],),
-        f"{prefix}data-schema-creator": (api["database_create_manage"],),
+        f"{prefix}data-schema-creator": (api["database_create_manage"], api["task_history_read"]),
         f"{prefix}database-engine-reviewer": (
             api["database_engine_review"],
             api["database_engine_request"],  # reviewers also list requests

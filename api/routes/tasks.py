@@ -16,8 +16,10 @@ from fastapi import APIRouter, HTTPException, Request
 from agent.platform import Operation, TaskNotFound, TaskRecord, TaskStatus
 from api.platform_runtime import get_pipeline
 from api.security.authentication import AuthenticationError, get_attached_principal
+from api.security.authorization import AuthorizationDenied, AuthorizationPolicy
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+PERMISSION = "task:history:read"
 
 # Filter names the browser uses -> the statuses they stand for.
 _GROUPS = {
@@ -40,10 +42,19 @@ def _error(status: int, code: str, message: str) -> HTTPException:
 
 def _principal(request: Request):
     try:
-        return get_attached_principal(request)
+        principal = get_attached_principal(request)
     except AuthenticationError as exc:
         raise _error(401, "authentication_required",
                      "A verified authenticated principal is required.") from exc
+    policy = getattr(request.app.state, "authorization_policy", None)
+    if not isinstance(policy, AuthorizationPolicy):
+        raise _error(503, "authorization_policy_unavailable",
+                     "The application authorization policy is not configured.")
+    try:
+        policy.require(principal, PERMISSION)
+    except AuthorizationDenied as exc:
+        raise _error(403, "permission_denied", f"The principal lacks the {PERMISSION} permission.") from exc
+    return principal
 
 
 def _title(op: Operation, task: TaskRecord) -> str:
