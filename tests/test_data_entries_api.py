@@ -107,3 +107,122 @@ def test_recording_into_an_unknown_database_is_not_found(world):
     client, _, _, _ = world
     r = _entry(client, "POST", "/plans", json={"question": "x", "database": "nope"})
     assert r.status_code == 404
+
+
+# ------------------------------------------------------------------ taking an entry back
+import sqlite3  # noqa: E402
+
+
+def _record(client, provider, user="clerk"):
+    plan_id = _plan(client, provider, INSERT, user=user).json()["plan_id"]
+    done = _entry(client, "POST", f"/plans/{plan_id}/run", user)
+    assert done.status_code == 200, done.text
+    return plan_id
+
+
+def _products(db):
+    with sqlite3.connect(db) as c:
+        return [r[0] for r in c.execute("SELECT product FROM sales WHERE product IN ('kopi', 'teh') ORDER BY id")]
+
+
+def test_an_entry_can_be_taken_back_once_and_only_its_own_rows_go(world):
+    client, provider, db, _ = world
+    before = _count(db)
+    entry_id = _record(client, provider)
+    assert _count(db) == before + 2
+    recent = _entry(client, "GET", "/recent").json()
+    assert recent["entries"][0]["entry_id"] == entry_id and recent["entries"][0]["undoable"] is True
+    assert recent["entries"][0]["rows"] == 2 and recent["entries"][0]["table"] == "sales"
+    undone = _entry(client, "POST", f"/{entry_id}/undo")
+    assert undone.status_code == 200, undone.text
+    assert undone.json() == {"status": "undone", "rows_removed": 2, "table": "sales", "verification": "verified"}
+    assert _count(db) == before and _products(db) == []
+    after = _entry(client, "GET", "/recent").json()["entries"][0]
+    assert after["undone"] is True and after["undoable"] is False
+    again = _entry(client, "POST", f"/{entry_id}/undo")
+    assert again.status_code == 409 and "sudah dibatalkan" in again.json()["detail"]["message"]
+
+
+def test_an_entry_is_not_taken_back_when_one_of_its_rows_was_edited_since(world):
+    client, provider, db, _ = world
+    before = _count(db)
+    entry_id = _record(client, provider)
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE sales SET amount = 999 WHERE product = 'kopi'")
+    refused = _entry(client, "POST", f"/{entry_id}/undo")
+    assert refused.status_code == 409 and refused.json()["detail"]["error"] == "undo_refused"
+    assert "changed after they were recorded" in refused.json()["detail"]["message"]
+    assert _count(db) == before + 2                     # nothing was removed, not even the untouched row
+
+
+def test_an_entry_is_not_taken_back_when_a_row_is_already_gone(world):
+    client, provider, db, _ = world
+    entry_id = _record(client, provider)
+    with sqlite3.connect(db) as c:
+        c.execute("DELETE FROM sales WHERE product = 'teh'")
+    refused = _entry(client, "POST", f"/{entry_id}/undo")
+    assert refused.status_code == 409 and "no longer there" in refused.json()["detail"]["message"]
+    assert _products(db) == ["kopi"]
+
+
+def test_only_the_author_can_take_an_entry_back(world):
+    client, provider, db, _ = world
+    entry_id = _record(client, provider)
+    assert _entry(client, "POST", f"/{entry_id}/undo", "clerk2").status_code == 404
+    assert _entry(client, "POST", f"/{entry_id}/undo", "alice").status_code == 403    # no entry permission
+    assert _products(db) == ["kopi", "teh"]
+
+
+def test_the_time_window_closes(world):
+    client, provider, db, tmp = world
+    entry_id = _record(client, provider)
+    with sqlite3.connect(tmp / "work" / "platform.sqlite3") as c:
+        c.execute("UPDATE platform_tasks SET updated_at = updated_at - 200000 WHERE task_id = ?", (entry_id,))
+    listed = _entry(client, "GET", "/recent").json()["entries"][0]
+    assert listed["undoable"] is False
+    late = _entry(client, "POST", f"/{entry_id}/undo")
+    assert late.status_code == 409 and "Batas waktu" in late.json()["detail"]["message"]
+    assert _products(db) == ["kopi", "teh"]
+
+
+def test_undo_needs_no_delete_approval_on_the_table_but_removes_nothing_else(world):
+    client, provider, db, _ = world
+    insert_only = {"tables": {"sales": {
+        "columns": ["id", "region", "product", "amount"], "filterable_columns": ["id", "region", "product"],
+        "key_column": "id", "writable": {"operations": ["insert"], "columns": ["product", "amount"]}}}}
+    assert client.post("/api/v1/database-connections/sales/approve", json=insert_only,
+                       headers={"X-Test-User": "alice"}).status_code == 200
+    before = _count(db)
+    entry_id = _record(client, provider)
+    assert _entry(client, "POST", f"/{entry_id}/undo").status_code == 200
+    assert _count(db) == before
+
+
+def test_the_audit_names_the_keys_taken_back_and_holds_no_values(world, monkeypatch):
+    client, provider, db, tmp = world
+    monkeypatch.setenv("HAI_AUDIT_DETAIL", "minimal")
+    entry_id = _record(client, provider)
+    assert _entry(client, "POST", f"/{entry_id}/undo").status_code == 200
+    lines = (tmp / "work" / "audit" / "changes-sales.jsonl").read_text("utf-8").splitlines()
+    records = [json.loads(x) for x in lines]
+    made = next(r for r in records if r.get("status") == "committed" and r.get("operation") == "insert")
+    undo = next(r for r in records if r.get("event") == "undo")
+    assert made["inserted_keys"] == undo["keys"] and undo["status"] == "committed"
+    text = "\n".join(lines)
+    # the person's own words are kept (that is what "the original instruction" means); the values are not
+    for value in ('"product": "kopi"', '"product": "teh"', '"amount": 25', '"amount": 15', '"params": ["25"'):
+        assert value not in text
+    planned = next(r for r in records if r.get("event") == "entry_planned")
+    assert planned["plan"] == {"operation": "insert", "table": "sales", "max_rows": 100, "rows_count": 2}
+
+
+def test_an_insert_that_cannot_tell_its_own_rows_is_refused_and_leaves_nothing(world, monkeypatch):
+    client, provider, db, _ = world
+    from agent.workflow.data_change import DataChangeService
+    before = _count(db)
+    real = DataChangeService._max_key
+    monkeypatch.setattr(DataChangeService, "_max_key", lambda self, cur, table, key: (real(self, cur, table, key) or 0) - 1)
+    plan_id = _plan(client, provider, INSERT).json()["plan_id"]
+    refused = _entry(client, "POST", f"/plans/{plan_id}/run")
+    assert refused.status_code == 409 and "at the same moment" in refused.json()["detail"]["message"]
+    assert _count(db) == before

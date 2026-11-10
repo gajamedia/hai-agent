@@ -37,6 +37,8 @@ def settings() -> dict[str, Any]:
         # "minimal" (default): audit files hold no business data, only row keys and counts.
         # "full": they also hold the data as it was before a change and the values written.
         "audit_detail": "full" if os.getenv("HAI_AUDIT_DETAIL", "").strip().lower() == "full" else "minimal",
+        # How long after recording its author may take an entry back (minutes).
+        "entry_undo_minutes": _int_env("HAI_ENTRY_UNDO_MINUTES", 1440, 1, 43200),
         "step_up_max_age_seconds": _int_env("HAI_STEPUP_MAX_AGE_SECONDS", 120, 30, 900),
     }
 

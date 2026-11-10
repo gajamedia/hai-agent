@@ -78,6 +78,8 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     # Recording new data (insert only): one permission for planning, cancelling and running.
     ("GET", r"^/api/v1/data-entries/config$", "data:entry:record"),
     ("GET", r"^/api/v1/data-entries/databases$", "data:entry:record"),
+    ("GET", r"^/api/v1/data-entries/recent$", "data:entry:record"),
+    ("POST", r"^/api/v1/data-entries/[^/]+/undo$", "data:entry:record"),
     ("POST", r"^/api/v1/data-entries/plans$", "data:entry:record"),
     ("GET", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),
     ("DELETE", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),

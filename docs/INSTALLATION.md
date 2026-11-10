@@ -312,13 +312,15 @@ Default memberi `data-reports-user` dan `database-connection-manager`. Role lain
 | `data-entry` | Mencatat data baru saja (insert), mis. transaksi harian: ringkasan lalu "Simpan", tanpa frasa, login ulang, atau persetujuan. Tidak bisa ubah/hapus |
 | `data-change-approver` | Menyetujui perubahan buatan orang lain |
 
+Pencatatan lewat **Catat data** bisa dibatalkan oleh penulisnya sendiri selama `HAI_ENTRY_UNDO_MINUTES` (bawaan 1440 menit = 1 hari), hanya jika tabelnya punya kunci angka dan tidak ada barisnya yang diubah atau dihapus sejak dicatat. Pembatalan menghapus tepat baris itu saja, tidak butuh izin hapus, dan tercatat di riwayat tugas dan audit.
+
 ```powershell
 python scripts\keycloak_data_report_roles.py --user hai.dev --roles data-writer,data-change-approver
 ```
 
 Setelah itu **sign out lalu sign in lagi** agar token membawa role baru.
 
-Isi file audit perubahan data secara bawaan tidak memuat data bisnis (hanya kunci baris dan jumlah). `HAI_AUDIT_DETAIL=full` menyimpan juga data sebelum perubahan dan nilai yang ditulis.
+Isi file audit perubahan data secara bawaan tidak memuat nilai data bisnis (hanya kunci baris, nama kolom, dan jumlah). Kalimat perintah asli pengguna tetap dicatat (maks. 500 karakter) sebagai bukti instruksi, jadi bila pengguna mengetik nama atau data pribadi di kalimatnya, itu ikut tersimpan. `HAI_AUDIT_DETAIL=full` menyimpan juga data sebelum perubahan dan nilai yang ditulis.
 
 Satu orang yang memegang `data-writer` dan `data-change-approver` hanya bisa menyetujui perubahannya
 sendiri jika `HAI_DATA_CHANGE_SELF_APPROVAL=true` (hanya untuk uji/laptop).

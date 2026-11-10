@@ -13,6 +13,7 @@ Planning and running go through the shared platform pipeline (``database.entry``
 """
 
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Request
@@ -23,13 +24,14 @@ from agent.platform import (
     PolicyViolation, TaskConflict, TaskExpired, TaskNotFound, TaskStatus, TooManyTasks,
 )
 from agent.workflow.data_change import MAX_INSERT_ROWS, ChangeRefused
-from api.data_change_settings import ENTRY
+from api.data_change_settings import ENTRY, settings
 from api.database_runtime_registry import RegistryError, RegistryNotFound
-from api.features.database_changes import ENTRY_OPERATION, ConnectionChanged
+from api.features.database_changes import ENTRY_OPERATION, UNDO_OPERATION, ConnectionChanged, undone_entry_ids
 from api.routes.data_changes import LLM_UNAVAILABLE, _err, _pipeline, _principal, _registry, _view
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data-entries", tags=["data-entries"])
+_now = time.time  # replaced in tests
 
 
 def _mine(request: Request, plan_id: str, principal, *, allow_finished: bool = False):
@@ -173,8 +175,67 @@ def run_entry(plan_id: str, request: Request):
                    "before trying again.") from exc
     done = outcome.task
     verdict = (done.verification or {}).get("verdict", "unverified")
-    return {"status": "committed", "rows_affected": done.result["rows_affected"],
-            "table": done.result["table"], "verification": verdict, "replayed": outcome.replayed}
+    return {"status": "committed", "entry_id": done.task_id, "rows_affected": done.result["rows_affected"],
+            "table": done.result["table"], "verification": verdict, "replayed": outcome.replayed,
+            "undoable": bool(done.result.get("undo")) and verdict == "verified"}
+
+
+@router.get("/recent")
+def recent_entries(request: Request):
+    """The person's latest recorded entries, and which of them may still be taken back."""
+    principal = _principal(request, ENTRY)
+    pipeline = _pipeline(request)
+    window = settings()["entry_undo_minutes"] * 60
+    undone = undone_entry_ids(pipeline.store, principal.actor_id)
+    items, now = [], _now()
+    tasks, _more = pipeline.list_tasks(principal, statuses=[TaskStatus.COMPLETED], limit=100)
+    for task, _op in tasks:
+        info = (task.result or {}).get("undo")
+        if task.operation_id != ENTRY_OPERATION or not info:
+            continue
+        gone = task.task_id in undone
+        items.append({"entry_id": task.task_id, "database": info["database"], "table": info["table"],
+                      "rows": len(info["rows"]), "recorded_at": task.updated_at, "undone": gone,
+                      "undoable": not gone and now - task.updated_at <= window,
+                      "undo_seconds_left": 0 if gone else max(0, int(window - (now - task.updated_at)))})
+        if len(items) >= 20:
+            break
+    return {"entries": items, "undo_minutes": settings()["entry_undo_minutes"]}
+
+
+@router.post("/{entry_id}/undo")
+def undo_entry(entry_id: str, request: Request):
+    """Take back an entry: remove exactly the rows it recorded, unless one was edited since (then nothing is)."""
+    principal = _principal(request, ENTRY)
+    _mine(request, entry_id, principal, allow_finished=True)
+    pipeline = _pipeline(request)
+    try:
+        task = pipeline.submit(UNDO_OPERATION, {"entry_id": entry_id}, principal)
+    except PlanUnsupported as exc:
+        raise _err(409, "undo_not_possible", exc.reason) from exc
+    except PermissionDenied as exc:
+        raise _err(403, "permission_denied", f"The principal lacks the {ENTRY} permission.") from exc
+    except TooManyTasks as exc:
+        raise _err(429, "too_many_plans", str(exc)) from exc
+    except PlanError as exc:
+        logger.error("Undo planning failed.", exc_info=exc)
+        raise _err(503, "data_entry_failed", "The entry could not be taken back right now.") from exc
+    try:
+        outcome = pipeline.run(task.task_id, principal)
+    except ExecutionFailed as exc:
+        cause = exc.__cause__
+        if isinstance(cause, (ChangeRefused, ConnectionChanged)):
+            raise _err(409, "undo_refused", str(cause)) from exc
+        logger.error("Undo failed.", exc_info=exc)
+        raise _err(503, "data_entry_failed",
+                   "Taking the entry back failed and was rolled back if it had not been committed. "
+                   "Check the data before trying again.") from exc
+    except (TaskNotFound, TaskExpired, TaskConflict, ApprovalRequired, PolicyViolation) as exc:
+        raise _err(409, "undo_not_possible", str(exc)) from exc
+    done = outcome.task
+    verdict = (done.verification or {}).get("verdict", "unverified")
+    return {"status": "undone", "rows_removed": done.result["rows_affected"], "table": done.result["table"],
+            "verification": verdict}
 
 
 __all__ = ["router"]

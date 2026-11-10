@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, LoaderCircle } from "lucide-react";
-import { cancelDataEntry, createDataEntry, getDataEntryDatabases, runDataEntry } from "../api/client.js";
+import {
+  cancelDataEntry, createDataEntry, getDataEntryDatabases, listRecentEntries, runDataEntry, undoDataEntry,
+} from "../api/client.js";
 import "./autonomous-testing.css";
 
 const errorText = (error) => error?.body?.detail?.message || error?.message || "Terjadi kesalahan.";
@@ -23,6 +25,14 @@ function RowsTable({ rows }) {
     </div>
   );
 }
+
+const rowStyle = {
+  display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "10px 12px", borderRadius: 10,
+  border: "1px solid rgba(148,163,184,0.22)", background: "rgba(15,23,42,0.55)", fontSize: 13,
+};
+const formatTime = (seconds) => new Date(seconds * 1000).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" });
+const formatWindow = (minutes) =>
+  minutes % 1440 === 0 ? `${minutes / 1440} hari` : minutes % 60 === 0 ? `${minutes / 60} jam` : `${minutes} menit`;
 
 const fieldsetStyle = { border: 0, padding: 0, margin: 0, minWidth: 0 };
 const legendStyle = { fontSize: 12, fontWeight: 600, letterSpacing: "0.04em", color: "#94a3b8", padding: 0, marginBottom: 10 };
@@ -80,6 +90,22 @@ export default function DataEntry() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(null);
   const [result, setResult] = useState(null);
+  const [recent, setRecent] = useState([]);
+  const [undoMinutes, setUndoMinutes] = useState(null);
+  const [confirming, setConfirming] = useState(null);
+  const [notice, setNotice] = useState("");
+
+  const loadRecent = useCallback(async () => {
+    try {
+      const body = await listRecentEntries();
+      setRecent(body.entries || []);
+      setUndoMinutes(body.undo_minutes ?? null);
+    } catch {
+      setRecent([]);
+    }
+  }, []);
+
+  useEffect(() => { loadRecent(); }, [loadRecent]);
 
   useEffect(() => {
     let active = true;
@@ -125,8 +151,19 @@ export default function DataEntry() {
     guarded(async () => {
       const body = await runDataEntry(entry.plan_id, entry.plan_id);
       setResult(body);
+      setNotice("");
       setEntry(null);
       setQuestion("");
+      await loadRecent();
+    });
+
+  const undo = (entryId) =>
+    guarded(async () => {
+      const body = await undoDataEntry(entryId);
+      setConfirming(null);
+      setResult(null);
+      setNotice(`Dibatalkan: ${body.rows_removed} baris di tabel ${body.table} dihapus.`);
+      await loadRecent();
     });
 
   const cancel = () =>
@@ -213,6 +250,42 @@ export default function DataEntry() {
           {result.verification !== "verified" && (
             <> Hasilnya belum dapat dipastikan; periksa datanya sebelum mengulang.</>
           )}
+        </section>
+      )}
+
+      {notice && <section className="at-panel" role="status">{notice}</section>}
+
+      {recent.length > 0 && (
+        <section className="at-panel" aria-label="Pencatatan terbaru">
+          <h2>Pencatatan terbaru</h2>
+          <small>
+            Salah catat? Anda bisa membatalkan pencatatan Anda sendiri{undoMinutes ? ` dalam ${formatWindow(undoMinutes)}` : ""},
+            selama barisnya belum diubah orang lain.
+          </small>
+          <ul style={{ listStyle: "none", margin: "10px 0 0", padding: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+            {recent.map((item) => (
+              <li key={item.entry_id} style={rowStyle}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <b>{item.rows} baris</b> di {item.table} <small style={{ color: "#94a3b8" }}>· {formatTime(item.recorded_at)}</small>
+                </span>
+                {item.undone && <small style={{ color: "#94a3b8" }}>dibatalkan</small>}
+                {!item.undone && !item.undoable && <small style={{ color: "#94a3b8" }}>batas waktu lewat</small>}
+                {item.undoable && confirming !== item.entry_id && (
+                  <button type="button" className="at-button at-button-secondary" disabled={busy}
+                    onClick={() => setConfirming(item.entry_id)}>Batalkan</button>
+                )}
+                {item.undoable && confirming === item.entry_id && (
+                  <>
+                    <small>Hapus {item.rows} baris ini?</small>
+                    <button type="button" className="at-button at-button-primary" disabled={busy}
+                      onClick={() => undo(item.entry_id)}>Ya, batalkan</button>
+                    <button type="button" className="at-button at-button-secondary" disabled={busy}
+                      onClick={() => setConfirming(null)}>Tidak</button>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
         </section>
       )}
     </main>

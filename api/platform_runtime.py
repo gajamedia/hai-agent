@@ -14,7 +14,7 @@ from typing import Any, Optional
 from agent.platform import Feature, OperationRegistry, PlatformPipeline, SQLiteTaskStore
 from api.database_runtime_registry import DatabaseRuntimeRegistry
 from api.data_change_settings import settings as change_settings
-from api.features.database_changes import build_change_operation, build_entry_operation
+from api.features.database_changes import build_change_operation, build_entry_operation, build_undo_operation
 from api.features.database_creation import build_create_operation
 from api.features.database_reports import OutcomeCache, build_report_operation
 from api.security.authorization import AuthorizationPolicy
@@ -62,6 +62,9 @@ def get_pipeline(app: Any) -> PlatformPipeline:
         if isinstance(registry, DatabaseRuntimeRegistry):
             database_operations.append(build_change_operation(lambda: app.state.database_runtime_registry))
             database_operations.append(build_entry_operation(lambda: app.state.database_runtime_registry))
+            database_operations.append(build_undo_operation(
+                lambda: app.state.database_runtime_registry, lambda: store,
+                window_minutes=lambda: change_settings()["entry_undo_minutes"], clock=time.time))
             database_operations.append(build_create_operation(lambda: app.state.database_runtime_registry))
         operations.register(Feature("database", "Database Agent", tuple(database_operations)))
         pipeline = PlatformPipeline(

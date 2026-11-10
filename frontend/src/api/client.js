@@ -346,6 +346,14 @@ export async function runDataEntry(planId, idempotencyKey, signal) {
   );
 }
 
+export async function listRecentEntries(signal) {
+  return request(`${API_V1}/data-entries/recent`, { signal });
+}
+
+export async function undoDataEntry(entryId, signal) {
+  return jsonPost(`${API_V1}/data-entries/${encodeURIComponent(entryId)}/undo`, {}, signal);
+}
+
 export async function cancelDataEntry(planId, signal) {
   return request(`${API_V1}/data-entries/plans/${encodeURIComponent(planId)}`, {
     method: "DELETE",

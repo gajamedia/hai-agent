@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Optional
 from fastapi.encoders import jsonable_encoder
 
 from agent.platform import (
-    ApprovalPolicy, Effect, Operation, PlanUnsupported, Verdict, Verification,
+    ApprovalPolicy, Effect, Operation, PlanUnsupported, TaskStatus, Verdict, Verification,
 )
 from agent.workflow.data_change import ChangeRefused, ChangeRequest
 from api.data_change_settings import APPROVE, ENTRY, EXECUTE, PLAN, requires_approval
@@ -138,8 +138,13 @@ def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, ent
             change_request_from_json(plan_doc["request"]), expected_rows=plan_doc["expected_rows"],
             actor=ctx.actor_id, approver=ctx.approved_by, plan_id=ctx.task_id,
             question=plan_doc["question"])
-        return {"rows_affected": done.rows_affected, "operation": plan_doc["summary"]["operation"],
-                "table": plan_doc["summary"]["table"]}
+        out = {"rows_affected": done.rows_affected, "operation": plan_doc["summary"]["operation"],
+               "table": plan_doc["summary"]["table"]}
+        if done.inserted:
+            # Enough to take exactly these rows back later: their keys and fingerprints, never their values.
+            out["undo"] = {"database": name, "table": plan_doc["summary"]["table"],
+                           "rows": [dict(row) for row in done.inserted]}
+        return out
 
     def verify(plan_doc: Mapping[str, Any], result: Mapping[str, Any], ctx) -> Verification:
         service = get_registry().data_changes(plan_doc["database"])
@@ -166,6 +171,89 @@ def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, ent
         label="Ubah data", describe=describe_change)
 
 
-__all__ = ["CHANGE_OPERATION", "ENTRY_OPERATION", "ConnectionChanged", "build_change_operation",
+UNDO_OPERATION = "database.undo"
+_ALREADY = {TaskStatus.COMPLETED, TaskStatus.UNVERIFIED, TaskStatus.EXECUTING, TaskStatus.VERIFYING}
+
+
+def undone_entry_ids(store, actor: str, *, limit: int = 200) -> set[str]:
+    """Ids of the entries this person has already taken back (or is taking back right now)."""
+    found: set[str] = set()
+    for task in store.list_for_owner(actor, limit=limit):
+        if task.operation_id == UNDO_OPERATION and task.status in _ALREADY and task.plan:
+            found.add(task.plan.get("entry_id"))
+    return found
+
+
+def describe_undo(plan: Optional[Mapping[str, Any]], result: Optional[Mapping[str, Any]]) -> str:
+    if result and result.get("rows_affected") is not None:
+        return f"Batalkan pencatatan: {result['rows_affected']} baris di {result.get('table')}"
+    summary = (plan or {}).get("summary") or {}
+    if summary.get("table"):
+        return f"Batalkan pencatatan: {summary.get('rows')} baris di {summary['table']}"
+    return "Batalkan pencatatan"
+
+
+def build_undo_operation(get_registry: Callable[[], DatabaseRuntimeRegistry],
+                         get_store: Callable[[], Any], *, window_minutes: Callable[[], int],
+                         clock: Callable[[], float]) -> Operation:
+    """Take back an entry (``database.undo``): remove exactly the rows it made, once, by its own author, within
+    a time window, and only if none of them was edited since. The author needs no delete approval for this: the
+    rows are named by key, so nothing else in the table can be touched."""
+
+    def plan(request: Mapping[str, Any], ctx) -> dict[str, Any]:
+        store = get_store()
+        try:
+            source = store.get(request["entry_id"])
+        except Exception:  # an unknown id is the same as someone else's
+            source = None
+        if source is None or source.owner != ctx.actor_id or source.operation_id != ENTRY_OPERATION:
+            raise PlanUnsupported("Pencatatan itu tidak ditemukan.", {"kind": "unsupported"})
+        info = (source.result or {}).get("undo")
+        if source.status is not TaskStatus.COMPLETED or not info:
+            raise PlanUnsupported("Pencatatan ini tidak bisa dibatalkan (tabelnya tidak punya kunci angka, "
+                                  "atau hasilnya belum terverifikasi).", {"kind": "unsupported"})
+        if clock() - source.updated_at > window_minutes() * 60:
+            raise PlanUnsupported(f"Batas waktu pembatalan ({window_minutes()} menit) sudah lewat.",
+                                  {"kind": "unsupported"})
+        if source.task_id in undone_entry_ids(store, ctx.actor_id):
+            raise PlanUnsupported("Pencatatan ini sudah dibatalkan.", {"kind": "unsupported"})
+        registry = get_registry()
+        return {"entry_id": source.task_id, "database": info["database"], "table": info["table"],
+                "rows": info["rows"], "connection": registry.change_token(info["database"]),
+                "summary": {"operation": "undo", "table": info["table"], "rows": len(info["rows"])}}
+
+    def preview(plan_doc: Mapping[str, Any], ctx) -> dict[str, Any]:
+        return {"summary": plan_doc["summary"]}
+
+    def execute(plan_doc: Mapping[str, Any], ctx) -> dict[str, Any]:
+        registry = get_registry()
+        if registry.change_token(plan_doc["database"]) != plan_doc["connection"]:
+            raise ConnectionChanged("the approved tables changed since this entry was recorded")
+        removed = registry.data_changes(plan_doc["database"]).undo_insert(
+            plan_doc["table"], plan_doc["rows"], actor=ctx.actor_id, plan_id=ctx.task_id,
+            entry_id=plan_doc["entry_id"])
+        return {"rows_affected": removed, "operation": "undo", "table": plan_doc["table"],
+                "entry_id": plan_doc["entry_id"]}
+
+    def verify(plan_doc: Mapping[str, Any], result: Mapping[str, Any], ctx) -> Verification:
+        service = get_registry().data_changes(plan_doc["database"])
+        key = service.table(plan_doc["table"]).entry.key_column
+        keys = tuple(row["key"] for row in plan_doc["rows"])
+        request = ChangeRequest(operation="delete", table=plan_doc["table"],
+                                conditions=((key, "in", keys),), max_rows=len(keys))
+        seen = service.verify(request, len(keys))
+        evidence = {**seen, "rows_affected": result.get("rows_affected")}
+        return Verification(Verdict.VERIFIED if seen["confirmed"] else Verdict.UNVERIFIED, evidence)
+
+    return Operation(
+        feature=FEATURE, name="undo", effect=Effect.WRITE, permission=ENTRY, risk=0.3,
+        approval=ApprovalPolicy.none(),
+        description="Take back an entry: remove exactly the rows it made, if none was edited since",
+        plan=plan, preview=preview, execute=execute, verify=verify, plan_permission=ENTRY,
+        max_active=50, label="Batalkan catat", describe=describe_undo)
+
+
+__all__ = ["CHANGE_OPERATION", "ENTRY_OPERATION", "UNDO_OPERATION", "ConnectionChanged", "build_change_operation",
+           "build_undo_operation", "describe_undo", "undone_entry_ids",
            "build_entry_operation", "describe_change",
            "change_request_from_json", "change_request_to_json"]

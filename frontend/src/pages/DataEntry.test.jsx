@@ -8,7 +8,9 @@ vi.mock("../api/client", () => ({
   cancelDataEntry: vi.fn(),
   createDataEntry: vi.fn(),
   getDataEntryDatabases: vi.fn(),
+  listRecentEntries: vi.fn(),
   runDataEntry: vi.fn(),
+  undoDataEntry: vi.fn(),
 }));
 
 const ENTRY = {
@@ -29,6 +31,7 @@ describe("DataEntry", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     api.getDataEntryDatabases.mockResolvedValue({ databases: [{ name: "dbsales", tables: ["sales"] }] });
+    api.listRecentEntries.mockResolvedValue({ entries: [], undo_minutes: 1440 });
     api.createDataEntry.mockResolvedValue(ENTRY);
     api.runDataEntry.mockResolvedValue({ status: "committed", rows_affected: 2, table: "sales", verification: "verified" });
   });
@@ -93,5 +96,43 @@ describe("DataEntry", () => {
     expect(await screen.findByText("30 tabel dapat diisi")).toBeTruthy();
     expect(screen.getByText("+27 lainnya")).toBeTruthy();
     expect(screen.queryByText("tb_10")).toBeNull();
+  });
+
+  const RECENT = { entry_id: "e1", database: "dbsales", table: "sales", rows: 2, recorded_at: 1760000000,
+    undone: false, undoable: true, undo_seconds_left: 3000 };
+
+  it("lists recent entries and takes one back only after a second, explicit yes", async () => {
+    const user = userEvent.setup();
+    api.listRecentEntries.mockResolvedValue({ entries: [RECENT], undo_minutes: 1440 });
+    api.undoDataEntry.mockResolvedValue({ status: "undone", rows_removed: 2, table: "sales", verification: "verified" });
+    render(<DataEntry />);
+    expect(await screen.findByLabelText("Pencatatan terbaru")).toBeTruthy();
+    expect(screen.getByText(/dalam 1 hari/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Batalkan" }));
+    expect(api.undoDataEntry).not.toHaveBeenCalled(); // the first press only asks
+    await user.click(screen.getByRole("button", { name: "Ya, batalkan" }));
+    expect(api.undoDataEntry).toHaveBeenCalledWith("e1");
+    expect(await screen.findByText(/Dibatalkan: 2 baris di tabel sales dihapus/)).toBeTruthy();
+  });
+
+  it("says plainly why an entry cannot be taken back", async () => {
+    const user = userEvent.setup();
+    api.listRecentEntries.mockResolvedValue({ entries: [RECENT], undo_minutes: 1440 });
+    api.undoDataEntry.mockRejectedValue(Object.assign(new Error("x"), {
+      body: { detail: { message: "1 of the rows were changed after they were recorded, so nothing was taken back." } } }));
+    render(<DataEntry />);
+    await user.click(await screen.findByRole("button", { name: "Batalkan" }));
+    await user.click(screen.getByRole("button", { name: "Ya, batalkan" }));
+    expect(await screen.findByText(/changed after they were recorded/)).toBeTruthy();
+  });
+
+  it("shows entries that were taken back or are past the time limit without a button", async () => {
+    api.listRecentEntries.mockResolvedValue({ entries: [
+      { ...RECENT, entry_id: "a", undone: true, undoable: false },
+      { ...RECENT, entry_id: "b", undoable: false }], undo_minutes: 60 });
+    render(<DataEntry />);
+    expect(await screen.findByText("dibatalkan")).toBeTruthy();
+    expect(screen.getByText("batas waktu lewat")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Batalkan" })).toBeNull();
   });
 });

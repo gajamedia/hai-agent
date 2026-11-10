@@ -13,6 +13,7 @@ approved for writing, run an UPDATE or DELETE without conditions, or change more
 user's own limit.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -85,6 +86,18 @@ class ChangePreview:
 class ChangeResult:
     rows_affected: int
     before_image: tuple[dict[str, Any], ...] = field(default=(), repr=False)
+    # For an insert into a table with a whole-number key: the key and a fingerprint of each row made, so the
+    # insert can be taken back. Never the values themselves.
+    inserted: tuple[dict[str, Any], ...] = ()
+
+
+_UNTRACKED = object()
+
+
+def _fingerprint(row: Mapping[str, Any]) -> str:
+    """A short hash of a row as read from the database; equal rows give equal fingerprints."""
+    text = json.dumps({k: _plain(v) for k, v in row.items()}, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 # --------------------------------------------------------------------------- SQL
@@ -144,6 +157,11 @@ class ChangeSqlBuilder:
         adapter, params, bind = self._statement(table, conditions)
         q = adapter._q
         return f"DELETE FROM {q(table)}{self._where(adapter, bind, conditions)}", params
+
+    def max_key(self, table: str, key: str) -> str:
+        adapter, _params, _bind = self._statement(table, ((key, "eq", 0),))
+        q = adapter._q
+        return f"SELECT MAX({q(key)}) FROM {q(table)}"
 
     def insert(self, table: str, columns: Sequence[str], rows) -> tuple[str, list[Any]]:
         adapter, params, bind = self._statement(table, ())
@@ -383,6 +401,7 @@ class DataChangeService:
         record: dict[str, Any] = {
             "plan_id": plan_id, "actor": actor, "approver": approver, "operation": request.operation,
             "table": request.table, "expected_rows": expected_rows, "question": question[:500]}
+        inserted: tuple[dict[str, Any], ...] = ()
         try:
             cursor = connection.cursor()
             try:
@@ -412,6 +431,10 @@ class DataChangeService:
                 record.update(sql=sql, params=[_plain(p) for p in params], statements=len(statements))
                 record["params_count"] = len(record["params"])
                 affected = 0
+                # For an insert into a table with a numeric key, remember which rows this change made, so that
+                # it can be taken back later (and only those rows). Read inside the same transaction.
+                track_key = self.table(request.table).entry.key_column if request.operation == "insert" else None
+                max_before = self._max_key(cursor, request.table, track_key) if track_key else _UNTRACKED
                 for sql, params in statements:
                     cursor.execute(sql, params)
                     affected += cursor.rowcount
@@ -419,6 +442,8 @@ class DataChangeService:
                     raise ChangeRefused(
                         f"The statement touched {affected} rows, not the {expected_rows} that were shown. "
                         "It was rolled back; nothing changed.")
+                if track_key and max_before is not _UNTRACKED:
+                    inserted = self._inserted_rows(cursor, request, track_key, max_before, affected)
             finally:
                 cursor.close()
             connection.commit()
@@ -439,8 +464,96 @@ class DataChangeService:
                 pass
         record.update(status="committed", rows_affected=affected)
         record.update(self._data_for_audit(request, record.get("params", []), before))
+        if inserted:
+            record["inserted_keys"] = [row["key"] for row in inserted]      # keys only, never the values
         self._audit(record)
-        return ChangeResult(affected, tuple(before))
+        return ChangeResult(affected, tuple(before), inserted)
+
+    # ------------------------------------------------------------------ taking an insert back
+    def _max_key(self, cursor, table: str, key: str):
+        """The highest key now, or None for an empty table, or ``_UNTRACKED`` when the key is not a plain
+        whole number (such a table can still be written, but its inserts cannot be taken back)."""
+        cursor.execute(self.builder.max_key(table, key))
+        row = cursor.fetchone()
+        value = row[0] if row else None
+        if value is None:
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else _UNTRACKED
+
+    def _inserted_rows(self, cursor, request: ChangeRequest, key: str, max_before, expected: int):
+        """The rows this insert made: those above the highest key seen before it, inside the same transaction.
+
+        If their number is not exactly the number inserted (someone else inserted at the same moment) the whole
+        change is refused and rolled back: it is better to try again than to guess which rows are ours."""
+        columns = self._table_columns(request.table)
+        conditions = () if max_before is None else ((key, "gt", max_before),)
+        sql, params = self.builder.select(request.table, columns, conditions, limit=expected + 1)
+        cursor.execute(sql, params)
+        rows = self._rows(cursor, columns)
+        if len(rows) != expected:
+            raise ChangeRefused(
+                "Another change was recorded at the same moment, so this one was not saved. "
+                "Nothing changed; press Simpan again.")
+        return tuple({"key": row[key], "fp": _fingerprint(row)} for row in sorted(rows, key=lambda r: r[key]))
+
+    def _table_columns(self, table: str) -> list[str]:
+        return list(self.table(table).entry.columns)
+
+    def undo_insert(self, table: str, rows: Sequence[Mapping[str, Any]], *, actor: str, plan_id: str,
+                    entry_id: str) -> int:
+        """Remove exactly the rows an earlier insert made, if and only if every one of them is still there and
+        still holds what was recorded. Whatever the table's approvals say, nothing else can be removed this way:
+        the rows are named by their keys, and one that was edited since is a refusal, never a deletion."""
+        key = self.table(table).entry.key_column
+        keys = [row["key"] for row in rows]
+        wanted = {row["key"]: row["fp"] for row in rows}
+        if not key or not keys or len(keys) != len(set(keys)) or len(keys) > MAX_INSERT_ROWS:
+            raise ChangeRefused("This entry cannot be taken back.")
+        columns = self._table_columns(table)
+        conditions = ((key, "in", tuple(keys)),)
+        record: dict[str, Any] = {"event": "undo", "plan_id": plan_id, "entry_id": entry_id, "actor": actor,
+                                  "table": table, "keys": keys}
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            try:
+                sql, params = self.builder.select(table, columns, conditions, limit=len(keys) + 1,
+                                                  lock=self.lock_clause)
+                cursor.execute(sql, params)
+                found = self._rows(cursor, columns)
+                if len(found) != len(keys):
+                    raise ChangeRefused(
+                        f"{len(keys) - len(found)} of the {len(keys)} rows are no longer there, so nothing was "
+                        "taken back.")
+                changed = [row[key] for row in found if _fingerprint(row) != wanted.get(row[key])]
+                if changed:
+                    raise ChangeRefused(
+                        f"{len(changed)} of the rows were changed after they were recorded, so nothing was "
+                        "taken back. Ask someone who may change data to correct them.")
+                sql, params = self.builder.delete(table, conditions)
+                cursor.execute(sql, params)
+                if cursor.rowcount != len(keys):
+                    raise ChangeRefused(f"The statement touched {cursor.rowcount} rows, not {len(keys)}. "
+                                        "It was rolled back; nothing changed.")
+            finally:
+                cursor.close()
+            connection.commit()
+        except Exception as exc:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            record.update(status="rolled_back", reason=f"{type(exc).__name__}: {exc}"[:300])
+            self._audit(record)
+            raise
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        record.update(status="committed", rows_affected=len(keys))
+        self._audit(record)
+        return len(keys)
 
     def verify(self, request: ChangeRequest, expected_rows: int) -> dict[str, Any]:
         """After the commit: read the table again and say what is observed.
@@ -498,7 +611,24 @@ class DataChangeService:
 
     def audit(self, event: str, **fields: Any) -> None:
         """Record a decision that is not an execution (approval, rejection, refusal)."""
+        plan = fields.get("plan")
+        if self._detail_mode() != "full" and isinstance(plan, Mapping):
+            fields["plan"] = self._plan_without_values(plan)
         self._audit({"event": event, **fields})
+
+    @staticmethod
+    def _plan_without_values(plan: Mapping[str, Any]) -> dict[str, Any]:
+        """A plan as the audit may keep it when it holds no business data: what kind, where, how many, and which
+        columns - never the values that would be written or searched for (nor the model's title, which may echo them)."""
+        out: dict[str, Any] = {"operation": plan.get("operation"), "table": plan.get("table"),
+                               "max_rows": plan.get("max_rows")}
+        if isinstance(plan.get("rows"), list):
+            out["rows_count"] = len(plan["rows"])
+        if isinstance(plan.get("set"), Mapping):
+            out["set_columns"] = sorted(plan["set"])
+        if isinstance(plan.get("conditions"), list):
+            out["condition_columns"] = [c.get("column") for c in plan["conditions"] if isinstance(c, Mapping)]
+        return out
 
     def _audit(self, record: dict[str, Any]) -> None:
         record = {"at": self._clock().isoformat(), **record}
