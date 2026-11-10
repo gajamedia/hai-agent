@@ -57,6 +57,8 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"^/api/v1/database-connections$", "database:connection:manage"),
     ("POST", r"^/api/v1/database-connections$", "database:connection:manage"),
     ("GET", r"^/api/v1/database-connections/profiles$", "database:connection:manage"),
+    ("GET", r"^/api/v1/database-connections/profiles/[^/]+/databases$", "database:connection:manage"),
+    ("GET", r"^/api/v1/database-connections/files$", "database:connection:manage"),
     ("GET", r"^/api/v1/database-connections/[^/]+/schema$", "database:connection:manage"),
     ("POST", r"^/api/v1/database-connections/[^/]+/approve$", "database:connection:manage"),
     ("POST", r"^/api/v1/database-connections/[^/]+/refresh$", "database:connection:manage"),
@@ -73,6 +75,13 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("POST", r"^/api/v1/data-changes/plans/[^/]+/run$", "data:change:execute"),
     ("GET", r"^/api/v1/data-changes/approvals$", "data:change:approve"),
     ("POST", r"^/api/v1/data-changes/approvals/[^/]+/(?:approve|reject)$", "data:change:approve"),
+    # Recording new data (insert only): one permission for planning, cancelling and running.
+    ("GET", r"^/api/v1/data-entries/config$", "data:entry:record"),
+    ("GET", r"^/api/v1/data-entries/databases$", "data:entry:record"),
+    ("POST", r"^/api/v1/data-entries/plans$", "data:entry:record"),
+    ("GET", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),
+    ("DELETE", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),
+    ("POST", r"^/api/v1/data-entries/plans/[^/]+/run$", "data:entry:record"),
     # Creating databases: one permission for planning and running; a fresh login is checked by the handler.
     ("GET", r"^/api/v1/database-creation/config$", "database:create:manage"),
     ("POST", r"^/api/v1/database-creation/plans$", "database:create:manage"),

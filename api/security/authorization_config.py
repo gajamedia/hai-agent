@@ -80,6 +80,8 @@ def _role_map_for_keycloak(api_client_id: str) -> dict[str, tuple[str, ...]]:
         # Changing data (insert/update/delete) is separate from reading: the writer may plan and
         # execute; a different person with the approver role approves what needs a second pair of eyes.
         f"{prefix}data-writer": (api["data_change_plan"], api["data_change_execute"], api["task_history_read"]),
+        # Recording new data only (a cashier or clerk): no update, no delete, no approval of others' changes.
+        f"{prefix}data-entry": (api["data_entry_record"], api["task_history_read"]),
         f"{prefix}data-change-approver": (api["data_change_approve"],),
         f"{prefix}data-schema-creator": (api["database_create_manage"], api["task_history_read"]),
         f"{prefix}database-engine-reviewer": (

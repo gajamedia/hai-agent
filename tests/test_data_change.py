@@ -45,10 +45,10 @@ def db(tmp_path):
     return path
 
 
-def _service(db, tmp_path, *answers):
+def _service(db, tmp_path, *answers, detail="full"):
     planner = DataChangePlanner(LLMService(Scripted(*answers)), [TABLE], today=lambda: date(2026, 11, 7))
     return DataChangeService(planner=planner, connect=lambda: sqlite3.connect(db), quote="`",
-                             paramstyle="qmark", audit_path=tmp_path / "audit.jsonl", lock_clause="")
+                             paramstyle="qmark", audit_path=tmp_path / "audit.jsonl", lock_clause="", audit_detail=detail)
 
 
 def _rows(db, sql="SELECT id, nama, harga_beli FROM tb_bahan ORDER BY id"):
@@ -279,3 +279,27 @@ def test_verify_an_insert_uses_the_reported_count(db, tmp_path):
     rows = _committed(svc, request)
     assert svc.verify(request, rows) == {"method": "database_reported_rowcount", "expected_rows": 2,
                                          "observed_rows": 2, "confirmed": True}
+
+
+def test_the_default_audit_keeps_no_business_data_only_keys_and_counts(db, tmp_path):
+    svc = _service(db, tmp_path, detail="minimal")
+    request = _plan(svc, UPDATE)
+    result = _run(svc, request, svc.preview(request).expected_rows)
+    assert result.rows_affected == 2
+    text = (tmp_path / "audit.jsonl").read_text("utf-8")
+    audit = json.loads(text.splitlines()[0])
+    assert audit["status"] == "committed" and audit["audit_detail"] == "minimal"
+    assert audit["before_image"] == [{"id": 2}, {"id": 3}] or all(set(r) == {"id"} for r in audit["before_image"])
+    assert audit["before_image_rows"] == 2 and audit["params"] == [] and audit["params_count"] == 2
+    for value in ("11000", "12000", "5000", "13000"):
+        assert value not in text
+
+
+def test_the_audit_detail_can_be_changed_without_a_restart(db, tmp_path):
+    mode = {"value": "minimal"}
+    planner = DataChangePlanner(LLMService(Scripted()), [TABLE], today=lambda: date(2026, 11, 7))
+    svc = DataChangeService(planner=planner, connect=lambda: sqlite3.connect(db), quote="`", paramstyle="qmark",
+                            audit_path=tmp_path / "audit.jsonl", lock_clause="", audit_detail=lambda: mode["value"])
+    assert svc._detail_mode() == "minimal"
+    mode["value"] = "full"
+    assert svc._detail_mode() == "full"

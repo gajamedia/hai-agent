@@ -12,6 +12,7 @@ from typing import Any
 from agent.workflow.data_change import DEFAULT_MAX_ROWS_CEILING
 
 PLAN, EXECUTE, APPROVE = "data:change:plan", "data:change:execute", "data:change:approve"
+ENTRY = "data:entry:record"
 
 
 def _int_env(name: str, default: int, low: int, high: int) -> int:
@@ -33,6 +34,9 @@ def settings() -> dict[str, Any]:
         # Off by default. On a one-person setup the owner may approve their own plan; the approval is still a
         # separate step that needs a fresh sign-in, and both decisions are in the audit trail.
         "self_approval": os.getenv("HAI_DATA_CHANGE_SELF_APPROVAL", "").strip().lower() in {"1", "true", "yes"},
+        # "minimal" (default): audit files hold no business data, only row keys and counts.
+        # "full": they also hold the data as it was before a change and the values written.
+        "audit_detail": "full" if os.getenv("HAI_AUDIT_DETAIL", "").strip().lower() == "full" else "minimal",
         "step_up_max_age_seconds": _int_env("HAI_STEPUP_MAX_AGE_SECONDS", 120, 30, 900),
     }
 
@@ -42,4 +46,4 @@ def requires_approval(operation: str) -> bool:
     return mode == "all" or (mode == "delete" and operation == "delete")
 
 
-__all__ = ["APPROVE", "EXECUTE", "PLAN", "requires_approval", "settings"]
+__all__ = ["APPROVE", "ENTRY", "EXECUTE", "PLAN", "requires_approval", "settings"]

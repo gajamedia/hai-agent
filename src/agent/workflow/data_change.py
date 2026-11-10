@@ -15,11 +15,12 @@ user's own limit.
 
 import json
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, Union
 
 from agent.llm.business_database_adapter import (
     BusinessDatabaseAdapter, ReadOnlyTableSpec,
@@ -295,7 +296,12 @@ class DataChangeService:
 
     def __init__(self, *, planner: DataChangePlanner, connect: Callable[[], Any], quote: str,
                  paramstyle: str, audit_path: Path, lock_clause: str = " FOR UPDATE", dialect: str = "limit",
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 audit_detail: Union[str, Callable[[], str]] = "minimal") -> None:
+        # ``audit_detail``: "minimal" (default) keeps no business data in the audit file - only the key of
+        # each changed row and the number of values; "full" also keeps the data as it was before the change
+        # and the values written. A callable is asked at every write, so a change of setting needs no restart.
+        self._audit_detail = audit_detail
         self.planner, self._connect = planner, connect
         self.builder = ChangeSqlBuilder(quote=quote, paramstyle=paramstyle, dialect=dialect)
         self.audit_path, self.lock_clause, self._clock = Path(audit_path), lock_clause, clock
@@ -404,6 +410,7 @@ class DataChangeService:
                     statements = [self.builder.delete(request.table, request.conditions)]
                 sql, params = statements[0]
                 record.update(sql=sql, params=[_plain(p) for p in params], statements=len(statements))
+                record["params_count"] = len(record["params"])
                 affected = 0
                 for sql, params in statements:
                     cursor.execute(sql, params)
@@ -421,6 +428,8 @@ class DataChangeService:
             except Exception:  # the connection may already be gone
                 pass
             record.update(status="rolled_back", reason=f"{type(exc).__name__}: {exc}"[:300])
+            if self._detail_mode() != "full":
+                record["params"] = []
             self._audit(record)
             raise
         finally:
@@ -428,7 +437,8 @@ class DataChangeService:
                 connection.close()
             except Exception:
                 pass
-        record.update(status="committed", rows_affected=affected, before_image=before)
+        record.update(status="committed", rows_affected=affected)
+        record.update(self._data_for_audit(request, record.get("params", []), before))
         self._audit(record)
         return ChangeResult(affected, tuple(before))
 
@@ -471,6 +481,20 @@ class DataChangeService:
         wanted = 0 if request.operation == "delete" else expected_rows
         return {"method": "reread_after_commit", "expected_rows": wanted, "observed_rows": observed,
                 "confirmed": observed == wanted}
+
+    def _detail_mode(self) -> str:
+        mode = self._audit_detail() if callable(self._audit_detail) else self._audit_detail
+        return "full" if mode == "full" else "minimal"
+
+    def _data_for_audit(self, request: ChangeRequest, params: list[Any],
+                        before: list[dict[str, Any]]) -> dict[str, Any]:
+        """The business data an audit record may carry, according to the audit detail setting."""
+        if self._detail_mode() == "full":
+            return {"before_image": before}
+        key = self.table(request.table).entry.key_column
+        keys = [{key: row.get(key)} for row in before] if key else []
+        # The values written (record["params"]) are withheld too: only how many there were is kept.
+        return {"before_image": keys, "before_image_rows": len(before), "params": [], "audit_detail": "minimal"}
 
     def audit(self, event: str, **fields: Any) -> None:
         """Record a decision that is not an execution (approval, rejection, refusal)."""

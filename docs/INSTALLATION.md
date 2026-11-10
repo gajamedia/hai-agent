@@ -309,6 +309,7 @@ Default memberi `data-reports-user` dan `database-connection-manager`. Role lain
 | `database-engine-reviewer` | Meninjau permintaan engine database baru |
 | `data-schema-creator` | Membuat database/tabel baru (awalan nama `hai_`) |
 | `data-writer` | Merencanakan & menjalankan perubahan data (insert/update/delete) |
+| `data-entry` | Mencatat data baru saja (insert), mis. transaksi harian: ringkasan lalu "Simpan", tanpa frasa, login ulang, atau persetujuan. Tidak bisa ubah/hapus |
 | `data-change-approver` | Menyetujui perubahan buatan orang lain |
 
 ```powershell
@@ -316,6 +317,8 @@ python scripts\keycloak_data_report_roles.py --user hai.dev --roles data-writer,
 ```
 
 Setelah itu **sign out lalu sign in lagi** agar token membawa role baru.
+
+Isi file audit perubahan data secara bawaan tidak memuat data bisnis (hanya kunci baris dan jumlah). `HAI_AUDIT_DETAIL=full` menyimpan juga data sebelum perubahan dan nilai yang ditulis.
 
 Satu orang yang memegang `data-writer` dan `data-change-approver` hanya bisa menyetujui perubahannya
 sendiri jika `HAI_DATA_CHANGE_SELF_APPROVAL=true` (hanya untuk uji/laptop).

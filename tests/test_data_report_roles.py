@@ -121,3 +121,12 @@ def test_the_realm_declares_the_data_change_roles():
     assert {WRITER, APPROVER} <= declared
     dev = next(u for u in realm["users"] if u["username"] == "hai.dev")
     assert not ({WRITER, APPROVER} & set(dev["clientRoles"][CLIENT]))
+
+
+def test_the_data_entry_role_can_only_record_and_read_its_own_history(policy):
+    clerk = _principal("data-entry")
+    assert _allowed(policy, clerk, "data:entry:record") and _allowed(policy, clerk, "task:history:read")
+    assert not any(_allowed(policy, clerk, p) for p in (PLAN_P, EXEC_P, APPROVE_P, "business:database:read"))
+    assert not _allowed(policy, _principal(WRITER), "data:entry:record")      # writers use Ubah data
+    realm = json.loads(REALM.read_text(encoding="utf-8"))
+    assert "data-entry" in {r["name"] for r in realm["roles"]["client"][CLIENT]}

@@ -24,11 +24,15 @@ from agent.platform import (
     ApprovalPolicy, Effect, Operation, PlanUnsupported, Verdict, Verification,
 )
 from agent.workflow.data_change import ChangeRefused, ChangeRequest
-from api.data_change_settings import APPROVE, EXECUTE, PLAN, requires_approval
+from api.data_change_settings import APPROVE, ENTRY, EXECUTE, PLAN, requires_approval
 from api.database_runtime_registry import DatabaseRuntimeRegistry
 
 FEATURE = "database"
 CHANGE_OPERATION = "database.change"
+ENTRY_OPERATION = "database.entry"
+ENTRY_ONLY_INSERT = (
+    "Ini bukan pencatatan data baru. Untuk mengubah atau menghapus data yang sudah ada, "
+    "gunakan menu Ubah data (perlu izin penulis data).")
 
 
 class ConnectionChanged(ValueError):
@@ -75,6 +79,20 @@ def describe_change(plan: Optional[Mapping[str, Any]], result: Optional[Mapping[
 
 def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) -> Operation:
     """``get_registry`` returns the live database registry (raising if it is not configured)."""
+    return _build_operation(get_registry, entry=False)
+
+
+def build_entry_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) -> Operation:
+    """Recording new data (``database.entry``): what a clerk does all day, in plain words or from a file.
+
+    Insert only, with its own permission. No typed phrase, no fresh login and no second person: the person
+    sees what will be recorded and presses "Simpan". The row limit, the preview, the all-or-nothing
+    transaction, the read-back check and the audit are the same as for every other change. Updating and
+    deleting stay with ``database.change`` and its stricter approvals."""
+    return _build_operation(get_registry, entry=True)
+
+
+def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, entry: bool) -> Operation:
 
     def plan(request: Mapping[str, Any], ctx) -> dict[str, Any]:
         registry = get_registry()
@@ -83,6 +101,8 @@ def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) 
         result = service.planner.plan(request["question"], max_rows=request["max_rows"])
         if result.request is None:
             raise PlanUnsupported(result.reason or "The request cannot be done.", {"kind": "unsupported"})
+        if entry and result.request.operation != "insert":
+            raise PlanUnsupported(ENTRY_ONLY_INSERT, {"kind": "unsupported"})
         try:
             preview = service.preview(result.request)
         except ChangeRefused as exc:
@@ -130,6 +150,13 @@ def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) 
             return Verification(Verdict.UNVERIFIED, evidence)
         return Verification(Verdict.VERIFIED, evidence)
 
+    if entry:
+        return Operation(
+            feature=FEATURE, name="entry", effect=Effect.WRITE, permission=ENTRY, risk=0.3,
+            approval=ApprovalPolicy.none(),
+            description="Record new rows in tables approved for writing (insert only, no extra approval)",
+            plan=plan, preview=preview, execute=execute, verify=verify, plan_permission=ENTRY,
+            sensitive=True, max_active=100, label="Catat data", describe=describe_change)
     return Operation(
         feature=FEATURE, name="change", effect=Effect.WRITE, permission=EXECUTE, risk=0.8,
         approval=ApprovalPolicy(confirm_phrase=True, fresh_login=True),
@@ -139,5 +166,6 @@ def build_change_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) 
         label="Ubah data", describe=describe_change)
 
 
-__all__ = ["CHANGE_OPERATION", "ConnectionChanged", "build_change_operation", "describe_change",
+__all__ = ["CHANGE_OPERATION", "ENTRY_OPERATION", "ConnectionChanged", "build_change_operation",
+           "build_entry_operation", "describe_change",
            "change_request_from_json", "change_request_to_json"]

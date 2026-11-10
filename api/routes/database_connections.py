@@ -89,6 +89,20 @@ def list_profiles(request: Request):
             "account_setup": registry.can_setup_accounts}
 
 
+@router.get("/profiles/{profile}/databases")
+def list_profile_databases(profile: str, request: Request):
+    """What there is to choose from on a server profile: database names only, each marked as allowed or not."""
+    _, registry = _guard(request)
+    return {"profile": profile, "databases": _call(registry.list_source_databases, profile)}
+
+
+@router.get("/files")
+def list_data_files(request: Request):
+    """SQLite files in the data folder (names relative to it)."""
+    _, registry = _guard(request)
+    return {"files": registry.list_source_files()}
+
+
 @router.post("/servers")
 def add_server(request: Request, payload: dict[str, Any]):
     """Add a database server from a form: tested first, saved only if the test passes."""

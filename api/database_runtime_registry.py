@@ -47,10 +47,13 @@ from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableRelation, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
-from agent.workflow.database_creation import DIALECTS, DatabaseCreationService, DatabaseDesigner
+from agent.workflow.database_creation import (
+    DIALECTS, DatabaseCreationService, DatabaseDesigner, SQLiteCreationService,
+)
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
+from api.data_change_settings import settings as data_change_settings
 from api.relation_suggestions import suggest_relations
 from api.database_engines import (
     EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, SQLServerEngine, any_database_allowed,
@@ -464,6 +467,36 @@ class DatabaseRuntimeRegistry:
             del impl.profiles[name]
             self._creators.pop(name, None)
 
+    def list_source_databases(self, source: Any) -> list[dict[str, Any]]:
+        """The databases on a server profile (or the ones this application made, for the SQLite profile), each
+        marked with whether it may be connected and whether it is connected already. Names only."""
+        with self._lock:
+            impl = next((e for e in self._engines.values()
+                         if isinstance(source, str) and source in getattr(e, "profiles", {})), None)
+            connected = {c.filename for c in self._connections.values()}
+        if impl is None or not hasattr(impl, "list_databases"):
+            raise RegistryNotFound(f"no server named '{source}'")
+        try:
+            items = impl.list_databases(source)
+        except Exception as exc:
+            # Driver errors can echo hosts and users: the browser gets our own message, the log the real cause.
+            if not isinstance(exc, EngineError):
+                logger.warning("Could not list the databases of %r: %s: %s", source, type(exc).__name__, exc)
+            detail = str(exc) if isinstance(exc, EngineError) else "connection failed"
+            raise RegistryError(f"cannot list databases: {detail}") from exc
+        return [{**item, "connected": f"{source}/{item['name']}" in connected
+                 or (bool(item.get("default")) and source in connected)} for item in items]
+
+    def list_source_files(self) -> list[dict[str, Any]]:
+        """SQLite files in the data folder, each marked with whether a connection uses it already."""
+        impl = self._engines.get("sqlite")
+        if impl is None or not hasattr(impl, "list_files"):
+            return []
+        with self._lock:
+            connected = {c.filename for c in self._connections.values()}
+        return [{"name": f, "connected": f in connected or f"sqlite/{Path(f).stem}" in connected}
+                for f in impl.list_files()]
+
     def profile_engine(self, name: Any) -> str | None:
         """Engine type of a named server profile, or None if there is no such profile."""
         for item in self.profiles():
@@ -475,7 +508,12 @@ class DatabaseRuntimeRegistry:
         if not isinstance(name, str) or not _NAME.match(name):
             raise RegistryError("name must be lowercase letters, digits or _ (2-32 chars)")
         if engine == "sqlite":
-            resolve_in_root(self.data_root, source)  # fail fast before taking the lock
+            # Fail fast before taking the lock. "sqlite/<database>" names a database this application made.
+            finder = getattr(self._engines.get("sqlite"), "_file", None)
+            try:
+                finder(source) if finder else resolve_in_root(self.data_root, source)
+            except EngineError as exc:
+                raise RegistryError(str(exc)) from exc
         with self._lock:
             if name in self._connections or name in self._degraded:
                 raise RegistryError(f"connection '{name}' already exists")
@@ -657,7 +695,8 @@ class DatabaseRuntimeRegistry:
             planner=DataChangePlanner(self._llm, tables), connect=factory, quote=impl.quote,
             paramstyle=impl.paramstyle, lock_clause=getattr(impl, "lock_clause", " FOR UPDATE"),
             dialect=getattr(impl, "dialect", "limit"),
-            audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl")
+            audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl",
+            audit_detail=lambda: data_change_settings()["audit_detail"])
 
     # --------------------------------------------------- creating databases
     def creatable_profiles(self) -> list[dict[str, str]]:
@@ -684,6 +723,17 @@ class DatabaseRuntimeRegistry:
             if cached is not None:
                 return cached
             impl = next(e for e in self._engines.values() if profile in getattr(e, "profiles", {}))
+            if impl.kind == "sqlite":
+                # A SQLite database is a file in the data folder: there is no server, account or grant.
+                if self._llm is None:
+                    self._llm = LLMService(self.llm_provider_factory())
+                service = SQLiteCreationService(
+                    designer=DatabaseDesigner(self._llm, prefix=impl.profiles[profile].creator_prefix,
+                                              dialect=DIALECTS["sqlite"]),
+                    data_root=self.data_root, profile=profile,
+                    audit_path=self.work_dir / "audit" / f"creations-{profile}.jsonl")
+                self._creators[profile] = service
+                return service
             try:
                 factory = impl.open_creator(profile)
             except EngineError as exc:
@@ -724,6 +774,30 @@ class DatabaseRuntimeRegistry:
                                sorted(writable.writable_columns)])
             body = {"name": conn.name, "engine": conn.engine, "tables": tables}
             return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def entry_databases(self) -> list[dict[str, Any]]:
+        """Connections where new rows may be recorded (a table approved for insert): name and tables only."""
+        with self._lock:
+            out = []
+            for conn_name, conn in sorted(self._connections.items()):
+                if conn.changes is None:
+                    continue
+                tables = sorted(t for t, w in conn.changes.planner.tables.items() if "insert" in w.operations)
+                if tables:
+                    out.append({"name": conn_name, "tables": tables})
+            return out
+
+    def resolve_entry_name(self, name: Any = None) -> str:
+        """The connection to record into: the named one, or the only one that accepts new rows."""
+        able = [d["name"] for d in self.entry_databases()]
+        if name is not None:
+            if name not in able:
+                raise RegistryNotFound(f"'{name}' does not accept new data")
+            return name
+        if len(able) != 1:
+            raise RegistryError("name the database to record into" if able
+                                else "no connection has tables approved for adding data")
+        return able[0]
 
     def resolve_change_name(self, name: Any = None) -> str:
         """The connection to use for a change: the named one, or the only one that can change data."""

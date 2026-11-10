@@ -110,6 +110,10 @@
           "description": "Plan and execute data changes (insert, update, delete) after re-confirming identity."
         },
         {
+          "name": "data-entry",
+          "description": "Record new data only (insert), for example daily transactions. Cannot update, delete or approve."
+        },
+        {
           "name": "data-change-approver",
           "description": "Approve data changes made by someone else (second pair of eyes)."
         },
