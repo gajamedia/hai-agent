@@ -30,7 +30,7 @@ _GROUPS = {
 }
 # What of a task's stored outcome may be shown (metadata only; report rows are never stored).
 _RESULT_KEYS = ("status", "rows_affected", "operation", "table", "row_count", "kind", "limit_reached",
-                "workflow_id", "error_code")
+                "workflow_id", "error_code", "database", "mode", "profile")
 # What of an audit record's detail may be shown.
 _DETAIL_KEYS = ("from", "to", "verdict", "self_approved")
 _MAX_LIMIT = 200

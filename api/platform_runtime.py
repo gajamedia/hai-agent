@@ -15,6 +15,7 @@ from agent.platform import Feature, OperationRegistry, PlatformPipeline, SQLiteT
 from api.database_runtime_registry import DatabaseRuntimeRegistry
 from api.data_change_settings import settings as change_settings
 from api.features.database_changes import build_change_operation
+from api.features.database_creation import build_create_operation
 from api.features.database_reports import OutcomeCache, build_report_operation
 from api.security.authorization import AuthorizationPolicy
 from agent.workflow.table_report_service import TableReportService
@@ -60,6 +61,7 @@ def get_pipeline(app: Any) -> PlatformPipeline:
         database_operations = [build_report_operation(_resolver(app), cache)]
         if isinstance(registry, DatabaseRuntimeRegistry):
             database_operations.append(build_change_operation(lambda: app.state.database_runtime_registry))
+            database_operations.append(build_create_operation(lambda: app.state.database_runtime_registry))
         operations.register(Feature("database", "Database Agent", tuple(database_operations)))
         pipeline = PlatformPipeline(
             registry=operations, store=store, authorize=authorize, clock=time.time, ttl_seconds=900,

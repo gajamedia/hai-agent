@@ -51,6 +51,7 @@ const FILTERS = [
 const OPERATION_PAGE = {
   "database.report": "/database-agent/reports",
   "database.change": "/database-agent/changes",
+  "database.create": "/database-agent/create",
 };
 
 const LIVE = new Set(["awaiting_approval", "executing", "verifying"]);

@@ -336,6 +336,38 @@ class DatabaseCreationService:
         return {"database": design.database, "tables": [t.name for t in design.tables],
                 "profile": self.profile, "mode": mode}
 
+    def verify(self, design: DatabaseDesign) -> dict[str, Any]:
+        """Ask the server again, after the statements ran: does the database exist, with every table?
+
+        ``confirmed`` is True only when both are seen. A server that cannot be asked (or hides the
+        objects from the creator account) gives ``confirmed: False`` with the reason, never a guess.
+        """
+        sqlserver = self.dialect.name == "sqlserver"
+        try:
+            connection = self._connect()
+            try:
+                exists = bool(self._ask(
+                    connection, "SELECT name FROM sys.databases WHERE name = ?" if sqlserver
+                    else "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
+                    (design.database,)))
+                have: set[str] = set()
+                if exists and design.tables:
+                    have = {str(r[0]).lower() for r in (self._ask(
+                        connection, f"SELECT TABLE_NAME FROM [{design.database}].INFORMATION_SCHEMA.TABLES "
+                                    "WHERE TABLE_TYPE = 'BASE TABLE'") if sqlserver else self._ask(
+                        connection, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+                        (design.database,)))}
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            return {"confirmed": False, "database_found": None, "missing_tables": None,
+                    "reason": f"{type(exc).__name__}"}
+        missing = sorted(t.name for t in design.tables if t.name.lower() not in have)
+        return {"confirmed": exists and not missing, "database_found": exists, "missing_tables": missing}
+
     def audit(self, event: str, **fields: Any) -> None:
         self._audit({"event": event, **fields})
 
