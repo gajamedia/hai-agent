@@ -110,7 +110,7 @@ export default function DatabaseCreation() {
         await connectDatabase({ name, profile: created.profile, database: created.database });
       }
       setConnected(true);
-      navigate("/database-agent/reports", { state: {
+      navigate("/database-agent/connections", { state: {
         review: name,
         message: `${created.mode === "add_tables" ? "Tabel baru ditambahkan ke" : "Database baru dibuat:"} ${created.database}. `
           + "Sudah terhubung, dan pilihan di bawah sudah diisi (boleh difilter, tambah, ubah). Periksa lalu tekan Setujui.",
@@ -173,7 +173,8 @@ export default function DatabaseCreation() {
           <p>
             Belum ada server yang boleh membuat database. Tambahkan server di atas (isi akun pembuat database),
             atau jalankan <code>python scripts\setup_mysql_creator_user.py &lt;profil&gt;</code> lalu restart
-            backend (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
+            backend (lihat docs/TRY_DATA_REPORTS_LOCALLY.md). Untuk SQLite (database berupa file, tanpa server),
+            isi <code>HAI_SQLITE_WRITE=true</code> di <code>.env</code> lalu restart backend.
           </p>
         ) : (
           <form className="at-form" onSubmit={makePlan} aria-label="Rancang database">
@@ -189,6 +190,12 @@ export default function DatabaseCreation() {
             {profiles.length === 1 && (
               <small>Server: <b>{profiles[0].name}{profiles[0].type ? ` (${profiles[0].type})` : ""}</b>. Untuk SQL Server,
                 tambahkan servernya lewat panel <b>Tambah server database</b> di atas; setelah itu muncul pilihan server di sini.</small>
+            )}
+            {(profiles.length === 1 ? profiles[0].type : profiles.find((p) => p.name === profile)?.type) === "sqlite" && (
+              <small>
+                SQLite menyimpan database sebagai satu file di folder data server. Cocok untuk instalasi kecil dan
+                pencatatan ringan: hanya satu penulis pada satu waktu, jadi kurang pas untuk banyak kasir sekaligus.
+              </small>
             )}
             <label>
               Perintah
@@ -251,7 +258,7 @@ export default function DatabaseCreation() {
             : `Database ${result.database} dibuat${result.tables.length ? ` dengan tabel ${result.tables.join(", ")}` : ""}.`}
           <div className="at-form-row">
             {connected ? (
-              <span>Terhubung. Buka tab <Link to="/database-agent/reports">Laporan</Link> untuk menyetujui tabelnya
+              <span>Terhubung. Buka tab <Link to="/database-agent/connections">Koneksi</Link> untuk menyetujui tabelnya
                 (centang <b>boleh diubah</b> bila ingin mengisinya).</span>
             ) : (
               <button type="button" className="at-button at-button-primary" disabled={busy} onClick={connect}>

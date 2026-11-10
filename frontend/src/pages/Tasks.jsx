@@ -49,7 +49,7 @@ const FILTERS = [
 
 // Where a person goes to act on a task that is still open.
 const OPERATION_PAGE = {
-  "database.report": "/database-agent/reports",
+  "database.report": "/database-agent/view",
   "database.change": "/database-agent/changes",
   "database.create": "/database-agent/create",
 };

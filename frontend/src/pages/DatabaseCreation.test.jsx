@@ -40,7 +40,7 @@ const renderPage = () => render(
   <MemoryRouter>
     <Routes>
       <Route path="/" element={<DatabaseCreation />} />
-      <Route path="/database-agent/reports" element={<Landing />} />
+      <Route path="/database-agent/connections" element={<Landing />} />
     </Routes>
   </MemoryRouter>);
 

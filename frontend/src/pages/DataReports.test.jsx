@@ -18,6 +18,8 @@ vi.mock("../api/client", () => ({
   listDatabaseProfiles: vi.fn(),
   listEngineRequests: vi.fn(),
   createEngineRequest: vi.fn(),
+  listDataFiles: vi.fn(),
+  listProfileDatabases: vi.fn(),
 }));
 
 const SCHEMA = {
@@ -57,6 +59,8 @@ afterEach(cleanup);
 describe("DataReports", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    api.listDataFiles.mockResolvedValue({ files: [] });
+    api.listProfileDatabases.mockResolvedValue({ databases: [] });
     api.listDatabaseConnections.mockResolvedValue({ connections: [] });
     api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
     api.listEngineRequests.mockResolvedValue({ requests: [] });
@@ -731,5 +735,97 @@ describe("DataReports relation found by the AI", () => {
     expect(within(notice).getByText(/AI menduga hubungan antar tabel/)).toBeTruthy();
     expect(notice.textContent).toMatch(/kolom id_jenis di tabel tb_bahan sama dengan kolom id di tabel tb_jenisbahan/);
     expect(screen.getByRole("button", { name: "Jalankan" })).toBeTruthy();
+  });
+});
+
+
+describe("DataReports split into two tabs", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "sales", status: "active", tables: ["sales"] }] });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
+    api.listDataFiles.mockResolvedValue({ files: [] });
+    api.listProfileDatabases.mockResolvedValue({ databases: [] });
+  });
+
+  const renderPart = (part) => render(<MemoryRouter><DataReports part={part} /></MemoryRouter>);
+
+  it("Koneksi connects and approves but does not ask for reports", async () => {
+    renderPart("connections");
+    expect(await screen.findByRole("heading", { name: "Koneksi database" })).toBeTruthy();
+    expect(screen.getByRole("form", { name: "Hubungkan database" })).toBeTruthy();
+    expect(await screen.findByText(/aktif/)).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Tanya laporan" })).toBeNull();
+  });
+
+  it("Lihat data asks for reports but does not offer connecting", async () => {
+    renderPart("view");
+    expect(await screen.findByRole("heading", { name: "Lihat data" })).toBeTruthy();
+    expect(screen.getByRole("form", { name: "Tanya laporan" })).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Hubungkan database" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Ubah persetujuan/ })).toBeNull();
+  });
+});
+
+
+describe("Koneksi: choosing from what exists", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.listDatabaseConnections.mockResolvedValue({ connections: [] });
+    api.listEngineRequests.mockResolvedValue({ requests: [] });
+    api.listDatabaseProfiles.mockResolvedValue({ profiles: [
+      { name: "my", type: "mysql", prefix: "hai_" }] });
+    api.listDataFiles.mockResolvedValue({ files: [
+      { name: "sales.sqlite3", connected: false }, { name: "old.db", connected: true }] });
+    api.listProfileDatabases.mockResolvedValue({ databases: [
+      { name: "dbsales", allowed: true, default: true, connected: false },
+      { name: "hai_toko", allowed: true, default: false, connected: false },
+      { name: "kantor", allowed: false, default: false, connected: false }] });
+  });
+
+  const renderKoneksi = () => render(<MemoryRouter><DataReports part="connections" /></MemoryRouter>);
+
+  it("lists the SQLite files and fills the file and connection name when one is picked", async () => {
+    const user = userEvent.setup();
+    renderKoneksi();
+    await user.click(await screen.findByRole("button", { name: "Pilih sales.sqlite3" }));
+    expect(screen.getByPlaceholderText("sales.sqlite3").value).toBe("sales.sqlite3");
+    expect(screen.getByPlaceholderText("sales").value).toBe("sales");
+    expect(screen.getByRole("button", { name: "Pilih old.db" }).disabled).toBe(true); // already connected
+    expect(screen.getByText("terhubung")).toBeTruthy();
+  });
+
+  it("lists the databases of the chosen server and only lets the allowed ones be picked", async () => {
+    const user = userEvent.setup();
+    renderKoneksi();
+    await user.selectOptions(await screen.findByLabelText("Sumber"), "my");
+    expect(await screen.findByText(/Database di my/)).toBeTruthy();
+    expect(api.listProfileDatabases).toHaveBeenCalledWith("my");
+    expect(screen.getByRole("button", { name: "Pilih kantor" }).disabled).toBe(true);
+    expect(screen.getByText("bawaan profil")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Pilih hai_toko" }));
+    expect(screen.getByLabelText("Database buatan agent").value).toBe("hai_toko");
+    expect(screen.getByPlaceholderText("sales").value).toBe("hai_toko");
+  });
+
+  it("leaves the database empty when the profile's own database is picked, and never overwrites a typed name", async () => {
+    const user = userEvent.setup();
+    renderKoneksi();
+    await user.type(await screen.findByPlaceholderText("sales"), "penjualan");
+    await user.selectOptions(screen.getByLabelText("Sumber"), "my");
+    await user.click(await screen.findByRole("button", { name: "Pilih dbsales" }));
+    expect(screen.getByLabelText("Database buatan agent").value).toBe("");
+    expect(screen.getByPlaceholderText("sales").value).toBe("penjualan");
+  });
+
+  it("says plainly when the list cannot be loaded", async () => {
+    api.listProfileDatabases.mockRejectedValue(Object.assign(new Error("x"), {
+      body: { detail: { message: "cannot list databases: connection failed" } } }));
+    const user = userEvent.setup();
+    renderKoneksi();
+    await user.selectOptions(await screen.findByLabelText("Sumber"), "my");
+    expect(await screen.findByText(/cannot list databases: connection failed/)).toBeTruthy();
   });
 });

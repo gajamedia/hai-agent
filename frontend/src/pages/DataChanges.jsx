@@ -212,7 +212,7 @@ export default function DataChanges() {
       <section className="at-panel">
         {databases.length === 0 ? (
           <p>
-            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di tab <Link to="/database-agent/reports">Laporan</Link>,
+            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di tab <Link to="/database-agent/connections">Koneksi</Link>,
             buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b> serta izin Tambah/Ubah/Hapus. Server juga
             butuh akun penulis di profil database (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
           </p>
@@ -229,7 +229,7 @@ export default function DataChanges() {
                 </select>
                 <small>
                   Hanya koneksi yang tabelnya sudah disetujui untuk diubah muncul di sini (MySQL, SQL Server, ...).
-                  Koneksi lain: di tab <Link to="/database-agent/reports">Laporan</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
+                  Koneksi lain: di tab <Link to="/database-agent/connections">Koneksi</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
                   server juga butuh akun penulis di profilnya.
                 </small>
               </label>

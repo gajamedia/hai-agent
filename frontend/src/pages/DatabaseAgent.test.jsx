@@ -11,8 +11,10 @@ function renderAt(path) {
     <MemoryRouter initialEntries={[path]}>
       <Routes>
         <Route path="/database-agent" element={<DatabaseAgent />}>
-          <Route index element={<Navigate to="reports" replace />} />
-          <Route path="reports" element={<h1>LAPORAN PAGE</h1>} />
+          <Route index element={<Navigate to="view" replace />} />
+          <Route path="connections" element={<h1>KONEKSI PAGE</h1>} />
+          <Route path="view" element={<h1>LIHAT PAGE</h1>} />
+          <Route path="entry" element={<h1>CATAT PAGE</h1>} />
           <Route path="changes" element={<h1>UBAH PAGE</h1>} />
           <Route path="create" element={<h1>BUAT PAGE</h1>} />
         </Route>
@@ -23,23 +25,22 @@ function renderAt(path) {
 }
 
 describe("Database Agent menu", () => {
-  it("offers the three tabs", () => {
-    renderAt("/database-agent/reports");
+  it("offers the five tabs in working order: create, connect, record, change, view", () => {
+    renderAt("/database-agent/view");
     const nav = screen.getByRole("navigation", { name: "Database Agent" });
     expect(nav.querySelectorAll("a")).toHaveLength(DATABASE_AGENT_TABS.length);
-    for (const label of ["Laporan", "Ubah data", "Buat database"]) {
-      expect(screen.getByRole("link", { name: label })).toBeTruthy();
-    }
+    const labels = [...nav.querySelectorAll("a")].map((a) => a.textContent);
+    expect(labels).toEqual(["Buat database", "Koneksi", "Catat data", "Ubah data", "Lihat data"]);
   });
 
-  it("opens Laporan by default", async () => {
+  it("opens Lihat data by default", async () => {
     renderAt("/database-agent");
-    expect(await screen.findByText("LAPORAN PAGE")).toBeTruthy();
+    expect(await screen.findByText("LIHAT PAGE")).toBeTruthy();
   });
 
   it("switches tabs without leaving the menu", async () => {
     const user = userEvent.setup();
-    renderAt("/database-agent/reports");
+    renderAt("/database-agent/view");
     await user.click(screen.getByRole("link", { name: "Ubah data" }));
     expect(await screen.findByText("UBAH PAGE")).toBeTruthy();
     await user.click(screen.getByRole("link", { name: "Buat database" }));

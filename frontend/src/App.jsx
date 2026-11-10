@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Dashboard from "./pages/Dashboard.jsx";
 import AutonomousTesting from "./pages/AutonomousTesting.jsx";
 import DataChanges from "./pages/DataChanges.jsx";
+import DataEntry from "./pages/DataEntry.jsx";
 import DatabaseCreation from "./pages/DatabaseCreation.jsx";
 import DataReports from "./pages/DataReports.jsx";
 import DatabaseAgent from "./pages/DatabaseAgent.jsx";
@@ -53,13 +54,16 @@ function AuthenticatedApplication() {
         <Route path="/tasks" element={<Tasks />} />
         <Route path="/autonomous-testing" element={<AutonomousTesting />} />
         <Route path="/database-agent" element={<DatabaseAgent />}>
-          <Route index element={<Navigate to="reports" replace />} />
-          <Route path="reports" element={<DataReports />} />
+          <Route index element={<Navigate to="view" replace />} />
+          <Route path="connections" element={<DataReports part="connections" />} />
+          <Route path="view" element={<DataReports part="view" />} />
+          <Route path="reports" element={<Navigate to="/database-agent/view" replace />} />
+          <Route path="entry" element={<DataEntry />} />
           <Route path="changes" element={<DataChanges />} />
           <Route path="create" element={<DatabaseCreation />} />
         </Route>
         {/* Old addresses keep working (bookmarks). */}
-        <Route path="/data-reports" element={<Navigate to="/database-agent/reports" replace />} />
+        <Route path="/data-reports" element={<Navigate to="/database-agent/view" replace />} />
         <Route path="/data-changes" element={<Navigate to="/database-agent/changes" replace />} />
         <Route path="/database-creation" element={<Navigate to="/database-agent/create" replace />} />
         <Route path="*" element={<Navigate to="/" replace />} />

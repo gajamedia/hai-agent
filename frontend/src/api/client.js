@@ -319,6 +319,40 @@ export async function downloadReport(url, signal) {
   return { blob: await response.blob(), filename: match ? match[1] : "report" };
 }
 
+// What there is to choose from on the Koneksi page: SQLite files, or the databases of a server profile.
+export async function listDataFiles(signal) {
+  return request(`${API_V1}/database-connections/files`, { signal });
+}
+
+export async function listProfileDatabases(profile, signal) {
+  return request(`${API_V1}/database-connections/profiles/${encodeURIComponent(profile)}/databases`, { signal });
+}
+
+// Recording new data (insert only): see the rows, press Simpan. No phrase and no fresh login.
+export async function getDataEntryDatabases(signal) {
+  return request(`${API_V1}/data-entries/databases`, { signal });
+}
+
+export async function createDataEntry(payload, signal) {
+  return jsonPost(`${API_V1}/data-entries/plans`, payload, signal);
+}
+
+export async function runDataEntry(planId, idempotencyKey, signal) {
+  return jsonPost(
+    `${API_V1}/data-entries/plans/${encodeURIComponent(planId)}/run`,
+    {},
+    signal,
+    idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+  );
+}
+
+export async function cancelDataEntry(planId, signal) {
+  return request(`${API_V1}/data-entries/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+    signal,
+  });
+}
+
 // Data changes (insert / update / delete). Running needs a fresh login and the exact phrase.
 export async function getDataChangeConfig(signal) {
   return request(`${API_V1}/data-changes/config`, { signal });
