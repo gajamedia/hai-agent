@@ -268,3 +268,58 @@ def test_tables_added_to_an_existing_database_have_their_own_phrase(world):
     done = _call(client, "POST", f"/plans/{plan['plan_id']}/run", json={"confirm": plan["confirm_phrase"]}).json()
     assert done["mode"] == "add_tables" and done["verification"] == "verified"
     assert server.databases["hai_toko"] == {"tb_lama", "tb_supplier"}
+
+
+# ---- the SQL Server dialect asks different questions; the verifier must use them ------------------
+
+class _SqlServerCursor:
+    def __init__(self, state):
+        self.s, self.rows = state, []
+
+    def execute(self, sql, params=()):
+        if self.s.get("down"):
+            raise RuntimeError("cannot ask")
+        self.s["asked"].append(sql)
+        if sql.startswith("SELECT name FROM sys.databases"):
+            self.rows = [(params[0],)] if params[0] in self.s["databases"] else []
+        elif "INFORMATION_SCHEMA.TABLES" in sql:
+            name = re.match(r"SELECT TABLE_NAME FROM \[(\w+)\]", sql).group(1)
+            self.rows = [(t,) for t in sorted(self.s["databases"].get(name, ()))]
+        else:
+            raise AssertionError(f"a MySQL question was asked of SQL Server: {sql}")
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        pass
+
+
+def _sqlserver(tmp_path, state):
+    from agent.workflow.database_creation import SQLSERVER
+    conn = type("C", (), {"cursor": lambda self: _SqlServerCursor(state), "close": lambda self: None})()
+    service = DatabaseCreationService(
+        designer=DatabaseDesigner(LLMService(Scripted()), prefix="hai_", dialect=SQLSERVER),
+        connect=lambda: conn, profile="ss", audit_path=tmp_path / "a.jsonl")
+    return service, service.designer.validate(GOOD)
+
+
+def test_sqlserver_verification_asks_sqlserver_questions_and_confirms(tmp_path):
+    state = {"databases": {"hai_toko": {"tb_bahan"}}, "asked": []}
+    service, design = _sqlserver(tmp_path, state)
+    seen = service.verify(design)
+    assert seen == {"confirmed": True, "database_found": True, "missing_tables": []}
+    assert any("sys.databases" in q for q in state["asked"])
+
+
+def test_sqlserver_verification_names_a_missing_table_or_database(tmp_path):
+    service, design = _sqlserver(tmp_path, {"databases": {"hai_toko": set()}, "asked": []})
+    assert service.verify(design) == {"confirmed": False, "database_found": True, "missing_tables": ["tb_bahan"]}
+    service, design = _sqlserver(tmp_path, {"databases": {}, "asked": []})
+    assert service.verify(design)["confirmed"] is False and service.verify(design)["database_found"] is False
+
+
+def test_a_server_that_cannot_be_asked_is_never_confirmed(tmp_path):
+    service, design = _sqlserver(tmp_path, {"databases": {"hai_toko": {"tb_bahan"}}, "asked": [], "down": True})
+    seen = service.verify(design)
+    assert seen["confirmed"] is False and seen["database_found"] is None
