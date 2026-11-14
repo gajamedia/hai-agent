@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 from .contracts import (
+    LLMImage,
     LLMMessage,
     LLMProvider,
     LLMRequest,
@@ -38,6 +39,7 @@ class LLMService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         metadata: Mapping[str, Any] | None = None,
+        images: Iterable[LLMImage] = (),
     ) -> LLMResponse:
         request = LLMRequest(
             messages=tuple(messages),
@@ -45,6 +47,7 @@ class LLMService:
             temperature=temperature,
             max_tokens=max_tokens,
             metadata=dict(metadata or {}),
+            images=tuple(images),
         )
 
         response = self.provider.complete(request)

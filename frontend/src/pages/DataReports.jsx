@@ -16,6 +16,7 @@ import {
   runReportPlan,
 } from "../api/client.js";
 import { describeCondition } from "./conditions.js";
+import SourceChoices, { suggestName } from "./SourceChoices.jsx";
 import "./autonomous-testing.css";
 
 // A relation is the same pair of columns whichever side is written first.
@@ -304,7 +305,7 @@ function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
   );
 }
 
-function ResultTable({ rows }) {
+export function ResultTable({ rows }) {
   if (!rows?.length) return null;
   const headers = Object.keys(rows[0]);
   return (
@@ -344,7 +345,20 @@ const STATUS_TEXT = (c) =>
         ? `tidak tersedia${c.reason ? `: ${c.reason}` : ""}`
         : "menunggu persetujuan";
 
-export default function DataReports() {
+// ``part``: "connections" (connect databases, approve tables), "view" (ask for reports), or "all" (both).
+const HEADERS = {
+  all: ["DATA REPORTS", "Laporan dari database",
+    "Hubungkan database SQLite dari folder data server, setujui tabelnya, lalu tanyakan dalam bahasa biasa. "
+    + "Akses hanya-baca; agent hanya melihat data yang Anda setujui."],
+  connections: ["KONEKSI", "Koneksi database",
+    "Hubungkan database, lalu setujui tabel dan kolom yang boleh dilihat atau diisi agent. "
+    + "Agent hanya menyentuh apa yang Anda setujui di sini."],
+  view: ["LIHAT DATA", "Lihat data",
+    "Tanyakan data dalam bahasa biasa dan dapatkan tabel, atau file Excel, PDF, HTML, dan CSV. "
+    + "Akses hanya-baca; agent hanya melihat data yang sudah disetujui."],
+};
+
+export default function DataReports({ part = "all" }) {
   const [connections, setConnections] = useState([]);
   const [selected, setSelected] = useState("");
   const [schema, setSchema] = useState(null);
@@ -549,12 +563,9 @@ export default function DataReports() {
     <main className="at-shell">
       <header className="at-header">
         <div>
-          <span className="at-eyebrow">DATA REPORTS</span>
-          <h1>Laporan dari database</h1>
-          <p className="at-subtitle">
-            Hubungkan database SQLite dari folder data server, setujui tabelnya, lalu tanyakan dalam
-            bahasa biasa. Akses hanya-baca; agent hanya melihat data yang Anda setujui.
-          </p>
+          <span className="at-eyebrow">{HEADERS[part][0]}</span>
+          <h1>{HEADERS[part][1]}</h1>
+          <p className="at-subtitle">{HEADERS[part][2]}</p>
         </div>
       </header>
       {warnings.length > 0 && (
@@ -564,7 +575,8 @@ export default function DataReports() {
       {error && (
         <div className="at-alert" role="alert"><AlertCircle size={17} /><span>{error}</span></div>
       )}
-      <div className="at-layout">
+      <div className="at-layout" style={part === "view" || (part === "connections" && !schema) ? { gridTemplateColumns: "minmax(0, 1fr)" } : undefined}>
+        {part !== "view" && (
         <section className="at-panel">
           <div className="at-section-heading"><Database size={18} /><h2>Koneksi</h2></div>
           <form className="at-form" onSubmit={connect} aria-label="Hubungkan database">
@@ -583,6 +595,15 @@ export default function DataReports() {
                 </select>
               </label>
             )}
+            <SourceChoices
+              source={source}
+              selected={source ? (database || undefined) : filename}
+              onPick={(item) => {
+                if (source) setDatabase(item.default ? "" : item.name);
+                else setFilename(item.name);
+                if (!name.trim() && suggestName(item.name)) setName(suggestName(item.name));
+              }}
+            />
             {(chosenProfile?.prefix || chosenProfile?.any_database) && (
               <label>
                 Database <small>opsional; kosong = database bawaan profil</small>
@@ -664,6 +685,8 @@ export default function DataReports() {
             ))}
           </ul>
         </section>
+        )}
+        {(part !== "connections" || schema) && (
         <section className="at-panel">
           {schema ? (
             <ApprovalForm key={selected} connection={selected} schema={schema} busy={busy} onApprove={approve} preset={preset} />
@@ -844,7 +867,7 @@ export default function DataReports() {
                         <p>{result.reason}</p>
                         {result.needs_join && (
                           <p>
-                            Untuk menggabungkan tabel, buka <b>Ubah persetujuan</b> pada database ini, pastikan
+                            Untuk menggabungkan tabel, buka tab <b>Koneksi</b>, lalu <b>Ubah persetujuan</b> pada database ini, pastikan
                             kedua tabel disetujui, lalu centang relasinya di kotak <b>Relasi antar tabel</b>
                             (foreign key, saran dari nama kolom, atau tambahkan sendiri). Setelah itu ulangi
                             pertanyaannya.
@@ -864,6 +887,7 @@ export default function DataReports() {
             </>
           )}
         </section>
+        )}
       </div>
     </main>
   );

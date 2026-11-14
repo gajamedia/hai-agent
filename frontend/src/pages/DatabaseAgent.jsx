@@ -2,11 +2,14 @@ import { ArrowLeft } from "lucide-react";
 import { Link, NavLink, Outlet } from "react-router-dom";
 import "./autonomous-testing.css";
 
-// One menu for everything that touches databases: reading (reports), changing data, creating databases.
+// One menu for everything that touches databases: connecting, creating databases, recording, changing and viewing data.
 export const DATABASE_AGENT_TABS = [
-  { to: "/database-agent/reports", label: "Laporan" },
-  { to: "/database-agent/changes", label: "Ubah data" },
+  { to: "/database-agent/assistant", label: "Asisten" },
   { to: "/database-agent/create", label: "Buat database" },
+  { to: "/database-agent/connections", label: "Koneksi" },
+  { to: "/database-agent/entry", label: "Catat data" },
+  { to: "/database-agent/changes", label: "Ubah data" },
+  { to: "/database-agent/view", label: "Lihat data" },
 ];
 
 const barStyle = { display: "flex", gap: "8px", flexWrap: "wrap", margin: "0 0 4px" };

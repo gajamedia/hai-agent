@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 
 import pytest
-from fastapi.routing import APIRoute
 
 from api.main import create_app
 from api.security.authentication_middleware import _CAPABILITY_PREFIXES, required_permission_for_route
@@ -25,11 +24,28 @@ def _concrete(path: str) -> str:
 
 
 def _api_routes():
-    app = create_app()
-    for route in app.routes:
-        if isinstance(route, APIRoute) and route.path.startswith("/api/v1"):
-            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
-                yield method, route.path
+    """Every (method, path) under /api/v1, read from the OpenAPI schema.
+
+    Not from ``app.routes``: newer FastAPI wraps included routers in ``_IncludedRouter`` objects, so
+    walking ``app.routes`` for ``APIRoute`` finds none and this guard would pass without checking anything.
+    """
+    paths = create_app().openapi()["paths"]
+    for path, operations in paths.items():
+        if path.startswith("/api/v1"):
+            for method in sorted(m.upper() for m in operations if m.upper() in _METHODS):
+                yield method, path
+
+
+_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+
+
+def test_the_guard_actually_sees_the_api():
+    """If route discovery silently finds nothing, every other test here passes for no reason."""
+    routes = set(_api_routes())
+    assert len(routes) > 40
+    for expected in [("POST", "/api/v1/table-reports/plans"), ("POST", "/api/v1/data-changes/plans"),
+                     ("GET", "/api/v1/tasks"), ("GET", "/api/v1/tasks/{task_id}")]:
+        assert expected in routes
 
 
 def test_every_non_capability_api_route_is_mapped_to_a_permission():

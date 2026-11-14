@@ -32,6 +32,7 @@ KNOWN_ROLES = {
     "database-connection-manager": "Connect databases and approve which tables the agent may use.",
     "database-engine-reviewer": "Review requests for new database engines.",
     "data-writer": "Plan and execute data changes (insert, update, delete) after re-confirming identity.",
+    "data-entry": "Record new data only (insert), for example daily transactions. Cannot update, delete or approve.",
     "data-change-approver": "Approve data changes made by someone else (second pair of eyes).",
     "data-schema-creator": "Create new databases and tables (names with the server's prefix only).",
 }

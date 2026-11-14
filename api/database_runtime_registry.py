@@ -47,10 +47,13 @@ from agent.workflow.job_experience import JobExperienceStore
 from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableRelation, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
-from agent.workflow.database_creation import DIALECTS, DatabaseCreationService, DatabaseDesigner
+from agent.workflow.database_creation import (
+    DIALECTS, DatabaseCreationService, DatabaseDesigner, SQLiteCreationService, max_tables,
+)
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
 )
+from api.data_change_settings import settings as data_change_settings
 from api.relation_suggestions import suggest_relations
 from api.database_engines import (
     EngineError, MySQLEngine, PostgresEngine, SQLiteEngine, SQLServerEngine, any_database_allowed,
@@ -60,7 +63,6 @@ from api.database_engines import (
 logger = logging.getLogger("hai_agent.database_registry")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
-MAX_TABLES = 20
 LIST_READ_LIMIT = 1001
 MAX_COLUMNS_PER_TABLE = 100
 MAX_RELATIONS = 30
@@ -464,6 +466,36 @@ class DatabaseRuntimeRegistry:
             del impl.profiles[name]
             self._creators.pop(name, None)
 
+    def list_source_databases(self, source: Any) -> list[dict[str, Any]]:
+        """The databases on a server profile (or the ones this application made, for the SQLite profile), each
+        marked with whether it may be connected and whether it is connected already. Names only."""
+        with self._lock:
+            impl = next((e for e in self._engines.values()
+                         if isinstance(source, str) and source in getattr(e, "profiles", {})), None)
+            connected = {c.filename for c in self._connections.values()}
+        if impl is None or not hasattr(impl, "list_databases"):
+            raise RegistryNotFound(f"no server named '{source}'")
+        try:
+            items = impl.list_databases(source)
+        except Exception as exc:
+            # Driver errors can echo hosts and users: the browser gets our own message, the log the real cause.
+            if not isinstance(exc, EngineError):
+                logger.warning("Could not list the databases of %r: %s: %s", source, type(exc).__name__, exc)
+            detail = str(exc) if isinstance(exc, EngineError) else "connection failed"
+            raise RegistryError(f"cannot list databases: {detail}") from exc
+        return [{**item, "connected": f"{source}/{item['name']}" in connected
+                 or (bool(item.get("default")) and source in connected)} for item in items]
+
+    def list_source_files(self) -> list[dict[str, Any]]:
+        """SQLite files in the data folder, each marked with whether a connection uses it already."""
+        impl = self._engines.get("sqlite")
+        if impl is None or not hasattr(impl, "list_files"):
+            return []
+        with self._lock:
+            connected = {c.filename for c in self._connections.values()}
+        return [{"name": f, "connected": f in connected or f"sqlite/{Path(f).stem}" in connected}
+                for f in impl.list_files()]
+
     def profile_engine(self, name: Any) -> str | None:
         """Engine type of a named server profile, or None if there is no such profile."""
         for item in self.profiles():
@@ -475,7 +507,12 @@ class DatabaseRuntimeRegistry:
         if not isinstance(name, str) or not _NAME.match(name):
             raise RegistryError("name must be lowercase letters, digits or _ (2-32 chars)")
         if engine == "sqlite":
-            resolve_in_root(self.data_root, source)  # fail fast before taking the lock
+            # Fail fast before taking the lock. "sqlite/<database>" names a database this application made.
+            finder = getattr(self._engines.get("sqlite"), "_file", None)
+            try:
+                finder(source) if finder else resolve_in_root(self.data_root, source)
+            except EngineError as exc:
+                raise RegistryError(str(exc)) from exc
         with self._lock:
             if name in self._connections or name in self._degraded:
                 raise RegistryError(f"connection '{name}' already exists")
@@ -539,8 +576,9 @@ class DatabaseRuntimeRegistry:
         name = conn.name
         map_type = self._engines[conn.engine].map_type
         if True:
-            if not isinstance(tables, Mapping) or not tables or len(tables) > MAX_TABLES:
-                raise RegistryError(f"select between 1 and {MAX_TABLES} tables")
+            limit = max_tables()
+            if not isinstance(tables, Mapping) or not tables or len(tables) > limit:
+                raise RegistryError(f"select between 1 and {limit} tables")
             by_table = {t.name: t for t in conn.schema.tables}
             specs: dict[str, ReadOnlyTableSpec] = {}
             entries: list[TableCatalogEntry] = []
@@ -657,7 +695,8 @@ class DatabaseRuntimeRegistry:
             planner=DataChangePlanner(self._llm, tables), connect=factory, quote=impl.quote,
             paramstyle=impl.paramstyle, lock_clause=getattr(impl, "lock_clause", " FOR UPDATE"),
             dialect=getattr(impl, "dialect", "limit"),
-            audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl")
+            audit_path=self.work_dir / "audit" / f"changes-{conn.name}.jsonl",
+            audit_detail=lambda: data_change_settings()["audit_detail"])
 
     # --------------------------------------------------- creating databases
     def creatable_profiles(self) -> list[dict[str, str]]:
@@ -668,6 +707,13 @@ class DatabaseRuntimeRegistry:
                 if getattr(engine, "has_creator", lambda _n: False)(pname):
                     out.append({"name": pname, "prefix": profile.creator_prefix, "type": engine.kind})
         return sorted(out, key=lambda item: item["name"])
+
+    def language_model(self) -> Any:
+        """The shared language-model service (built on first use), for callers that only classify text."""
+        with self._lock:
+            if self._llm is None:
+                self._llm = LLMService(self.llm_provider_factory())
+            return self._llm
 
     def database_creator(self, profile: Any = None) -> DatabaseCreationService:
         with self._lock:
@@ -684,6 +730,17 @@ class DatabaseRuntimeRegistry:
             if cached is not None:
                 return cached
             impl = next(e for e in self._engines.values() if profile in getattr(e, "profiles", {}))
+            if impl.kind == "sqlite":
+                # A SQLite database is a file in the data folder: there is no server, account or grant.
+                if self._llm is None:
+                    self._llm = LLMService(self.llm_provider_factory())
+                service = SQLiteCreationService(
+                    designer=DatabaseDesigner(self._llm, prefix=impl.profiles[profile].creator_prefix,
+                                              dialect=DIALECTS["sqlite"]),
+                    data_root=self.data_root, profile=profile,
+                    audit_path=self.work_dir / "audit" / f"creations-{profile}.jsonl")
+                self._creators[profile] = service
+                return service
             try:
                 factory = impl.open_creator(profile)
             except EngineError as exc:
@@ -706,6 +763,48 @@ class DatabaseRuntimeRegistry:
             if conn.changes is None:
                 raise RegistryError("no table of this connection is approved for changing data")
             return conn.changes
+
+    def change_token(self, name: Any) -> str | None:
+        """Fingerprint of what data changes on ``name`` may touch (tables, columns, operations and the
+        engine). A change plan remembers it; if the writable approvals change, the token changes and the
+        plan is refused. Unlike object identity it survives a restart."""
+        with self._lock:
+            conn = self._get(name)
+            if conn.changes is None:
+                return None
+            tables = []
+            for table, writable in sorted(conn.changes.planner.tables.items()):
+                entry = writable.entry
+                tables.append([table, sorted((c, str(t)) for c, t in entry.columns.items()),
+                               sorted(entry.filterable_columns), entry.key_column,
+                               sorted(entry.required_non_null_columns), sorted(writable.operations),
+                               sorted(writable.writable_columns)])
+            body = {"name": conn.name, "engine": conn.engine, "tables": tables}
+            return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def entry_databases(self) -> list[dict[str, Any]]:
+        """Connections where new rows may be recorded (a table approved for insert): name and tables only."""
+        with self._lock:
+            out = []
+            for conn_name, conn in sorted(self._connections.items()):
+                if conn.changes is None:
+                    continue
+                tables = sorted(t for t, w in conn.changes.planner.tables.items() if "insert" in w.operations)
+                if tables:
+                    out.append({"name": conn_name, "tables": tables})
+            return out
+
+    def resolve_entry_name(self, name: Any = None) -> str:
+        """The connection to record into: the named one, or the only one that accepts new rows."""
+        able = [d["name"] for d in self.entry_databases()]
+        if name is not None:
+            if name not in able:
+                raise RegistryNotFound(f"'{name}' does not accept new data")
+            return name
+        if len(able) != 1:
+            raise RegistryError("name the database to record into" if able
+                                else "no connection has tables approved for adding data")
+        return able[0]
 
     def resolve_change_name(self, name: Any = None) -> str:
         """The connection to use for a change: the named one, or the only one that can change data."""
@@ -802,6 +901,11 @@ class DatabaseRuntimeRegistry:
                 "status": "active" if conn.service else "connected_pending_approval",
                 "tables": list(conn.tables),
                 "writable_tables": sorted(conn.changes.planner.tables) if conn.changes else [],
+                # Per table that allows update: the columns a file may use to find the rows (key first).
+                "match_columns": ({
+                    t: sorted(w.entry.filterable_columns, key=lambda c: c != w.entry.key_column)
+                    for t, w in conn.changes.planner.tables.items() if "update" in w.operations
+                } if conn.changes else {}),
                 "relations": [_relation_to_dict(r) for r in conn.relations]}
 
     def schema(self, name: str) -> dict[str, Any]:
@@ -848,6 +952,20 @@ class DatabaseRuntimeRegistry:
             if conn.service is None:
                 raise RegistryError(f"connection '{name}' has no approved tables yet")
             return conn.service
+
+    def service_token(self, name: str | None) -> str | None:
+        """Stable fingerprint of what a report on ``name`` may touch (engine, approved tables/columns,
+        approved relations). A plan remembers it; if the approvals change, the token changes and the plan
+        is refused. Unlike object identity it survives a restart."""
+        with self._lock:
+            conn = self._get(self.resolve_name(name))
+            if conn.service is None:
+                return None
+            relations = sorted((r.table, r.column, r.ref_table, r.ref_column) for r in conn.relations)
+            body = {"name": conn.name, "engine": conn.engine, "selection": conn.selection,
+                    "relations": relations}
+            return hashlib.sha256(
+                json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     def resolve_name(self, name: str | None) -> str:
         """Name of the connection ``service(name)`` would use, so callers can pin it."""

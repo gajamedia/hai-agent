@@ -45,10 +45,10 @@ def db(tmp_path):
     return path
 
 
-def _service(db, tmp_path, *answers):
+def _service(db, tmp_path, *answers, detail="full"):
     planner = DataChangePlanner(LLMService(Scripted(*answers)), [TABLE], today=lambda: date(2026, 11, 7))
     return DataChangeService(planner=planner, connect=lambda: sqlite3.connect(db), quote="`",
-                             paramstyle="qmark", audit_path=tmp_path / "audit.jsonl", lock_clause="")
+                             paramstyle="qmark", audit_path=tmp_path / "audit.jsonl", lock_clause="", audit_detail=detail)
 
 
 def _rows(db, sql="SELECT id, nama, harga_beli FROM tb_bahan ORDER BY id"):
@@ -205,7 +205,7 @@ def test_insert_adds_rows_and_a_failure_adds_none(db, tmp_path):
     assert len(_rows(db)) == 12
     bad = _plan(svc, {"operation": "insert", "table": "tb_bahan",
                       "rows": [{"nama": "ok", "harga_beli": 1}, {"nama": None, "harga_beli": 2}]})
-    with pytest.raises(sqlite3.IntegrityError):               # NOT NULL, the second row
+    with pytest.raises(ChangeRefused, match="nama wajib diisi"):   # NOT NULL, the second row: said in words
         _run(svc, bad, 2)
     assert len(_rows(db)) == 12                                # the first row was rolled back too
 
@@ -223,3 +223,83 @@ def test_the_confirmation_phrase_names_the_action_the_rows_and_the_table(db, tmp
     assert svc.confirm_phrase(_plan(svc, UPDATE), 2) == "UBAH 2 BARIS tb_bahan"
     delete = _plan(svc, {"operation": "delete", "table": "tb_bahan", "conditions": UPDATE["conditions"]})
     assert svc.confirm_phrase(delete, 2) == "HAPUS 2 BARIS tb_bahan"
+
+
+# ------------------------------------------------------------------ verifying after the commit
+def _committed(svc, request):
+    preview = svc.preview(request)
+    svc.execute(request, expected_rows=preview.expected_rows, actor="a", approver=None,
+                plan_id="p", question="q")
+    return preview.expected_rows
+
+
+def test_verify_a_delete_by_reading_the_table_again(db, tmp_path):
+    svc = _service(db, tmp_path)
+    request = _plan(svc, {"operation": "delete", "table": "tb_bahan",
+                          "conditions": [{"column": "id", "operator": "in", "value": [1, 2]}]})
+    rows = _committed(svc, request)
+    assert svc.verify(request, rows) == {"method": "reread_after_commit", "expected_rows": 0,
+                                         "observed_rows": 0, "confirmed": True}
+
+
+def test_verify_notices_a_delete_that_did_not_hold(db, tmp_path):
+    svc = _service(db, tmp_path)
+    request = _plan(svc, {"operation": "delete", "table": "tb_bahan",
+                          "conditions": [{"column": "id", "operator": "in", "value": [1, 2]}]})
+    rows = _committed(svc, request)
+    with sqlite3.connect(db) as c:                       # somebody put a matching row back
+        c.execute("INSERT INTO tb_bahan VALUES (1, 'back', 1.0, '2026-01-01')")
+    seen = svc.verify(request, rows)
+    assert seen["observed_rows"] == 1 and seen["confirmed"] is False
+
+
+def test_verify_an_update_finds_the_rows_with_their_new_values(db, tmp_path):
+    svc = _service(db, tmp_path)
+    request = _plan(svc, {"operation": "update", "table": "tb_bahan", "set": {"nama": "baru"},
+                          "conditions": [{"column": "harga_beli", "operator": "lt", "value": 13000}]})
+    rows = _committed(svc, request)
+    seen = svc.verify(request, rows)
+    assert seen == {"method": "reread_after_commit", "expected_rows": rows, "observed_rows": rows,
+                    "confirmed": True}
+    with sqlite3.connect(db) as c:                       # one of them was changed again afterwards
+        c.execute("UPDATE tb_bahan SET nama='lain' WHERE id=1")
+    assert svc.verify(request, rows)["confirmed"] is False
+
+
+def test_verify_an_update_that_changes_what_it_selected_by_can_only_use_the_reported_count(db, tmp_path):
+    svc = _service(db, tmp_path)
+    request = _plan(svc, UPDATE)                          # sets harga_beli where harga_beli < 13000
+    rows = _committed(svc, request)
+    assert svc.verify(request, rows)["method"] == "database_reported_rowcount"
+
+
+def test_verify_an_insert_uses_the_reported_count(db, tmp_path):
+    svc = _service(db, tmp_path)
+    request = _plan(svc, {"operation": "insert", "table": "tb_bahan", "rows": [{"nama": "x"}, {"nama": "y"}]})
+    rows = _committed(svc, request)
+    assert svc.verify(request, rows) == {"method": "database_reported_rowcount", "expected_rows": 2,
+                                         "observed_rows": 2, "confirmed": True}
+
+
+def test_the_default_audit_keeps_no_business_data_only_keys_and_counts(db, tmp_path):
+    svc = _service(db, tmp_path, detail="minimal")
+    request = _plan(svc, UPDATE)
+    result = _run(svc, request, svc.preview(request).expected_rows)
+    assert result.rows_affected == 2
+    text = (tmp_path / "audit.jsonl").read_text("utf-8")
+    audit = json.loads(text.splitlines()[0])
+    assert audit["status"] == "committed" and audit["audit_detail"] == "minimal"
+    assert audit["before_image"] == [{"id": 2}, {"id": 3}] or all(set(r) == {"id"} for r in audit["before_image"])
+    assert audit["before_image_rows"] == 2 and audit["params"] == [] and audit["params_count"] == 2
+    for value in ("11000", "12000", "5000", "13000"):
+        assert value not in text
+
+
+def test_the_audit_detail_can_be_changed_without_a_restart(db, tmp_path):
+    mode = {"value": "minimal"}
+    planner = DataChangePlanner(LLMService(Scripted()), [TABLE], today=lambda: date(2026, 11, 7))
+    svc = DataChangeService(planner=planner, connect=lambda: sqlite3.connect(db), quote="`", paramstyle="qmark",
+                            audit_path=tmp_path / "audit.jsonl", lock_clause="", audit_detail=lambda: mode["value"])
+    assert svc._detail_mode() == "minimal"
+    mode["value"] = "full"
+    assert svc._detail_mode() == "full"

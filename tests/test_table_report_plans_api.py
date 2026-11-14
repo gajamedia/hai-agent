@@ -11,7 +11,7 @@ from api.database_runtime_registry import DatabaseRuntimeRegistry
 from api.main import create_app
 from api.security.authentication import AuthenticatedPrincipal
 from api.security.authorization import AuthorizationPolicy
-from api.table_report_plans import PlanConflict, PlanNotFound, PlanStore
+from api.platform_runtime import get_pipeline
 from tests.test_table_report_job_e2e import _make_db, _sample_rows
 from tests.test_table_reports_api import PERMISSION, READ, _Attach
 
@@ -59,21 +59,19 @@ def world(tmp_path):
         registry.activate("sales", SELECTION, actor_id="alice")
         shared = {}
 
-        def client(actor="alice", *permissions, store=None):
+        def client(actor="alice", *permissions, pipeline=None):
             app = create_app(authorization_policy_factory=lambda _a: AuthorizationPolicy(),
                              database_runtime_registry_factory=lambda _a: registry)
-            if store is not None:
-                app.state.table_report_plans = store
-            elif "store" in shared:
-                app.state.table_report_plans = shared["store"]
             app.add_middleware(_Attach, principal=_who(actor, *(permissions or (PERMISSION, READ))))
             c = TestClient(app)
             c.__enter__()
             made.append(c)
-            shared.setdefault("store", getattr(app.state, "table_report_plans", None))
+            # every client shares one pipeline, as one running server would
+            if pipeline is not None:
+                app.state.platform_pipeline = pipeline
+            else:
+                app.state.platform_pipeline = shared.setdefault("pipeline", get_pipeline(app))
             return c
-        # make every client share one PlanStore, as one running server would
-        shared["store"] = PlanStore()
         return client, registry, provider
     yield build, tmp_path
     for c in made:
@@ -215,10 +213,15 @@ def test_disconnecting_after_planning_blocks_the_run(world):
 
 
 def test_plans_expire(world):
+    from agent.platform import PlatformPipeline, SQLiteTaskStore
     now = [1000.0]
-    store = PlanStore(ttl_seconds=60, clock=lambda: now[0])
     client, *_ = world[0](_plan())
-    c = client(store=store)
+    probe = client()
+    base = get_pipeline(probe.app)
+    clocked = PlatformPipeline(
+        registry=base.registry, store=SQLiteTaskStore(":memory:", clock=lambda: now[0]),
+        authorize=base._authorize, clock=lambda: now[0], ttl_seconds=60)
+    c = client(pipeline=clocked)
     pid = _create(c).json()["plan_id"]
     now[0] += 61
     assert c.post(f"{BASE}/plans/{pid}/run").status_code == 404
@@ -230,41 +233,79 @@ def test_the_combined_endpoint_still_works(world):
     assert body["status"] == "succeeded"
 
 
-# ---------------------------------------------------------------- store unit
-def _store_plan(store, owner="a"):
-    return store.create(owner=owner, database="d", question="q", plan_result=object(),
-                        summary={}, service=object())
+# ------------------------------------------------------- platform behaviour of the report plans
+def test_too_many_pending_plans_answer_429(world):
+    client, *_ = world[0](_plan(), _plan(), _plan())
+    c = client()
+    object.__setattr__(get_pipeline(c.app).registry.get("database.report"), "max_active", 2)
+    assert _create(c).status_code == 201
+    assert _create(c).status_code == 201
+    third = _create(c)
+    assert third.status_code == 429 and third.json()["detail"]["error"] == "too_many_plans"
 
 
-def test_store_state_machine_and_caps():
-    store = PlanStore(max_plans=2)
-    p = _store_plan(store)
-    assert store.begin_run(p.plan_id, "a", "k")[0] == "run"
-    with pytest.raises(PlanConflict):
-        store.begin_run(p.plan_id, "a", "k")        # still running
-    store.finish(p, {"ok": 1})
-    assert store.begin_run(p.plan_id, "a", "k")[0] == "replay"
-    with pytest.raises(PlanConflict):
-        store.begin_run(p.plan_id, "a", None)
-    with pytest.raises(PlanNotFound):
-        store.begin_run(p.plan_id, "intruder", "k")
-    _store_plan(store)
-    with pytest.raises(PlanConflict):
-        _store_plan(store)                           # cap of 2 pending plans
+def test_plans_survive_a_restart_and_run_once(world):
+    """A new pipeline over the same task file (a restarted server) still knows the plan."""
+    from agent.platform import PlatformPipeline, SQLiteTaskStore
+    client, registry, _ = world[0](_plan())
+    first = client()
+    pid = _create(first).json()["plan_id"]
+    path = registry.work_dir / "platform.sqlite3"
+    assert path.exists()
+    old = get_pipeline(first.app)
+    reborn = PlatformPipeline(registry=old.registry, store=SQLiteTaskStore(path, clock=old._clock),
+                              authorize=old._authorize, clock=old._clock)
+    second = client(pipeline=reborn)
+    ran = second.post(f"{BASE}/plans/{pid}/run")
+    assert ran.status_code == 200 and ran.json()["status"] == "succeeded"
+    assert second.post(f"{BASE}/plans/{pid}/run").status_code == 409
 
 
-def test_an_interrupted_run_is_not_silently_repeated():
-    store = PlanStore()
-    p = _store_plan(store)
-    store.begin_run(p.plan_id, "a", "k")
-    store.mark_unknown(p)
-    with pytest.raises(PlanConflict):
-        store.begin_run(p.plan_id, "a", "k")
+def test_report_rows_are_never_written_to_the_task_store(world):
+    client, registry, _ = world[0](_plan())
+    c = client()
+    pid = _create(c).json()["plan_id"]
+    body = c.post(f"{BASE}/plans/{pid}/run").json()
+    assert body["rows"]
+    stored = get_pipeline(c.app).store.get(pid)
+    assert stored.status.value == "completed" and stored.verification["verdict"] == "verified"
+    assert "rows" not in stored.result and "rows" not in stored.plan
+    import json as _json
+    blob = _json.dumps(get_pipeline(c.app).store.audit_records(pid))
+    assert "rows" not in blob and "amount" not in blob
 
 
-def test_release_allows_a_retry_only_when_nothing_started():
-    store = PlanStore()
-    p = _store_plan(store)
-    store.begin_run(p.plan_id, "a", None)
-    store.release(p)
-    assert store.begin_run(p.plan_id, "a", None)[0] == "run"
+def test_a_replay_after_a_restart_has_the_facts_but_no_rows(world):
+    from agent.platform import PlatformPipeline, SQLiteTaskStore
+    client, registry, _ = world[0](_plan())
+    first = client()
+    pid = _create(first).json()["plan_id"]
+    original = first.post(f"{BASE}/plans/{pid}/run", headers={"Idempotency-Key": "k"}).json()
+    old = get_pipeline(first.app)
+    reborn = PlatformPipeline(registry=old.registry,
+                              store=SQLiteTaskStore(registry.work_dir / "platform.sqlite3", clock=old._clock),
+                              authorize=old._authorize, clock=old._clock)
+    second = client(pipeline=reborn)
+    old.registry.report_outcomes.clear()                       # a new process has an empty cache
+    replay = second.post(f"{BASE}/plans/{pid}/run", headers={"Idempotency-Key": "k"}).json()
+    assert replay["replayed"] is True and replay["status"] == "succeeded"
+    assert replay["workflow_id"] == original["workflow_id"] and replay["plan"] == original["plan"]
+    assert replay["rows"] == []
+
+
+def test_the_run_is_audited_and_verified(world):
+    client, *_ = world[0](_plan())
+    c = client()
+    pid = _create(c).json()["plan_id"]
+    c.post(f"{BASE}/plans/{pid}/run")
+    events = [r["event"] for r in get_pipeline(c.app).store.audit_records(pid)]
+    assert events == ["task_planned", "task_executing", "task_executed", "task_completed"]
+
+
+def test_a_failed_report_is_recorded_as_failed_not_completed(world):
+    client, *_ = world[0](_plan())
+    planner_only = client("alice", PERMISSION)
+    pid = _create(planner_only).json()["plan_id"]
+    planner_only.post(f"{BASE}/plans/{pid}/run")
+    stored = get_pipeline(planner_only.app).store.get(pid)
+    assert stored.status.value == "failed" and stored.verification["verdict"] == "failed"

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
-import { AlertCircle, LoaderCircle, ShieldCheck } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertCircle, FileUp, LoaderCircle, ShieldCheck } from "lucide-react";
 import { Link } from "react-router-dom";
 import {
   cancelDataChangePlan,
   createDataChangePlan,
+  createDataChangePlanFromFile,
   decideDataChange,
   getDataChangeConfig,
   getDataChangePlan,
@@ -13,6 +14,8 @@ import {
 } from "../api/client.js";
 import { signInAgain } from "../auth/keycloak.js";
 import { describeCondition } from "./conditions.js";
+import FileMapping from "./FileMapping.jsx";
+import HeaderRowField from "./HeaderRowField.jsx";
 import "./autonomous-testing.css";
 
 const PENDING_KEY = "hai.dataChange.pending";
@@ -32,9 +35,11 @@ const takePending = () => {
 const errorCode = (error) => error?.body?.detail?.error;
 const errorText = (error) => error?.body?.detail?.message || error?.message || "Terjadi kesalahan.";
 
-function RowsTable({ title, rows }) {
+export function RowsTable({ title, rows, order = [] }) {
   if (!rows?.length) return null;
-  const headers = Object.keys(rows[0]);
+  const all = Object.keys(rows[0]);
+  // Same column order as the destination table; anything not in that list follows.
+  const headers = [...order.filter((h) => all.includes(h)), ...all.filter((h) => !order.includes(h))];
   return (
     <div style={{ overflowX: "auto" }}>
       <b>{title}</b>
@@ -52,7 +57,7 @@ function RowsTable({ title, rows }) {
   );
 }
 
-function ChangeSummary({ change }) {
+export function ChangeSummary({ change }) {
   const { plan, preview } = change;
   return (
     <div className="at-config-summary">
@@ -60,13 +65,23 @@ function ChangeSummary({ change }) {
       {plan.set && (
         <span>Nilai baru: {Object.entries(plan.set).map(([k, v]) => `${k} = ${v}`).join(", ")}</span>
       )}
+      {plan.match_column && (
+        <span>
+          Tiap baris file mencari satu baris tabel lewat kolom <b>{plan.match_column}</b> dan mengubah nilainya
+          ({plan.rows?.length} baris di file; sel kosong membiarkan nilai lama).
+        </span>
+      )}
       {plan.conditions && (
         <span>Baris yang dipilih: {plan.conditions.map(describeCondition).join(" DAN ")}</span>
       )}
       <span>Jumlah baris terdampak: <b>{change.expected_rows}</b> (batas Anda: {plan.max_rows})</span>
       {preview?.note && <small>{preview.note}</small>}
-      <RowsTable title="Sebelum" rows={preview?.before} />
-      <RowsTable title={plan.operation === "insert" ? "Baris yang ditambahkan" : "Sesudah"} rows={preview?.after} />
+      {change.file?.left_alone?.length > 0 && (
+        <small>Tidak diubah (tidak ada di file dan tidak ada aturan isian): {change.file.left_alone.join(", ")}.</small>
+      )}
+      <RowsTable title="Sebelum" rows={preview?.before} order={change.column_order} />
+      <RowsTable title={plan.operation === "insert" ? "Baris yang ditambahkan" : "Sesudah"} rows={preview?.after}
+        order={change.column_order} />
     </div>
   );
 }
@@ -84,6 +99,12 @@ export default function DataChanges() {
   const [result, setResult] = useState(null);
   const [approvals, setApprovals] = useState(null); // null: this person is not an approver
   const [notice, setNotice] = useState("");
+  const [file, setFile] = useState(null);
+  const [headerRow, setHeaderRow] = useState(1);
+  const [table, setTable] = useState("");
+  const [match, setMatch] = useState("");
+  const [mapState, setMapState] = useState(null);
+  const fileInput = useRef(null);
 
   const showError = (error) => setMessage({ kind: "error", text: errorText(error) });
 
@@ -136,19 +157,38 @@ export default function DataChanges() {
     }
   };
 
-  const makePlan = (event) => {
-    event.preventDefault();
+  const chosen = databases.find((d) => d.name === database);
+  const tables = chosen?.writable_tables || [];
+  const tableName = tables.length === 1 ? tables[0] : table;
+  const matchChoices = chosen?.match_columns?.[tableName] || null;
+
+  const makePlan = (event, mapping) => {
+    event?.preventDefault();
     return guarded(async () => {
       setResult(null);
       setPlan(null);
       setNotice("");
       setPhrase("");
-      const body = await createDataChangePlan({
-        question, max_rows: Number(maxRows), ...(database ? { database } : {}),
-      });
-      if (body.status === "planned") setPlan(body);
+      if (!mapping) setMapState(null);
+      const body = file
+        ? await createDataChangePlanFromFile(file, {
+          database, table: tableName, match: match.trim(), maxRows: Number(maxRows), question, headerRow,
+          ...(mapping ? { mapping } : {}),
+        })
+        : await createDataChangePlan({
+          question, max_rows: Number(maxRows), ...(database ? { database } : {}),
+        });
+      if (body.status === "planned") { setPlan(body); setMapState(null); }
+      else if (body.status === "needs_mapping") setMapState(body);
       else setMessage({ kind: "warning", text: body.reason });
     });
+  };
+
+  const clearFile = () => {
+    setFile(null);
+    setHeaderRow(1);
+    setMapState(null);
+    if (fileInput.current) fileInput.current.value = "";
   };
 
   // A fresh login is required: if the server says so, go to Keycloak and come back to this plan.
@@ -167,6 +207,7 @@ export default function DataChanges() {
         setResult(body);
         setPlan(null);
         setNotice("");
+        clearFile();
       } catch (error) {
         if (!needsSignIn(error, plan.plan_id)) throw error;
       }
@@ -198,8 +239,9 @@ export default function DataChanges() {
       <header className="at-header">
         <h1>Ubah data</h1>
         <p>
-          Tambah, ubah, atau hapus data dengan perintah biasa. Agent tidak menulis SQL: ia hanya memilih
-          perubahan terstruktur yang Anda lihat dulu, dan hanya pada tabel dan kolom yang disetujui untuk diubah.
+          Tambah, ubah, atau hapus data dengan perintah biasa, atau ubah banyak baris sekaligus dari file CSV/Excel.
+          Agent tidak menulis SQL: ia hanya memilih perubahan terstruktur yang Anda lihat dulu, dan hanya pada tabel
+          dan kolom yang disetujui untuk diubah.
         </p>
       </header>
 
@@ -212,7 +254,7 @@ export default function DataChanges() {
       <section className="at-panel">
         {databases.length === 0 ? (
           <p>
-            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di tab <Link to="/database-agent/reports">Laporan</Link>,
+            Belum ada koneksi yang tabelnya disetujui untuk diubah. Di tab <Link to="/database-agent/connections">Koneksi</Link>,
             buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b> serta izin Tambah/Ubah/Hapus. Server juga
             butuh akun penulis di profil database (lihat docs/TRY_DATA_REPORTS_LOCALLY.md).
           </p>
@@ -229,21 +271,64 @@ export default function DataChanges() {
                 </select>
                 <small>
                   Hanya koneksi yang tabelnya sudah disetujui untuk diubah muncul di sini (MySQL, SQL Server, ...).
-                  Koneksi lain: di tab <Link to="/database-agent/reports">Laporan</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
+                  Koneksi lain: di tab <Link to="/database-agent/connections">Koneksi</Link> buka <b>Ubah persetujuan</b> dan centang <b>boleh diubah</b>;
                   server juga butuh akun penulis di profilnya.
                 </small>
               </label>
             )}
             <label>
-              Perintah
+              {file ? "Tambahan yang diketik (boleh dikosongkan)" : "Perintah"}
               <textarea
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
-                placeholder="Contoh: naikkan harga beli bahan gula menjadi 15 ribu"
+                placeholder={file
+                  ? "Contoh: ubah kolom status semua baris di file menjadi aktif"
+                  : "Contoh: naikkan harga beli bahan gula menjadi 15 ribu"}
                 rows={3}
-                required
               />
+              {file && <small>Teks ini mengisi kolom yang tidak ada di file, untuk semua baris di file.</small>}
             </label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <FileUp size={16} aria-hidden="true" />
+                <span>{file ? "File perubahan" : "Atau unggah file perubahan (CSV atau Excel .xlsx)"}</span>
+                <input ref={fileInput} type="file" accept=".csv,.tsv,.txt,.xlsx" aria-label="File perubahan"
+                  onChange={(e) => { setFile(e.target.files?.[0] || null); setMapState(null); setTable(""); }} />
+              </label>
+              {file && (
+                <>
+                  <small>
+                    Tiap baris file mengubah satu baris tabel: kolom pencarinya (kunci tabel, atau kolom unik lain yang
+                    Anda isi di bawah) menunjuk barisnya, kolom lain berisi nilai barunya. Sel kosong membiarkan nilai
+                    lama. Nilai pencari yang tidak ketemu, atau ketemu lebih dari satu baris, menolak seluruh file.
+                  </small>
+                  {tables.length > 1 && (
+                    <label>
+                      Tabel tujuan
+                      <select value={table} onChange={(e) => { setTable(e.target.value); setMatch(""); }}>
+                        <option value="">Pilih tabel</option>
+                        {tables.map((t) => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </label>
+                  )}
+                  <HeaderRowField value={headerRow} onChange={setHeaderRow} />
+                  <label>
+                    Kolom pencari baris
+                    {matchChoices ? (
+                      <select value={match} onChange={(e) => setMatch(e.target.value)}>
+                        <option value="">Kunci tabel (otomatis)</option>
+                        {matchChoices.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    ) : (
+                      <input value={match} onChange={(e) => setMatch(e.target.value)} autoComplete="off"
+                        placeholder="Kosongkan untuk kunci tabel" />
+                    )}
+                    <small>Kolom di file yang menunjuk baris tabel mana yang diubah. Pilihannya kolom tabel yang boleh dipakai mencari.</small>
+                  </label>
+                  <div><button type="button" className="at-button at-button-secondary" onClick={clearFile}>Hapus file</button></div>
+                </>
+              )}
+            </div>
             <label>
               Maksimal baris yang boleh berubah
               <input
@@ -252,12 +337,20 @@ export default function DataChanges() {
               />
               <small>Jika perubahan mengenai lebih banyak baris, rencana ditolak. Batas server: {config?.max_rows_ceiling ?? "-"}.</small>
             </label>
-            <button className="at-button at-button-primary" disabled={busy || !question.trim()}>
+            <button className="at-button at-button-primary"
+              disabled={busy || (file ? (tables.length > 1 && !table) : !question.trim()) || (databases.length > 1 && !database)}>
               {busy ? <LoaderCircle size={14} className="spin" /> : null} Buat rencana
             </button>
           </form>
         )}
       </section>
+
+      {mapState && (
+        <FileMapping key={mapState.headers.join("|")} state={mapState} busy={busy}
+          required={mapState.match}
+          note={`Kolom pencari baris: ${mapState.match}; kolom file untuk itu harus dipilih.`}
+          onApply={(mapping) => makePlan(null, mapping)} onCancel={() => setMapState(null)} />
+      )}
 
       {plan && (
         <section className="at-panel" aria-label="Rencana perubahan">

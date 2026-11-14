@@ -25,6 +25,23 @@ class LLMMessage:
             raise TypeError("LLM message content must be a string")
 
 
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
+
+
+@dataclass(frozen=True)
+class LLMImage:
+    """An image for a model that can see (bytes already checked by the caller)."""
+
+    media_type: str
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if self.media_type not in IMAGE_TYPES:
+            raise ValueError(f"Unsupported image type: {self.media_type!r}")
+        if not isinstance(self.data, (bytes, bytearray)) or not self.data:
+            raise ValueError("image data must be non-empty bytes")
+
+
 @dataclass(frozen=True)
 class LLMRequest:
     """Provider-neutral request contract."""
@@ -34,6 +51,7 @@ class LLMRequest:
     temperature: float | None = None
     max_tokens: int | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    images: tuple[LLMImage, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.messages:

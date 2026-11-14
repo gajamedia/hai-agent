@@ -9,23 +9,59 @@ alter or overwrite anything here: a name that exists is refused.
 """
 
 import json
+import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from agent.llm.contracts import LLMMessage
 from agent.workflow.table_report_planner import PlanValidationError, _extract_json
 
-MAX_TABLES = 20
+logger = logging.getLogger(__name__)
+DEFAULT_MAX_TABLES = 20
+TABLES_CEILING = 200
 MAX_COLUMNS = 500
+
+
+def max_tables() -> int:
+    """How many tables one design may have, and how many tables one connection may approve: HAI_MAX_TABLES
+    (default 20, at most 200). One setting for both, so what can be created can also be approved. Read on every
+    call; an unreadable or out-of-range value falls back to the default, with a warning in the log."""
+    raw = os.getenv("HAI_MAX_TABLES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TABLES
+    if raw.isdigit() and 1 <= int(raw) <= TABLES_CEILING:
+        return int(raw)
+    logger.warning("HAI_MAX_TABLES=%r is not a whole number from 1 to %d; using %d.",
+                   raw, TABLES_CEILING, DEFAULT_MAX_TABLES)
+    return DEFAULT_MAX_TABLES
+
 # MySQL counts every column in the row size limit (65,535 bytes). utf8mb4 VARCHAR(255) = 1,022 bytes,
 # TEXT only a pointer. Checked here so a too-wide design is refused with a clear message, not a DDL error.
 _ROW_BYTES = {"integer": 4, "decimal": 8, "text": 1022, "long_text": 12, "date": 3, "datetime": 8, "boolean": 1}
 _ROW_LIMIT = 65000
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+DEFAULT_TABLE_PREFIX = "tb_"
+_PREFIX_OK = re.compile(r"^[a-z][a-z0-9_]{0,9}$")
+
+
+def table_prefix() -> str:
+    """What every new table name starts with: HAI_TABLE_PREFIX (default ``tb_``). Set it to nothing (an empty
+    value) to leave names as they are. Read on every call; a value that is not 1 to 10 lowercase letters, digits
+    or underscores (starting with a letter) falls back to the default, with a warning in the log."""
+    raw = os.environ.get("HAI_TABLE_PREFIX")
+    if raw is None:
+        return DEFAULT_TABLE_PREFIX
+    raw = raw.strip()
+    if raw == "" or _PREFIX_OK.match(raw):
+        return raw
+    logger.warning("HAI_TABLE_PREFIX=%r is not 1 to 10 lowercase letters, digits or underscores; using %r.",
+                   raw, DEFAULT_TABLE_PREFIX)
+    return DEFAULT_TABLE_PREFIX
 # Closed set of column types -> MySQL types. Nothing else can be requested.
 COLUMN_TYPES = {
     "integer": "INT", "decimal": "DECIMAL(14,2)", "text": "VARCHAR(255)", "long_text": "TEXT",
@@ -51,7 +87,14 @@ class Dialect:
 MYSQL = Dialect("mysql", COLUMN_TYPES, "%s", _ROW_LIMIT)
 # SQL Server moves long variable-length values off the row, so the 65,000-byte MySQL cap does not apply.
 SQLSERVER = Dialect("sqlserver", _SQLSERVER_TYPES, "?", None)
-DIALECTS = {"mysql": MYSQL, "sqlserver": SQLSERVER}
+# SQLite keeps each database in one file, so there is no server to ask and no row size cap. The type names
+# are chosen so that reading the table back maps to the same kinds (integer, number, date, ...).
+_SQLITE_TYPES = {
+    "integer": "INTEGER", "decimal": "NUMERIC", "text": "TEXT", "long_text": "TEXT",
+    "date": "DATE", "datetime": "DATETIME", "boolean": "BOOLEAN",
+}
+SQLITE = Dialect("sqlite", _SQLITE_TYPES, "?", None)
+DIALECTS = {"mysql": MYSQL, "sqlserver": SQLSERVER, "sqlite": SQLITE}
 _LOGIN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
@@ -88,11 +131,20 @@ class DesignPlanResult:
     attempts: int = 1
 
 
+IMAGE_NOTE = (
+    "\nAn image is attached: a database diagram (ERD), a sketch of tables, or a form. Read the tables and "
+    "their columns from it and design exactly those (do not invent extra tables). Relations between tables "
+    "are not enforced here: keep each as an ordinary integer column named like the key it points to (for "
+    "example id_pelanggan). Ignore a primary key called id (it is added automatically). If the image does "
+    "not show a database design, reply with supported false and say what you see."
+)
+
+
 class DatabaseDesigner:
     def __init__(self, llm: Any, *, prefix: str, max_attempts: int = 2, dialect: Dialect = MYSQL) -> None:
         self.llm, self.prefix, self.max_attempts, self.dialect = llm, prefix, max_attempts, dialect
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, with_image: bool = False) -> str:
         return (
             "You design tables in ONE database. You never write SQL. The database may not exist yet "
             "(it is then created) or may already exist (the tables are then ADDED to it; existing tables "
@@ -100,28 +152,32 @@ class DatabaseDesigner:
             f"The database name MUST start with '{self.prefix}' and use only lowercase letters, digits "
             "and underscores. Reply with ONLY one JSON object:\n"
             '{"supported": true, "database": "' + self.prefix + 'name", "title": "...", "tables": ['
-            '{"name": "tb_x", "columns": [{"name": "col", "type": "text", "nullable": true}]}]}\n'
+            '{"name": "' + table_prefix() + 'x", "columns": [{"name": "col", "type": "text", "nullable": true}]}]}\n'
             f"Column types, only these: {sorted(COLUMN_TYPES)}. Do NOT add an id column: a numeric primary "
-            f"key named id is added automatically. At most {MAX_TABLES} tables and {MAX_COLUMNS} columns "
+            f"key named id is added automatically. At most {max_tables()} tables and {MAX_COLUMNS} columns "
             "per table (a table needs at least one column; if the user names a kind of system such as HRIS, "
             "choose the usual columns yourself). Use text only for short values; use long_text for notes"
             + (", because a row can hold about 65 short text columns" if self.dialect.row_limit else "")
+            + (f". Table names start with {table_prefix()}" if table_prefix() else "")
             + ". Table and column names are lowercase "
             "letters, digits and underscores. A database "
             "with no tables is allowed if the user asks for only the database. If the user only wants "
             "more tables in a database that exists, list just the new tables.\n"
             'If the request cannot be done: {"supported": false, "reason": "..."}.'
+            + (IMAGE_NOTE if with_image else "")
         )
 
-    def plan(self, question: str) -> DesignPlanResult:
+    def plan(self, question: str, images: Sequence[Any] = ()) -> DesignPlanResult:
+        """Design from text, and optionally from images (an ERD, a sketched table) attached to the request."""
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be non-empty text")
         question = question.strip()
-        messages = [LLMMessage("system", self._system_prompt()), LLMMessage("user", f"Request:\n{question}")]
+        messages = [LLMMessage("system", self._system_prompt(bool(images))), LLMMessage("user", f"Request:\n{question}")]
+        extra = {"images": tuple(images)} if images else {}
         errors: list[str] = []
         provider = None
         for attempt in range(1, self.max_attempts + 1):
-            response = self.llm.complete(messages, temperature=0)
+            response = self.llm.complete(messages, temperature=0, **extra)
             provider = response.provider
             try:
                 data = _extract_json(response.content)
@@ -143,15 +199,24 @@ class DatabaseDesigner:
             raise PlanValidationError(
                 f"The database name must start with '{self.prefix}' and use lowercase letters, digits and _.")
         raw_tables = data.get("tables", [])
-        if not isinstance(raw_tables, list) or len(raw_tables) > MAX_TABLES:
-            raise PlanValidationError(f"tables must be a list of at most {MAX_TABLES}.")
+        limit = max_tables()
+        if not isinstance(raw_tables, list) or len(raw_tables) > limit:
+            raise PlanValidationError(f"tables must be a list of at most {limit}.")
         tables, seen = [], set()
         for raw in raw_tables:
             if not isinstance(raw, Mapping) or set(raw) - {"name", "columns"}:
                 raise PlanValidationError('Each table must be {"name": ..., "columns": [...]}.')
             name = raw.get("name")
-            if not isinstance(name, str) or not _NAME.match(name) or name in seen:
+            if not isinstance(name, str) or not _NAME.match(name):
                 raise PlanValidationError(f"Invalid or repeated table name {name!r}.")
+            # Every table name starts with the configured prefix (tb_ by default), whatever the model (or the
+            # file) called it, on every server. An empty prefix leaves names as they are.
+            prefix = table_prefix()
+            if prefix and not name.startswith(prefix):
+                name = prefix + name
+            if not _NAME.match(name) or name in seen:
+                raise PlanValidationError(f"Invalid or repeated table name {name!r}"
+                                          + (f" (names start with {prefix})." if prefix else "."))
             seen.add(name)
             columns_raw = raw.get("columns")
             if not isinstance(columns_raw, list) or not columns_raw:
@@ -216,6 +281,17 @@ def _build_sqlserver(design: DatabaseDesign, database_exists: bool, grant_reader
     return statements
 
 
+def _build_sqlite(design: DatabaseDesign) -> list[str]:
+    """Only CREATE TABLE: the database is the file, which exists as soon as it is opened."""
+    statements = []
+    for table in design.tables:
+        columns = ['"id" INTEGER PRIMARY KEY AUTOINCREMENT']
+        columns += [f'"{c.name}" {_SQLITE_TYPES[c.type]} {"NULL" if c.nullable else "NOT NULL"}'
+                    for c in table.columns]
+        statements.append(f'CREATE TABLE "{table.name}" ({", ".join(columns)})')
+    return statements
+
+
 def build_statements(design: DatabaseDesign, *, database_exists: bool = False, dialect: Dialect = MYSQL,
                      grant_reader: str = "", grant_writer: str = "") -> list[str]:
     """CREATE statements. Every name was validated against a strict pattern and is quoted.
@@ -223,6 +299,8 @@ def build_statements(design: DatabaseDesign, *, database_exists: bool = False, d
     When the database already exists only its new tables are created: nothing existing is touched."""
     if dialect.name == "sqlserver":
         return _build_sqlserver(design, database_exists, grant_reader, grant_writer)
+    if dialect.name == "sqlite":
+        return _build_sqlite(design)
     statements = [] if database_exists else [f"CREATE DATABASE `{design.database}` CHARACTER SET utf8mb4"]
     for table in design.tables:
         columns = ["`id` INT NOT NULL AUTO_INCREMENT"]
@@ -336,6 +414,38 @@ class DatabaseCreationService:
         return {"database": design.database, "tables": [t.name for t in design.tables],
                 "profile": self.profile, "mode": mode}
 
+    def verify(self, design: DatabaseDesign) -> dict[str, Any]:
+        """Ask the server again, after the statements ran: does the database exist, with every table?
+
+        ``confirmed`` is True only when both are seen. A server that cannot be asked (or hides the
+        objects from the creator account) gives ``confirmed: False`` with the reason, never a guess.
+        """
+        sqlserver = self.dialect.name == "sqlserver"
+        try:
+            connection = self._connect()
+            try:
+                exists = bool(self._ask(
+                    connection, "SELECT name FROM sys.databases WHERE name = ?" if sqlserver
+                    else "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
+                    (design.database,)))
+                have: set[str] = set()
+                if exists and design.tables:
+                    have = {str(r[0]).lower() for r in (self._ask(
+                        connection, f"SELECT TABLE_NAME FROM [{design.database}].INFORMATION_SCHEMA.TABLES "
+                                    "WHERE TABLE_TYPE = 'BASE TABLE'") if sqlserver else self._ask(
+                        connection, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+                        (design.database,)))}
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            return {"confirmed": False, "database_found": None, "missing_tables": None,
+                    "reason": f"{type(exc).__name__}"}
+        missing = sorted(t.name for t in design.tables if t.name.lower() not in have)
+        return {"confirmed": exists and not missing, "database_found": exists, "missing_tables": missing}
+
     def audit(self, event: str, **fields: Any) -> None:
         self._audit({"event": event, **fields})
 
@@ -348,5 +458,114 @@ class DatabaseCreationService:
                 handle.write(line + "\n")
 
 
-__all__ = ["COLUMN_TYPES", "DIALECTS", "Dialect", "MYSQL", "SQLSERVER", "ColumnDef", "CreationRefused", "DatabaseCreationService", "DatabaseDesign",
+class SQLiteCreationService(DatabaseCreationService):
+    """Creating a database on SQLite: a new file ``<name>.sqlite3`` inside the data folder.
+
+    Same promises as on a server: the name must start with the prefix, nothing that exists is overwritten
+    (an existing file only gets new tables, never changed ones) and nothing is ever dropped. The file is
+    always inside ``data_root``: the name is checked against a strict pattern, so it cannot be a path.
+    All the statements run in one transaction, and a file this run created is removed if it fails."""
+
+    SUFFIX = ".sqlite3"
+
+    def __init__(self, *, designer: DatabaseDesigner, data_root: Path, profile: str, audit_path: Path,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+        super().__init__(designer=designer, connect=lambda: None, profile=profile,
+                         audit_path=audit_path, clock=clock)
+        self.data_root = Path(data_root)
+
+    def _path(self, design: DatabaseDesign) -> Path:
+        name = design.database
+        prefix = self.designer.prefix
+        if (not re.fullmatch(r"[a-z][a-z0-9_]{1,56}", name) or not name.startswith(prefix)
+                or name == prefix):
+            raise CreationRefused(f"The database name must start with '{prefix}' and have a name after it.")
+        return self.data_root / f"{name}{self.SUFFIX}"
+
+    @staticmethod
+    def _tables(path: Path) -> set[str]:
+        import sqlite3
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10)
+        try:
+            return {str(r[0]).lower() for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")}
+        finally:
+            connection.close()
+
+    def _plan(self, design: DatabaseDesign) -> tuple[str, list[str]]:
+        path = self._path(design)
+        if not path.exists():
+            return "create_database", build_statements(design, dialect=self.dialect)
+        if not design.tables:
+            raise CreationRefused(f"A database named '{design.database}' already exists and no tables were "
+                                  "asked for; nothing is overwritten. Ask for tables to add, or choose another name.")
+        try:
+            have = self._tables(path)
+        except Exception as exc:
+            raise CreationRefused(f"The file of '{design.database}' cannot be opened as a SQLite database; "
+                                  "choose another name.") from exc
+        clash = sorted(t.name for t in design.tables if t.name.lower() in have)
+        if clash:
+            raise CreationRefused(
+                f"The database '{design.database}' already has the table(s) {', '.join(clash)}; existing tables "
+                "are never changed. Use other table names.")
+        return "add_tables", build_statements(design, dialect=self.dialect)
+
+    def preview(self, design: DatabaseDesign) -> tuple[str, list[str]]:
+        return self._plan(design)
+
+    def execute(self, design: DatabaseDesign, *, actor: str, plan_id: str, question: str) -> dict[str, Any]:
+        import sqlite3
+        record: dict[str, Any] = {"plan_id": plan_id, "actor": actor, "database": design.database,
+                                  "tables": [t.name for t in design.tables], "profile": self.profile,
+                                  "question": question[:500]}
+        path = self._path(design)
+        made_file = False
+        done = 0
+        try:
+            mode, statements = self._plan(design)          # re-checked: things may have changed
+            record.update(mode=mode, statements=statements)
+            made_file = not path.exists()
+            connection = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for sql in statements:                      # SQLite DDL is transactional: all or nothing
+                    connection.execute(sql)
+                    done += 1
+                connection.execute("COMMIT")
+            except BaseException:
+                try:
+                    connection.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                connection.close()
+        except Exception as exc:
+            if made_file:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            record.update(status="failed", statements_done=done, reason=f"{type(exc).__name__}: {exc}"[:300])
+            self._audit(record)
+            raise
+        record.update(status="created", statements_done=done)
+        self._audit(record)
+        return {"database": design.database, "tables": [t.name for t in design.tables],
+                "profile": self.profile, "mode": mode}
+
+    def verify(self, design: DatabaseDesign) -> dict[str, Any]:
+        try:
+            path = self._path(design)
+            exists = path.is_file()
+            have = self._tables(path) if exists and design.tables else set()
+        except Exception as exc:
+            return {"confirmed": False, "database_found": None, "missing_tables": None,
+                    "reason": f"{type(exc).__name__}"}
+        missing = sorted(t.name for t in design.tables if t.name.lower() not in have)
+        return {"confirmed": exists and not missing, "database_found": exists, "missing_tables": missing}
+
+
+__all__ = ["COLUMN_TYPES", "DIALECTS", "Dialect", "MYSQL", "SQLITE", "SQLSERVER", "SQLiteCreationService", "ColumnDef", "CreationRefused", "DatabaseCreationService", "DatabaseDesign",
            "DatabaseDesigner", "DesignPlanResult", "TableDef", "build_statements"]

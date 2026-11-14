@@ -1,11 +1,17 @@
 # hAI Agent
 
-hAI Agent adalah project eksperimen untuk membangun agen AI modular dengan kemampuan persepsi, penalaran, perencanaan, eksekusi aksi, memori, pembelajaran, refleksi, dan metakognisi. Project ini menyediakan library Python, API HTTP berbasis FastAPI, serta dashboard React untuk mencoba pipeline kognitif dan simulasi lingkungan.
+hAI Agent adalah **platform AI Agent otonom umum**. Pengguna menyatakan tujuan dalam bahasa natural; agen menafsirkan, merencanakan, menjalankan tindakan yang diizinkan kebijakan, memverifikasi hasil, dan menjelaskan apa yang berhasil, gagal, atau belum selesai.
 
-> Status project: eksperimental. Banyak kemampuan tersedia sebagai modul yang dapat dirangkai; tidak semuanya aktif otomatis pada setiap request.
+Platform ini disusun sebagai **pondasi bersama + fitur agent**:
+
+- **Pondasi**: kognisi (interpretasi, penalaran, perencanaan), memori dan pembelajaran, registry kapabilitas tepercaya, kebijakan risiko dan approval, autentikasi/otorisasi (Keycloak), audit/trace, idempotency, dan pemulihan.
+- **Fitur agent**: modul yang memakai pondasi itu untuk satu bidang pekerjaan. Fitur pertama dan satu-satunya yang sudah berfungsi di dunia nyata adalah **Database Agent**. Fitur lain direncanakan dan akan dibangun di atas pondasi yang sama.
+
+> Status: **pra-produksi, dalam pengembangan aktif**. Rincian cakupan terverifikasi dan celah yang diketahui ada di [Product Contract](docs/product/PRODUCT_CONTRACT_V0.1.md). Jangan menganggap sistem ini siap produksi.
 
 ## Daftar isi
 
+- [Status fitur](#status-fitur)
 - [Gambaran sistem](#gambaran-sistem)
 - [Struktur direktori](#struktur-direktori)
 - [Prasyarat](#prasyarat)
@@ -16,28 +22,57 @@ hAI Agent adalah project eksperimen untuk membangun agen AI modular dengan kemam
 - [Menjalankan pengujian](#menjalankan-pengujian)
 - [Penyimpanan dan data eksperimen](#penyimpanan-dan-data-eksperimen)
 - [Pengembangan](#pengembangan)
+- [Roadmap](#roadmap)
+- [Dokumentasi lain](#dokumentasi-lain)
+
+## Status fitur
+
+| Bagian | Status | Keterangan |
+| --- | --- | --- |
+| **Database Agent: Laporan** | Berfungsi | Laporan tabel dari bahasa natural dalam dua fase (rencana untuk ditinjau, lalu dijalankan). LLM tidak pernah menulis SQL. Mendukung filter, perbandingan, daftar baris, dan join pada relasi yang disetujui. Keluaran Excel, PDF, CSV, HTML. |
+| **Database Agent: Ubah data** | Berfungsi | Insert/update/delete dengan akun penulis terpisah, pratinjau, batas baris, login ulang, dan approver kedua (self-approval opsional, default mati). |
+| **Database Agent: Buat database** | Berfungsi | Membuat database/tabel baru (prefix wajib) atau menambah tabel ke database yang ada. |
+| Engine database | MySQL, PostgreSQL, SQL Server, SQLite | Tes langsung ke server nyata bersifat opt-in (lihat [Menjalankan pengujian](#menjalankan-pengujian)). |
+| Pondasi kognitif | Berfungsi, teruji di simulasi | Orchestrator LLM, memori, pembelajaran, replanning adaptif, telemetry. Bukti benchmark hanya pada fixture simulasi Room. |
+| Keamanan | Berfungsi | Keycloak (JWT/JWKS), otorisasi per peran, audit, approval berlapis. |
+| Pengujian otonom | Berfungsi | Skenario, injeksi kegagalan, dan evaluasi pemulihan (halaman *Autonomous Testing*). |
+| Riwayat tugas (menu *Riwayat tugas*) | Berfungsi | Daftar tugas milik Anda dari semua fitur di pipeline platform (laporan, ubah data), dengan status, verifikasi, jejak audit, dan unduhan berkas laporan. Hanya membaca; tugas dibuat dan dilanjutkan di halaman fiturnya. |
+| Siklus tugas terpadu di UI | **Sebagian** | Riwayat sudah terpadu. Membuat, menyetujui, dan menjalankan masih di halaman tiap fitur; buat database belum memakai pipeline. |
+| Tugas persisten, penjadwal, pemicu | **Belum** | Agen belum bekerja sendiri tanpa permintaan pengguna. |
+| Kontrak "fitur agent" yang baku | **Belum** | Fitur baru belum punya cara standar untuk mendaftarkan diri ke pondasi. |
+| Fitur agent lain (berkas, HTTP/API, email, dan sebagainya) | **Belum** | Direncanakan. |
+| Kebijakan versi API/SDK publik | **Belum** | |
+| Paket deploy (Docker) | **Belum** | Hanya ada compose untuk Keycloak. |
+
+Lihat [roadmap](#roadmap) untuk urutan pengerjaan.
 
 ## Gambaran sistem
 
 ```text
 Dashboard React (frontend/)
-        │ HTTP
+        │ HTTP (token Keycloak)
         ▼
-FastAPI (api/)
-   ├── Cognitive runtime ── Orchestrator ── LLMService ── OpenCode CLI
+FastAPI (api/)  ── autentikasi, otorisasi, audit
+   ├── Fitur: Database Agent ── laporan / ubah data / buat database
+   │       └── engine MySQL · PostgreSQL · SQL Server · SQLite
+   ├── Cognitive runtime ── Orchestrator ── LLMService ── provider LLM
    │       └── Agent: kognisi, memori, pembelajaran, refleksi
    ├── Execution runtime ── Agent + RoomEnvironment (simulasi lokal)
-   └── Capability telemetry
+   ├── Registry & siklus hidup kapabilitas (usul → approval → aktif)
+   └── Telemetry kapabilitas, strategi, autonomous testing
 ```
 
-Ada dua runtime backend yang sengaja dipisahkan:
+Prinsip yang dijaga di seluruh platform:
 
-1. **Cognitive runtime** menyusun siklus interpretasi, penalaran, dan perencanaan melalui `CognitiveOrchestrator`, lalu menjalankannya dalam konteks `AgentCognitiveRuntime`. Provider LLM yang disiapkan saat ini adalah `OpenCodeProvider`, yang memanggil OpenCode CLI.
-2. **Execution runtime** menjalankan aksi yang diminta secara eksplisit di `RoomEnvironment`. Aksi dibatasi pada allowlist (`open_box`, `take_key`, `find_spare_key`, `unlock_door`) dan state simulasi berjalan di memori proses.
+1. **Kognisi dan eksekusi terpisah.** Endpoint kognitif hanya menghasilkan interpretasi/rencana dan **tidak mengeksekusi** rencana itu.
+2. **Otonomi yang diawasi.** Tindakan berisiko hanya berjalan dengan approval yang sah; kegagalan pemeriksaan otorisasi berarti ditolak (*fail closed*).
+3. **LLM tidak menulis SQL atau perintah mentah.** LLM mengusulkan rencana terstruktur; backend memvalidasi dan menjalankannya.
+4. **Rencana bukan bukti hasil.** Keberhasilan hanya dinyatakan jika diverifikasi dari state yang teramati.
+5. **Jujur soal cakupan.** Bukti simulasi tidak diklaim sebagai bukti kinerja dunia nyata.
 
-Endpoint kognitif hanya menghasilkan hasil kognitif/rencana; endpoint tersebut **tidak mengeksekusi rencana**. Untuk simulasi aksi, gunakan endpoint execution. Simulasi bukan konektor ke perangkat atau lingkungan eksternal.
+Simulasi Room (`open_box`, `take_key`, `find_spare_key`, `unlock_door`) adalah lingkungan contoh dan lahan uji pondasi, bukan konektor ke perangkat atau layanan eksternal. Statenya berjalan di memori proses.
 
-Dashboard saat ini menyediakan input request kognitif, ringkasan hasil/trace, telemetry kapabilitas, serta kontrol simulasi. Base URL API dapat diatur lewat `VITE_API_BASE_URL`.
+Provider LLM dipilih lewat `HAI_LLM_PROVIDER` (`auto` mencoba OpenCode CLI dulu, lalu Claude Code sebagai cadangan); lihat [manual instalasi](docs/INSTALLATION.md).
 
 ## Struktur direktori
 
@@ -48,18 +83,26 @@ Dashboard saat ini menyediakan input request kognitif, ringkasan hasil/trace, te
 | `src/agent/llm/` | Layanan/provider LLM, interpretasi, reasoning, planning, orchestrator, dan runtime integrasi. |
 | `src/agent/memory/` | Working, episodic, semantic, causal, procedural, reflection, dan strategy memory beserta persistence. |
 | `src/agent/learning/` | Pembelajaran strategi/kausal, adaptasi, telemetry, self-awareness, reflection, dan metacognition. |
-| `src/agent/world/` | Model lingkungan dan simulasi ruangan. |
+| `src/agent/world/` | Model lingkungan dan simulasi ruangan (Room). |
 | `src/agent/tools/` | Sistem aksi dan tool untuk lingkungan. |
-| `api/` | FastAPI app, schema, dependency factory, runtime simulasi, dan routes. |
-| `frontend/` | React + Vite dashboard. |
-| `tests/` | Pengujian unit, integrasi, API, runtime, memori, dan pembelajaran. |
-| `experiments/`, `data/` | Materi eksperimen dan data lokal. File database lokal pada `data/*.db` tidak dilacak Git. |
+| `src/agent/database/` | Manajer koneksi, deteksi, skema, dan gateway kapabilitas database. |
+| `src/agent/workflow/` | Alur kerja Database Agent: rencana laporan, agregasi, perubahan data, pembuatan database, dan renderer (Excel/PDF/CSV/HTML). |
+| `src/agent/autonomous_testing/` | Generator skenario, injeksi kegagalan, pemulihan, dan evaluator. |
+| `api/` | FastAPI app, schema, dependency factory, keamanan (`api/security/`), engine database, dan routes. |
+| `frontend/` | React + Vite dashboard (Dashboard, Database Agent, Strategy Lab, Autonomous Testing). |
+| `docs/` | Manual instalasi, panduan fitur, dan [Product Contract](docs/product/PRODUCT_CONTRACT_V0.1.md). |
+| `keycloak/`, `docker-compose.keycloak.yml` | Konfigurasi realm dan compose Keycloak untuk pengembangan. |
+| `scripts/` | Skrip operasional (setup akun database, diagnosa, Keycloak) dan skrip benchmark `step41_*`. |
+| `tests/` | Pengujian unit, integrasi, API, runtime, engine database, memori, dan pembelajaran. |
+| `experiments/`, `data/` | Materi eksperimen historis dan data lokal. File database lokal di `data/` tidak dilacak Git. |
 
 ## Prasyarat
 
 - Python **3.10.11 atau lebih baru**.
 - Node.js dan npm untuk menjalankan dashboard.
-- OpenCode CLI yang sudah terpasang dan dikonfigurasi jika ingin memakai endpoint kognitif dengan provider LLM nyata. Simulasi execution tidak memerlukan provider LLM.
+- Keycloak (compose tersedia) untuk autentikasi; lihat [manual instalasi](docs/INSTALLATION.md).
+- OpenCode CLI dan/atau Claude Code CLI untuk provider LLM. Simulasi execution tidak memerlukan LLM.
+- Driver database opsional sesuai engine: `.[mysql]`, `.[postgresql]`, `.[sqlserver]` (SQL Server juga butuh ODBC Driver 17/18).
 
 ## Instalasi
 
@@ -102,6 +145,10 @@ Backend membaca konfigurasi dari environment. Uvicorn dapat memuat file `.env` d
 | `OPENCODE_CWD` | Direktori kerja proses | Direktori kerja untuk proses OpenCode. |
 | `OPENCODE_TIMEOUT` | `120` | Batas waktu provider dalam detik; harus angka positif. |
 | `HAI_AGENT_NAME` | `hAI` | Nama agent kognitif. |
+| `HAI_LLM_PROVIDER` | `auto` | Pemilihan provider LLM (`auto` = OpenCode lalu Claude Code). |
+| `HAI_AUTH_ENABLED`, `HAI_AUTH_REQUIRED`, `HAI_KEYCLOAK_*` | - | Autentikasi Keycloak; lihat manual instalasi. |
+| `HAI_DATABASE_ROOT`, `HAI_DATABASE_PROFILES`, `HAI_DATABASE_WORK_DIR` | - | Lokasi database SQLite, profil server database, dan folder kerja Database Agent. |
+| `HAI_DATA_CHANGE_APPROVAL`, `HAI_DATA_CHANGE_SELF_APPROVAL`, `HAI_DATA_CHANGE_MAX_ROWS`, `HAI_STEPUP_MAX_AGE_SECONDS` | - | Kebijakan approval dan batas perubahan data. Self-approval default mati. |
 | `CORS_ORIGINS` | `http://127.0.0.1:5173,http://localhost:5173` | Daftar origin frontend yang dipisahkan koma. |
 | `VITE_API_BASE_URL` | `http://127.0.0.1:8000` | Base URL backend yang dibaca saat Vite berjalan/build. Atur di `frontend/.env`. |
 
@@ -133,14 +180,25 @@ Vite menampilkan URL dashboard di terminal (umumnya `http://127.0.0.1:5173`). Ba
 
 Semua route versi berada di prefix `/api/v1`.
 
-| Method | Path | Fungsi |
-| --- | --- | --- |
-| `POST` | `/api/v1/cognitive/run` | Menjalankan satu siklus kognitif dan mengembalikan hasil serta trace opsional. Tidak mengeksekusi rencana. |
-| `GET` | `/api/v1/execution/state` | Membaca state simulasi dan daftar aksi yang diizinkan. |
-| `POST` | `/api/v1/execution/run` | Menjalankan satu atau beberapa aksi allowlist secara berurutan pada simulasi. |
-| `POST` | `/api/v1/execution/reset` | Mengembalikan state simulasi ke awal; telemetry historis runtime tetap tersimpan selama proses hidup. |
-| `GET` | `/api/v1/telemetry/capabilities?limit=20` | Membaca snapshot dan event telemetry kapabilitas. `limit` bernilai 1–100. |
-| `GET` | `/health` | Memeriksa bahwa aplikasi API hidup. |
+Referensi interaktif lengkap ada di `/docs` saat backend berjalan. Ringkasan per kelompok:
+
+| Kelompok (prefix `/api/v1`) | Fungsi |
+| --- | --- |
+| `/cognitive/run` | Satu siklus kognitif (interpretasi, penalaran, rencana). **Tidak mengeksekusi** rencana. |
+| `/execution/*` | Simulasi Room: `state`, `run`, `plan-run` (rencana + eksekusi + verifikasi, idempotent), `reset`, `reconcile`. |
+| `/table-reports/*` | Database Agent, laporan: buat rencana, jalankan, unduh berkas, batalkan. |
+| `/data-changes/*` | Database Agent, ubah data: rencana, jalankan, antrean approval (`approve`/`reject`). |
+| `/database-creation/*` | Database Agent, buat database/tabel: rencana dan jalankan. |
+| `/database-connections/*` | Profil dan server database: hubungkan, setujui tabel/kolom, segarkan, hapus. |
+| `/database-onboarding/*`, `/database-engine-requests/*` | Allowlist awal dan tiket permintaan engine baru. |
+| `/capability-proposals/*`, `/capabilities/*` | Siklus hidup kapabilitas: usul, approval, aktivasi, nonaktif, cabut. |
+| `/capability-reads`, `/trusted-capability-invocations` | Eksekusi kapabilitas tepercaya lewat gateway. |
+| `/tasks`, `/tasks/{id}` | Riwayat tugas Anda sendiri (filter `waiting`, `running`, `done`, `problem`) dan rincian dengan jejak audit. |
+| `/autonomous-testing/*` | Batch pengujian otonom dan rekonsiliasinya. |
+| `/telemetry/capabilities`, `/strategies` | Telemetry kapabilitas dan informasi strategi. |
+| `GET /health` (tanpa prefix) | Pemeriksaan hidup. |
+
+Sebagian besar endpoint memerlukan token Keycloak dengan peran yang sesuai.
 
 Contoh request kognitif minimal:
 
@@ -180,7 +238,18 @@ Atau jalankan tes API/simulasi saja:
 pytest -q tests/test_api.py tests/test_api_execution.py tests/test_api_telemetry.py
 ```
 
-Tes API umumnya menggunakan runtime tiruan untuk menghindari kebutuhan provider LLM eksternal. Tes provider/runtime yang memanggil OpenCode dapat memiliki kebutuhan konfigurasi berbeda.
+Tes API umumnya menggunakan runtime tiruan agar tidak butuh provider LLM eksternal. Pada pemeriksaan terakhir seluruh suite menghasilkan **5220 lulus, 82 dilewati, 0 gagal** (sekitar 6 menit).
+
+Tes yang dilewati adalah tes integrasi *opt-in* yang butuh server nyata dan otomatis aktif jika variabel lingkungannya diisi (CI menjalankan MySQL dan PostgreSQL):
+
+| Variabel | Mengaktifkan |
+| --- | --- |
+| `HAI_MYSQL_TEST_PORT` (+ `HAI_MYSQL_TEST_ROOT_PASSWORD`) | Tes MySQL langsung |
+| `HAI_PG_TEST_PORT` (+ `HAI_PG_TEST_ADMIN_PASSWORD`) | Tes PostgreSQL langsung |
+| `HAI_SQLSERVER_TEST_SERVER` | Tes SQL Server langsung (belum ada di CI) |
+| `HAI_RUN_LIVE_LLM_TESTS=1` | Tes yang memanggil Claude sungguhan |
+
+Untuk tes laporan Excel/PDF pasang juga `openpyxl` dan `pypdf`. Tes frontend di `frontend/`: `npm test` (unit) dan `npm run test:e2e` (Playwright).
 
 ## Penyimpanan dan data eksperimen
 
@@ -190,10 +259,25 @@ Direktori `data/` berisi database eksperimen lokal. `.gitignore` mengecualikan `
 
 ## Pengembangan
 
-- Tambahkan kemampuan inti pada package yang sesuai di `src/agent/`, lalu integrasikan melalui runtime/orchestrator seperlunya.
-- Route API didefinisikan di `api/routes/`, schema request/response di `api/schemas.py`, dan runtime dependency dibuat di `api/dependencies.py` atau `api/execution_runtime.py`.
-- Komponen dashboard dan helper request berada di `frontend/src/`.
-- Nama aksi simulasi yang dapat dieksekusi didefinisikan pada `api/execution_runtime.py`; pertahankan validasi allowlist saat menambah aksi.
-- Untuk perubahan API, perbarui tes terkait di `tests/` dan contoh dokumentasi ini bila kontraknya berubah.
+- Kemampuan inti ditambahkan pada package yang sesuai di `src/agent/`, lalu diintegrasikan lewat runtime/orchestrator.
+- Fitur agent baru harus memakai pondasi yang ada (registry kapabilitas, kebijakan risiko/approval, trace, autentikasi) dan tidak membuat jalur eksekusi sendiri di luar itu. Kontrak baku untuk fitur agent sedang disusun (lihat roadmap).
+- Route API ada di `api/routes/`, schema di `api/schemas.py`, dan dependency/runtime di `api/dependencies.py` serta `api/execution_runtime.py`.
+- Engine database baru: ikuti [docs/ADDING_A_DATABASE_ENGINE.md](docs/ADDING_A_DATABASE_ENGINE.md) dan jalankan suite konformansi bersama.
+- Aksi simulasi Room didefinisikan di `api/execution_runtime.py`; pertahankan validasi allowlist.
+- Setiap perubahan perilaku disertai tes di `tests/`. CI (`.github/workflows/ci.yml`) menjalankan tes backend, engine database, dan frontend pada setiap pull request.
+- Skrip sekali pakai, cadangan lokal, dan hasil audit tidak dilacak Git (lihat `.gitignore`).
 
-Dokumentasi pendukung: [README_API.md](README_API.md) dan [frontend/README.md](frontend/README.md).
+## Roadmap
+
+1. **Fase 0 - Penyelarasan**: dokumentasi mengikuti arah platform, repo dirapikan, tes yang dilewati ditinjau.
+2. **Fase 1 - Kontrak fitur**: kontrak baku "fitur agent" dan pemetaan seluruh jalur Database Agent ke pondasi umum; paket diatur ulang (inti, fitur, lingkungan).
+3. **Fase 2 - Lapisan otonom**: tugas persisten dengan status siklus hidup, penjadwal/pemicu, verifikator hasil dan idempotency di jalur eksekusi umum, UI terpadu.
+4. **Fase 3 - Fitur kedua**: membuktikan pondasi dengan fitur yang sifatnya berbeda dari database, plus router yang memilih fitur dari permintaan natural.
+5. **Fase 4 - Pengerasan**: paket deploy, penyimpanan state bersama, kebijakan versi API, evaluasi di tugas nyata.
+
+## Dokumentasi lain
+
+- [Product Contract](docs/product/PRODUCT_CONTRACT_V0.1.md): cakupan terverifikasi, prinsip, kriteria akseptasi, dan celah.
+- [Manual instalasi](docs/INSTALLATION.md) dan [mencoba Database Agent secara lokal](docs/TRY_DATA_REPORTS_LOCALLY.md).
+- [Menambah engine database](docs/ADDING_A_DATABASE_ENGINE.md).
+- [README_API.md](README_API.md) (catatan awal API kognitif) dan [frontend/README.md](frontend/README.md).

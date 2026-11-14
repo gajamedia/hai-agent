@@ -122,24 +122,120 @@ def map_sqlserver_type(declared: str) -> str:
 
 
 # ------------------------------------------------------------------ SQLite
+@dataclass(frozen=True)
+class SQLiteProfile:
+    """What SQLite offers in place of a server profile: the prefix of the databases this application may create."""
+    name: str
+    creator_prefix: str = "hai_"
+    type: str = "sqlite"
+    user: str = ""
+    writer_user: str = ""
+
+
 class SQLiteEngine:
     kind = "sqlite"
     paramstyle = "qmark"
     quote = "`"  # backticks: SQLite never reinterprets them as string literals
     map_type = staticmethod(map_sqlite_type)
 
-    def __init__(self, data_root: Path) -> None:
+    # SQLite has no SELECT ... FOR UPDATE: a writer holds the file's single write lock while it commits.
+    lock_clause = ""
+    # The one "profile" this engine offers when writing is switched on (see ``write_enabled``).
+    PROFILE = "sqlite"
+    PREFIX = "hai_"
+    SUFFIX = ".sqlite3"
+
+    def __init__(self, data_root: Path, *, write_enabled: bool | None = None) -> None:
         self.data_root = data_root
+        self._write_enabled = write_enabled
+
+    # ---- writing is opt-in: HAI_SQLITE_WRITE=true (read live, so a change needs no restart) ----------------
+    @property
+    def write_enabled(self) -> bool:
+        if self._write_enabled is not None:
+            return self._write_enabled
+        return os.environ.get("HAI_SQLITE_WRITE", "").strip().lower() in {"1", "true", "yes"}
+
+    @property
+    def profiles(self) -> dict[str, "SQLiteProfile"]:
+        """Offered to the Buat database page and the connection form only while writing is on."""
+        return {self.PROFILE: SQLiteProfile(self.PROFILE, creator_prefix=self.PREFIX)} if self.write_enabled else {}
 
     def describe_source(self, source: str) -> str:
         return source
 
+    def _file(self, source: str) -> Path:
+        """The file a source names: ``toko.sqlite3``, or ``sqlite/hai_toko`` for a database this application made."""
+        from api.database_runtime_registry import resolve_in_root  # avoids an import cycle at load
+        if not isinstance(source, str):
+            return resolve_in_root(self.data_root, source)          # refuses it with its usual message
+        head, _, database = source.partition("/")
+        if head == self.PROFILE and database and "/" not in database and not database.lower().endswith(
+                (".db", ".sqlite", ".sqlite3")):
+            if not (database.startswith(self.PREFIX) and database != self.PREFIX) and not any_database_allowed():
+                raise EngineError(f"only databases named '{self.PREFIX}...' can be chosen here")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", database):
+                raise EngineError("the database name may only use letters, digits and _")
+            source = f"{database}{self.SUFFIX}"
+        return resolve_in_root(self.data_root, source)
+
     def open(self, manager: ConnectionManager, name: str, source: str, auth_ref: str):
-        from api.database_runtime_registry import resolve_in_root  # avoids import cycle at load
         register_sqlite_read_only_profile(
-            manager, profile_name=name, database_path=resolve_in_root(self.data_root, source),
-            authorization_ref=auth_ref)
+            manager, profile_name=name, database_path=self._file(source), authorization_ref=auth_ref)
         return discover_sqlite_schema(manager, profile_name=name), []
+
+    # ---- what is there to choose from --------------------------------------------------------------------
+    MAX_LISTED_FILES = 200
+
+    def list_files(self) -> list[str]:
+        """SQLite files in the data folder (relative names, at most MAX_LISTED_FILES), nothing outside it."""
+        root = Path(self.data_root)
+        found: list[str] = []
+        for path in sorted(root.rglob("*")):
+            if (path.suffix.lower() in {".db", ".sqlite", ".sqlite3"} and path.is_file()
+                    and not path.is_symlink()):
+                found.append(path.relative_to(root).as_posix())
+                if len(found) >= self.MAX_LISTED_FILES:
+                    break
+        return found
+
+    def list_databases(self, name: str) -> list[dict[str, Any]]:
+        """The databases this application made here (``hai_*.sqlite3``), for the ``sqlite`` profile."""
+        if name != self.PROFILE or not self.write_enabled:
+            raise EngineError("unknown database profile")
+        return [{"name": Path(f).stem, "allowed": True, "default": False}
+                for f in self.list_files() if "/" not in f and Path(f).stem.startswith(self.PREFIX)
+                and Path(f).suffix.lower() == self.SUFFIX]
+
+    # ---- creating and changing data (only while writing is on) -----------------------------------------
+    def has_creator(self, name: str) -> bool:
+        return self.write_enabled and name == self.PROFILE
+
+    def has_writer(self, source: str) -> bool:
+        """Data may be changed in a file this application made (name starts with ``hai_``); any other file
+        only when HAI_ALLOW_ANY_DATABASE_NAME is on. The reader connections are never used for writing."""
+        if not self.write_enabled:
+            return False
+        from api.database_runtime_registry import RegistryError
+        try:
+            path = self._file(source)
+        except (EngineError, RegistryError):
+            return False
+        return path.stem.startswith(self.PREFIX) or any_database_allowed()
+
+    def open_writer(self, source: str):
+        """A function opening read-write connections to the file. The reader stays read-only."""
+        if not self.has_writer(source):
+            raise EngineError("changing data is not enabled for this SQLite database")
+        path = self._file(source)
+
+        def factory():
+            import sqlite3
+            connection = sqlite3.connect(str(path), timeout=10)
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+
+        return factory
 
 
 # ---------------------------------------------------------------- PostgreSQL
@@ -351,6 +447,13 @@ class PostgresEngine:
     def describe_source(self, source: str) -> str:
         return source
 
+    def list_databases(self, name: str) -> list[dict[str, Any]]:
+        """A PostgreSQL profile is one database, so that is the whole list."""
+        profile = self.profiles.get(name)
+        if profile is None:
+            raise EngineError("unknown database profile")
+        return [{"name": profile.database, "allowed": True, "default": True}]
+
     def open(self, manager: ConnectionManager, name: str, source: str, auth_ref: str):
         profile = self.profiles.get(source)
         if profile is None:
@@ -545,11 +648,13 @@ _ANY_DB_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
 
 def any_database_allowed() -> bool:
-    """HAI_ALLOW_ANY_DATABASE_NAME=true: READING may name any database on a server profile (default off).
+    """HAI_ALLOW_ANY_DATABASE_NAME=true: reading AND changing data may name any database on a server profile
+    (default off).
 
-    Meant for databases this application did not create. Only the read-only account ever connects to
-    such a database: it is still checked to hold SELECT and nothing more, and the server decides what it
-    can see. Writing and creating stay limited to the profile's own database and the creator prefix.
+    Meant for databases this application did not create. The read-only account is still checked to hold
+    SELECT and nothing more. Changing data uses the profile's separate writer account, which is still checked
+    to hold only SELECT/INSERT/UPDATE/DELETE, so the server's own grants decide which databases it can change.
+    Only creating databases stays limited to the creator prefix.
     """
     return os.environ.get("HAI_ALLOW_ANY_DATABASE_NAME", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -559,9 +664,22 @@ def _resolve_database(profile, database: str, *, for_write: bool):
     if (profile.creator_user and _DB_OVERRIDE.match(database)
             and database.startswith(profile.creator_prefix) and database != profile.creator_prefix):
         return replace(profile, database=database)
-    if not for_write and any_database_allowed() and _ANY_DB_NAME.match(database):
+    if any_database_allowed() and _ANY_DB_NAME.match(database):
         return replace(profile, database=database)
     raise EngineError(f"only databases named '{profile.creator_prefix}...' can be chosen on this profile")
+
+
+def _database_choices(profile, names: list[str]) -> list[dict[str, Any]]:
+    """Mark each database a server shows: its own (the profile's default), prefixed ones the application made,
+    and, only when HAI_ALLOW_ANY_DATABASE_NAME is on, any other. The rest are listed but cannot be picked."""
+    out = []
+    for database in names:
+        default = database == profile.database
+        allowed = (default or (bool(profile.creator_user) and database.startswith(profile.creator_prefix)
+                               and database != profile.creator_prefix and bool(_DB_OVERRIDE.match(database)))
+                   or (any_database_allowed() and bool(_ANY_DB_NAME.match(database))))
+        out.append({"name": database, "allowed": allowed, "default": default})
+    return out
 
 
 class MySQLEngine:
@@ -637,6 +755,33 @@ class MySQLEngine:
         except EngineError:
             return False        # a database chosen only for reading never gets a writer
         return bool(profile and profile.writer_user and profile.writer_password_env)
+
+    def list_databases(self, name: str) -> list[dict[str, Any]]:
+        """The databases the profile's READ-ONLY account can see (never the system ones), each with whether this
+        application may connect it: the profile's own database, one with the creator prefix, or any when allowed."""
+        profile = self.profiles.get(name)
+        if profile is None:
+            raise EngineError("unknown database profile")
+        if not os.environ.get(profile.password_env):
+            raise EngineError(f"environment variable {profile.password_env} is not set")
+        connect = self._connect
+        if connect is None:
+            import pymysql
+            connect = pymysql.connect
+        tls: dict[str, Any] = {}
+        if profile.ssl == "require":
+            tls = {"ssl": {"check_hostname": False}, "ssl_verify_cert": False}
+        elif profile.ssl == "verify":
+            tls = {"ssl": {}, "ssl_verify_cert": True, "ssl_verify_identity": True}
+        connection = connect(host=profile.host, port=profile.port, user=profile.user,
+                             password=os.environ.get(profile.password_env, ""), database=profile.database,
+                             connect_timeout=5, read_timeout=10, write_timeout=10, charset="utf8mb4", **tls)
+        try:
+            rows = PostgresEngine._rows(connection, "SHOW DATABASES")
+        finally:
+            connection.close()
+        system = {"information_schema", "mysql", "performance_schema", "sys"}
+        return _database_choices(profile, sorted(str(r[0]) for r in rows if str(r[0]).lower() not in system))
 
     def has_creator(self, name: str) -> bool:
         profile = self.profiles.get(name)
@@ -867,6 +1012,24 @@ class SQLServerEngine:
         except EngineError:
             return False        # a database chosen only for reading never gets a writer
         return bool(profile and profile.writer_user and profile.writer_password_env)
+
+    def list_databases(self, name: str) -> list[dict[str, Any]]:
+        """The databases the profile's READ-ONLY login can see (never the system ones), each with whether this
+        application may connect it: the profile's own database, one with the creator prefix, or any when allowed."""
+        profile = self.profiles.get(name)
+        if profile is None:
+            raise EngineError("unknown database profile")
+        if not os.environ.get(profile.password_env):
+            raise EngineError(f"environment variable {profile.password_env} is not set")
+        connect, driver = self._driver(profile)
+        connection = connect(self._connection_string(profile, driver), timeout=5)
+        try:
+            rows = PostgresEngine._rows(
+                connection, "SELECT name FROM sys.databases WHERE database_id > 4 AND HAS_DBACCESS(name) = 1 "
+                            "ORDER BY name")
+        finally:
+            connection.close()
+        return _database_choices(profile, [str(r[0]) for r in rows])
 
     # SELECT TOP (n) ... FROM [t] WITH (UPDLOCK, ROWLOCK): the rows the change will touch stay locked
     lock_clause = " WITH (UPDLOCK, ROWLOCK)"

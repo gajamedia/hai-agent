@@ -90,6 +90,7 @@ class _AsUser:
 def world(tmp_path, monkeypatch):
     monkeypatch.delenv("HAI_DATA_CHANGE_APPROVAL", raising=False)
     monkeypatch.delenv("HAI_DATA_CHANGE_MAX_ROWS", raising=False)
+    monkeypatch.setenv("HAI_AUDIT_DETAIL", "full")
     data = tmp_path / "data"
     data.mkdir()
     _make_db(data / "sales.sqlite3", _sample_rows(30))
