@@ -14,6 +14,7 @@ from agent.llm.contracts import (
 )
 import logging
 import time
+from agent.llm.image_files import image_files
 from agent.llm.process_runner import run_cli, sanitized_environment
 
 
@@ -316,12 +317,21 @@ class OpenCodeProvider:
         self,
         request: LLMRequest,
     ) -> LLMResponse:
+        # Images are attached with --file from a private temporary folder that is removed afterwards.
+        with image_files(request.images) as (_folder, paths):
+            return self._complete(request, paths)
+
+    def _complete(
+        self,
+        request: LLMRequest,
+        image_paths: Sequence[Path] = (),
+    ) -> LLMResponse:
         if not request.messages:
             raise OpenCodeResponseParseError(
                 "At least one LLM message is required."
             )
 
-        command = self.build_command(request)
+        command = self.build_command(request, image_paths)
 
         # try:
         #     result = self._run_command(command)
@@ -429,6 +439,7 @@ class OpenCodeProvider:
     def build_command(
         self,
         request: LLMRequest,
+        image_paths: Sequence[str | Path] = (),
     ) -> list[str]:
         prompt = self._render_messages(
             request.messages
@@ -476,6 +487,8 @@ class OpenCodeProvider:
         if self.auto_approve:
             command.append("--auto")
 
+        # An image is attached as --file=<path>: the "=" form cannot swallow the prompt that follows.
+        command.extend(f"--file={path}" for path in image_paths)
         for file_path in self.files:
             command.extend(
                 [

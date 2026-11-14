@@ -205,7 +205,7 @@ def test_insert_adds_rows_and_a_failure_adds_none(db, tmp_path):
     assert len(_rows(db)) == 12
     bad = _plan(svc, {"operation": "insert", "table": "tb_bahan",
                       "rows": [{"nama": "ok", "harga_beli": 1}, {"nama": None, "harga_beli": 2}]})
-    with pytest.raises(sqlite3.IntegrityError):               # NOT NULL, the second row
+    with pytest.raises(ChangeRefused, match="nama wajib diisi"):   # NOT NULL, the second row: said in words
         _run(svc, bad, 2)
     assert len(_rows(db)) == 12                                # the first row was rolled back too
 

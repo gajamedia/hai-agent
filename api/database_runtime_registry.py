@@ -48,7 +48,7 @@ from agent.workflow.table_report_job import READ_ACTION, TableReportJobRunner
 from agent.workflow.table_report_planner import TableCatalogEntry, TableRelation, TableReportPlanner
 from agent.workflow.table_report_service import TableReportService
 from agent.workflow.database_creation import (
-    DIALECTS, DatabaseCreationService, DatabaseDesigner, SQLiteCreationService,
+    DIALECTS, DatabaseCreationService, DatabaseDesigner, SQLiteCreationService, max_tables,
 )
 from agent.workflow.data_change import (
     DataChangePlanner, DataChangeService, OPERATIONS as CHANGE_OPERATIONS, WritableTable,
@@ -63,7 +63,6 @@ from api.database_engines import (
 logger = logging.getLogger("hai_agent.database_registry")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
-MAX_TABLES = 20
 LIST_READ_LIMIT = 1001
 MAX_COLUMNS_PER_TABLE = 100
 MAX_RELATIONS = 30
@@ -577,8 +576,9 @@ class DatabaseRuntimeRegistry:
         name = conn.name
         map_type = self._engines[conn.engine].map_type
         if True:
-            if not isinstance(tables, Mapping) or not tables or len(tables) > MAX_TABLES:
-                raise RegistryError(f"select between 1 and {MAX_TABLES} tables")
+            limit = max_tables()
+            if not isinstance(tables, Mapping) or not tables or len(tables) > limit:
+                raise RegistryError(f"select between 1 and {limit} tables")
             by_table = {t.name: t for t in conn.schema.tables}
             specs: dict[str, ReadOnlyTableSpec] = {}
             entries: list[TableCatalogEntry] = []
@@ -707,6 +707,13 @@ class DatabaseRuntimeRegistry:
                 if getattr(engine, "has_creator", lambda _n: False)(pname):
                     out.append({"name": pname, "prefix": profile.creator_prefix, "type": engine.kind})
         return sorted(out, key=lambda item: item["name"])
+
+    def language_model(self) -> Any:
+        """The shared language-model service (built on first use), for callers that only classify text."""
+        with self._lock:
+            if self._llm is None:
+                self._llm = LLMService(self.llm_provider_factory())
+            return self._llm
 
     def database_creator(self, profile: Any = None) -> DatabaseCreationService:
         with self._lock:
@@ -894,6 +901,11 @@ class DatabaseRuntimeRegistry:
                 "status": "active" if conn.service else "connected_pending_approval",
                 "tables": list(conn.tables),
                 "writable_tables": sorted(conn.changes.planner.tables) if conn.changes else [],
+                # Per table that allows update: the columns a file may use to find the rows (key first).
+                "match_columns": ({
+                    t: sorted(w.entry.filterable_columns, key=lambda c: c != w.entry.key_column)
+                    for t, w in conn.changes.planner.tables.items() if "update" in w.operations
+                } if conn.changes else {}),
                 "relations": [_relation_to_dict(r) for r in conn.relations]}
 
     def schema(self, name: str) -> dict[str, Any]:

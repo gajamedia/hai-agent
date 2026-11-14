@@ -18,8 +18,9 @@ from typing import Any, Callable, Mapping, Optional
 
 from agent.platform import ApprovalPolicy, Effect, Operation, PlanUnsupported, Verdict, Verification
 from agent.workflow.database_creation import (
-    ColumnDef, CreationRefused, DatabaseDesign, TableDef,
+    ColumnDef, CreationRefused, DatabaseDesign, DesignPlanResult, TableDef,
 )
+from agent.workflow.table_report_planner import PlanValidationError
 from api.database_runtime_registry import DatabaseRuntimeRegistry
 
 FEATURE = "database"
@@ -63,7 +64,44 @@ def build_create_operation(get_registry: Callable[[], DatabaseRuntimeRegistry]) 
 
     def plan(request: Mapping[str, Any], ctx) -> dict[str, Any]:
         service = get_registry().database_creator(request.get("profile"))
-        result = service.designer.plan(request["question"])
+        file = request.get("file")
+        if file is not None:
+            # The design comes from the columns of an uploaded file, read by our own parser: no language
+            # model is involved and the file's values are not used here at all, only its column names and
+            # what kind of values each column holds. The designer's validation still decides.
+            try:
+                design = service.designer.validate({
+                    "database": file["database"], "title": f"Buat {file['database']} dari {file['name']}"[:200],
+                    "tables": [{"name": file["table"], "columns": [
+                        {"name": c[0], "type": c[1], "nullable": c[2] if len(c) > 2 else True}
+                        for c in file["columns"]]}]})
+            except PlanValidationError as exc:
+                raise PlanUnsupported(str(exc), {"kind": "unsupported"}) from exc
+            result = DesignPlanResult(f"[file] {file['name']}", design, None, "file")
+        else:
+            image = request.get("image")
+            if image is not None:
+                # A model already read the picture (in the route, where the bytes were); only its design arrives
+                # here, as names and types. It is validated again below, like every other design.
+                try:
+                    design = service.designer.validate(request["design"])
+                except PlanValidationError as exc:
+                    raise PlanUnsupported(str(exc), {"kind": "unsupported"}) from exc
+                result = DesignPlanResult(f"[image] {image['name']}", design, None, image.get("provider") or "image")
+            else:
+                result = service.designer.plan(request["question"])
+            if result.design is not None and (request.get("database") or request.get("table")):
+                # Names typed into the form win over whatever the model chose.
+                doc = design_to_json(result.design)
+                if request.get("database"):
+                    doc["database"] = request["database"]
+                if request.get("table") and len(doc["tables"]) == 1:
+                    doc["tables"][0]["name"] = request["table"]
+                try:
+                    result = DesignPlanResult(result.question, service.designer.validate(doc), None,
+                                              result.provider, result.attempts)
+                except PlanValidationError as exc:
+                    raise PlanUnsupported(str(exc), {"kind": "unsupported"}) from exc
         if result.design is None:
             raise PlanUnsupported(result.reason or "The request cannot be done.", {"kind": "unsupported"})
         try:

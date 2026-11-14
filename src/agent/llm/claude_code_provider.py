@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from agent.llm.contracts import LLMMessage, LLMRequest, LLMResponse
+from agent.llm.image_files import image_files
 from agent.llm.process_runner import run_cli, sanitized_environment
 
 DEFAULT_PROVIDER_NAME = "claude-code"
@@ -106,11 +107,19 @@ class ClaudeCodeProvider:
 
     # ------------------------------------------------------------------ API
     def complete(self, request: LLMRequest) -> LLMResponse:
+        # Images are read through the Read tool, and only from a private temporary folder that is removed afterwards.
+        with image_files(request.images) as (folder, paths):
+            return self._complete(request, folder, paths)
+
+    def _complete(self, request: LLMRequest, folder: Path | None, paths: Sequence[Path]) -> LLMResponse:
         system_prompt, prompt = self._split_messages(request.messages)
         if not prompt.strip():
             raise ClaudeCodeResponseParseError("At least one non-system message is required.")
+        if paths:
+            listing = "\n".join(str(p) for p in paths)
+            prompt += f"\n\n[ATTACHED IMAGES] Look at these image files with the Read tool before answering:\n{listing}"
         model = request.model or self.default_model
-        command = self.build_command(model=model, system_prompt=system_prompt)
+        command = self.build_command(model=model, system_prompt=system_prompt, image_folder=folder)
 
         try:
             result = self._run(command, prompt)
@@ -157,13 +166,17 @@ class ClaudeCodeProvider:
         )
 
     # ------------------------------------------------------------- internals
-    def build_command(self, *, model: str | None, system_prompt: str | None) -> list[str]:
+    def build_command(self, *, model: str | None, system_prompt: str | None,
+                      image_folder: Path | None = None) -> list[str]:
         command = [
             self.executable, "-p",
             "--output-format", "json",
-            "--tools", "",
+            # No tools at all, except: to look at attached images, the Read tool and only that temporary folder.
+            "--tools", "Read" if image_folder else "",
             "--no-session-persistence",
         ]
+        if image_folder:
+            command.extend(["--allowedTools", "Read", "--add-dir", str(image_folder)])
         if model:
             command.extend(["--model", model])
         if system_prompt:

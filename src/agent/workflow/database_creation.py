@@ -9,23 +9,59 @@ alter or overwrite anything here: a name that exists is refused.
 """
 
 import json
+import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from agent.llm.contracts import LLMMessage
 from agent.workflow.table_report_planner import PlanValidationError, _extract_json
 
-MAX_TABLES = 20
+logger = logging.getLogger(__name__)
+DEFAULT_MAX_TABLES = 20
+TABLES_CEILING = 200
 MAX_COLUMNS = 500
+
+
+def max_tables() -> int:
+    """How many tables one design may have, and how many tables one connection may approve: HAI_MAX_TABLES
+    (default 20, at most 200). One setting for both, so what can be created can also be approved. Read on every
+    call; an unreadable or out-of-range value falls back to the default, with a warning in the log."""
+    raw = os.getenv("HAI_MAX_TABLES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TABLES
+    if raw.isdigit() and 1 <= int(raw) <= TABLES_CEILING:
+        return int(raw)
+    logger.warning("HAI_MAX_TABLES=%r is not a whole number from 1 to %d; using %d.",
+                   raw, TABLES_CEILING, DEFAULT_MAX_TABLES)
+    return DEFAULT_MAX_TABLES
+
 # MySQL counts every column in the row size limit (65,535 bytes). utf8mb4 VARCHAR(255) = 1,022 bytes,
 # TEXT only a pointer. Checked here so a too-wide design is refused with a clear message, not a DDL error.
 _ROW_BYTES = {"integer": 4, "decimal": 8, "text": 1022, "long_text": 12, "date": 3, "datetime": 8, "boolean": 1}
 _ROW_LIMIT = 65000
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+DEFAULT_TABLE_PREFIX = "tb_"
+_PREFIX_OK = re.compile(r"^[a-z][a-z0-9_]{0,9}$")
+
+
+def table_prefix() -> str:
+    """What every new table name starts with: HAI_TABLE_PREFIX (default ``tb_``). Set it to nothing (an empty
+    value) to leave names as they are. Read on every call; a value that is not 1 to 10 lowercase letters, digits
+    or underscores (starting with a letter) falls back to the default, with a warning in the log."""
+    raw = os.environ.get("HAI_TABLE_PREFIX")
+    if raw is None:
+        return DEFAULT_TABLE_PREFIX
+    raw = raw.strip()
+    if raw == "" or _PREFIX_OK.match(raw):
+        return raw
+    logger.warning("HAI_TABLE_PREFIX=%r is not 1 to 10 lowercase letters, digits or underscores; using %r.",
+                   raw, DEFAULT_TABLE_PREFIX)
+    return DEFAULT_TABLE_PREFIX
 # Closed set of column types -> MySQL types. Nothing else can be requested.
 COLUMN_TYPES = {
     "integer": "INT", "decimal": "DECIMAL(14,2)", "text": "VARCHAR(255)", "long_text": "TEXT",
@@ -95,11 +131,20 @@ class DesignPlanResult:
     attempts: int = 1
 
 
+IMAGE_NOTE = (
+    "\nAn image is attached: a database diagram (ERD), a sketch of tables, or a form. Read the tables and "
+    "their columns from it and design exactly those (do not invent extra tables). Relations between tables "
+    "are not enforced here: keep each as an ordinary integer column named like the key it points to (for "
+    "example id_pelanggan). Ignore a primary key called id (it is added automatically). If the image does "
+    "not show a database design, reply with supported false and say what you see."
+)
+
+
 class DatabaseDesigner:
     def __init__(self, llm: Any, *, prefix: str, max_attempts: int = 2, dialect: Dialect = MYSQL) -> None:
         self.llm, self.prefix, self.max_attempts, self.dialect = llm, prefix, max_attempts, dialect
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, with_image: bool = False) -> str:
         return (
             "You design tables in ONE database. You never write SQL. The database may not exist yet "
             "(it is then created) or may already exist (the tables are then ADDED to it; existing tables "
@@ -107,28 +152,32 @@ class DatabaseDesigner:
             f"The database name MUST start with '{self.prefix}' and use only lowercase letters, digits "
             "and underscores. Reply with ONLY one JSON object:\n"
             '{"supported": true, "database": "' + self.prefix + 'name", "title": "...", "tables": ['
-            '{"name": "tb_x", "columns": [{"name": "col", "type": "text", "nullable": true}]}]}\n'
+            '{"name": "' + table_prefix() + 'x", "columns": [{"name": "col", "type": "text", "nullable": true}]}]}\n'
             f"Column types, only these: {sorted(COLUMN_TYPES)}. Do NOT add an id column: a numeric primary "
-            f"key named id is added automatically. At most {MAX_TABLES} tables and {MAX_COLUMNS} columns "
+            f"key named id is added automatically. At most {max_tables()} tables and {MAX_COLUMNS} columns "
             "per table (a table needs at least one column; if the user names a kind of system such as HRIS, "
             "choose the usual columns yourself). Use text only for short values; use long_text for notes"
             + (", because a row can hold about 65 short text columns" if self.dialect.row_limit else "")
+            + (f". Table names start with {table_prefix()}" if table_prefix() else "")
             + ". Table and column names are lowercase "
             "letters, digits and underscores. A database "
             "with no tables is allowed if the user asks for only the database. If the user only wants "
             "more tables in a database that exists, list just the new tables.\n"
             'If the request cannot be done: {"supported": false, "reason": "..."}.'
+            + (IMAGE_NOTE if with_image else "")
         )
 
-    def plan(self, question: str) -> DesignPlanResult:
+    def plan(self, question: str, images: Sequence[Any] = ()) -> DesignPlanResult:
+        """Design from text, and optionally from images (an ERD, a sketched table) attached to the request."""
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be non-empty text")
         question = question.strip()
-        messages = [LLMMessage("system", self._system_prompt()), LLMMessage("user", f"Request:\n{question}")]
+        messages = [LLMMessage("system", self._system_prompt(bool(images))), LLMMessage("user", f"Request:\n{question}")]
+        extra = {"images": tuple(images)} if images else {}
         errors: list[str] = []
         provider = None
         for attempt in range(1, self.max_attempts + 1):
-            response = self.llm.complete(messages, temperature=0)
+            response = self.llm.complete(messages, temperature=0, **extra)
             provider = response.provider
             try:
                 data = _extract_json(response.content)
@@ -150,15 +199,24 @@ class DatabaseDesigner:
             raise PlanValidationError(
                 f"The database name must start with '{self.prefix}' and use lowercase letters, digits and _.")
         raw_tables = data.get("tables", [])
-        if not isinstance(raw_tables, list) or len(raw_tables) > MAX_TABLES:
-            raise PlanValidationError(f"tables must be a list of at most {MAX_TABLES}.")
+        limit = max_tables()
+        if not isinstance(raw_tables, list) or len(raw_tables) > limit:
+            raise PlanValidationError(f"tables must be a list of at most {limit}.")
         tables, seen = [], set()
         for raw in raw_tables:
             if not isinstance(raw, Mapping) or set(raw) - {"name", "columns"}:
                 raise PlanValidationError('Each table must be {"name": ..., "columns": [...]}.')
             name = raw.get("name")
-            if not isinstance(name, str) or not _NAME.match(name) or name in seen:
+            if not isinstance(name, str) or not _NAME.match(name):
                 raise PlanValidationError(f"Invalid or repeated table name {name!r}.")
+            # Every table name starts with the configured prefix (tb_ by default), whatever the model (or the
+            # file) called it, on every server. An empty prefix leaves names as they are.
+            prefix = table_prefix()
+            if prefix and not name.startswith(prefix):
+                name = prefix + name
+            if not _NAME.match(name) or name in seen:
+                raise PlanValidationError(f"Invalid or repeated table name {name!r}"
+                                          + (f" (names start with {prefix})." if prefix else "."))
             seen.add(name)
             columns_raw = raw.get("columns")
             if not isinstance(columns_raw, list) or not columns_raw:

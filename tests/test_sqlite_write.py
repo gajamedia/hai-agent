@@ -101,9 +101,10 @@ def test_an_existing_database_is_never_overwritten_and_only_gets_new_tables(tmp_
 
 def test_a_failed_creation_leaves_no_file_behind(tmp_path):
     service, data = _service(tmp_path)
-    bad = service.designer.validate({**DESIGN, "tables": [
-        {"name": "tb_ok", "columns": [{"name": "a", "type": "text"}]},
-        {"name": "sqlite_reserved", "columns": [{"name": "a", "type": "text"}]}]})   # SQLite refuses this name
+    from agent.workflow.database_creation import ColumnDef, DatabaseDesign, TableDef
+    one = (ColumnDef("a", "text", True),)
+    # Validation now puts tb_ in front of every name, so a name SQLite refuses is built by hand here.
+    bad = DatabaseDesign("hai_toko", (TableDef("tb_ok", one), TableDef("sqlite_reserved", one)), "t")
     with pytest.raises(sqlite3.Error):
         service.execute(bad, actor="maker", plan_id="p1", question="q")
     assert not (data / "hai_toko.sqlite3").exists()

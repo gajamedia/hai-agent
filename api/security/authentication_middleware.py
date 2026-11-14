@@ -70,6 +70,7 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     # Data changes: planning/cancelling and running are the writer's; approving is a second person's.
     ("GET", r"^/api/v1/data-changes/config$", "data:change:plan"),
     ("POST", r"^/api/v1/data-changes/plans$", "data:change:plan"),
+    ("POST", r"^/api/v1/data-changes/file-plans$", "data:change:plan"),
     ("GET", r"^/api/v1/data-changes/plans/[^/]+$", "data:change:plan"),
     ("DELETE", r"^/api/v1/data-changes/plans/[^/]+$", "data:change:plan"),
     ("POST", r"^/api/v1/data-changes/plans/[^/]+/run$", "data:change:execute"),
@@ -80,6 +81,7 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"^/api/v1/data-entries/databases$", "data:entry:record"),
     ("GET", r"^/api/v1/data-entries/recent$", "data:entry:record"),
     ("POST", r"^/api/v1/data-entries/[^/]+/undo$", "data:entry:record"),
+    ("POST", r"^/api/v1/data-entries/file-plans$", "data:entry:record"),
     ("POST", r"^/api/v1/data-entries/plans$", "data:entry:record"),
     ("GET", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),
     ("DELETE", r"^/api/v1/data-entries/plans/[^/]+$", "data:entry:record"),
@@ -87,9 +89,15 @@ _ROUTE_PERMISSION_RULES: tuple[tuple[str, str, str], ...] = (
     # Creating databases: one permission for planning and running; a fresh login is checked by the handler.
     ("GET", r"^/api/v1/database-creation/config$", "database:create:manage"),
     ("POST", r"^/api/v1/database-creation/plans$", "database:create:manage"),
+    ("POST", r"^/api/v1/database-creation/file-plans$", "database:create:manage"),
+    ("POST", r"^/api/v1/database-creation/image-plans$", "database:create:manage"),
     ("GET", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
     ("DELETE", r"^/api/v1/database-creation/plans/[^/]+$", "database:create:manage"),
     ("POST", r"^/api/v1/database-creation/plans/[^/]+/run$", "database:create:manage"),
+    # The one-page assistant only decides which page's pipeline a message belongs to; every role that runs a
+    # feature carries task:history:read. What the person may actually run is still checked per pipeline route.
+    ("POST", r"^/api/v1/assistant/route$", "task:history:read"),
+    ("POST", r"^/api/v1/assistant/route-file$", "task:history:read"),
     # Task history: your own tasks. The permission comes with the roles that run features; the handler
     # then shows only your tasks, and only for operations you may still use.
     ("GET", r"^/api/v1/tasks$", "task:history:read"),

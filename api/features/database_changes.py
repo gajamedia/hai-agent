@@ -23,7 +23,8 @@ from fastapi.encoders import jsonable_encoder
 from agent.platform import (
     ApprovalPolicy, Effect, Operation, PlanUnsupported, TaskStatus, Verdict, Verification,
 )
-from agent.workflow.data_change import ChangeRefused, ChangeRequest
+from agent.workflow.data_change import MAX_IMPORT_ROWS, ChangePlanResult, ChangeRefused, ChangeRequest
+from agent.workflow.table_report_planner import PlanValidationError
 from api.data_change_settings import APPROVE, ENTRY, EXECUTE, PLAN, requires_approval
 from api.database_runtime_registry import DatabaseRuntimeRegistry
 
@@ -44,7 +45,7 @@ class ConnectionChanged(ValueError):
 def change_request_to_json(request: ChangeRequest) -> dict[str, Any]:
     return {
         "operation": request.operation, "table": request.table, "title": request.title,
-        "max_rows": request.max_rows,
+        "max_rows": request.max_rows, "match_column": request.match_column,
         "set_values": [[c, v] for c, v in request.set_values],
         "rows": [[[c, v] for c, v in row] for row in request.rows],
         "conditions": [[c, op, list(v) if isinstance(v, (tuple, list)) else v]
@@ -55,7 +56,7 @@ def change_request_to_json(request: ChangeRequest) -> dict[str, Any]:
 def change_request_from_json(data: Mapping[str, Any]) -> ChangeRequest:
     return ChangeRequest(
         operation=data["operation"], table=data["table"], title=data.get("title", ""),
-        max_rows=int(data["max_rows"]),
+        max_rows=int(data["max_rows"]), match_column=data.get("match_column", ""),
         set_values=tuple((c, v) for c, v in data["set_values"]),
         rows=tuple(tuple((c, v) for c, v in row) for row in data["rows"]),
         conditions=tuple((c, op, tuple(v) if isinstance(v, list) else v)
@@ -98,7 +99,25 @@ def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, ent
         registry = get_registry()
         name = registry.resolve_change_name(request.get("database"))
         service = registry.data_changes(name)
-        result = service.planner.plan(request["question"], max_rows=request["max_rows"])
+        file = request.get("file")
+        if file is not None:
+            # Rows read from an uploaded file by our own parser; no language model sees them. The planner's
+            # validation (table approved for the operation, writable columns, value types) still decides.
+            try:
+                if entry:
+                    checked = service.planner.validate(
+                        {"operation": "insert", "table": file["table"], "rows": file["rows"],
+                         "title": f"Impor {file['name']}"[:200]},
+                        max_rows=MAX_IMPORT_ROWS, row_limit=MAX_IMPORT_ROWS)
+                else:
+                    checked = service.planner.validate_bulk_update(
+                        file["table"], file["match"], file["rows"], max_rows=request["max_rows"],
+                        title=f"Ubah dari {file['name']}"[:200])
+            except PlanValidationError as exc:
+                raise PlanUnsupported(str(exc), {"kind": "unsupported"}) from exc
+            result = ChangePlanResult(f"[file] {file['name']} ({len(file['rows'])} rows)", checked, None, "file")
+        else:
+            result = service.planner.plan(request["question"], max_rows=request["max_rows"])
         if result.request is None:
             raise PlanUnsupported(result.reason or "The request cannot be done.", {"kind": "unsupported"})
         if entry and result.request.operation != "insert":
@@ -112,11 +131,14 @@ def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, ent
             "question": result.question, "database": name, "connection": registry.change_token(name),
             "request": change_request_to_json(result.request),
             "summary": service.summarize(result.request),
+            "column_order": list(service.table(result.request.table).entry.columns),
             "expected_rows": preview.expected_rows,
             "before": jsonable_encoder(preview.before), "after": jsonable_encoder(preview.after),
             "note": preview.sample_note,
             "confirm_phrase": service.confirm_phrase(result.request, preview.expected_rows),
             "provider": result.provider,
+            **({"file": {"name": file["name"], "sha256": file["sha256"], "rows": len(file["rows"])}}
+               if file is not None else {}),
         }
 
     def approval_for(plan_doc: Mapping[str, Any], ctx) -> ApprovalPolicy:
@@ -140,6 +162,9 @@ def _build_operation(get_registry: Callable[[], DatabaseRuntimeRegistry], *, ent
             question=plan_doc["question"])
         out = {"rows_affected": done.rows_affected, "operation": plan_doc["summary"]["operation"],
                "table": plan_doc["summary"]["table"]}
+        if plan_doc.get("file"):
+            # What the file was, never what it held: lets a second upload of the same file be noticed.
+            out["file"] = {"name": plan_doc["file"]["name"], "sha256": plan_doc["file"]["sha256"]}
         if done.inserted:
             # Enough to take exactly these rows back later: their keys and fingerprints, never their values.
             out["undo"] = {"database": name, "table": plan_doc["summary"]["table"],

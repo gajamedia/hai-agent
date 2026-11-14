@@ -13,6 +13,7 @@ approved for writing, run an UPDATE or DELETE without conditions, or change more
 user's own limit.
 """
 
+import re
 import hashlib
 import json
 import math
@@ -34,6 +35,7 @@ from agent.workflow.table_report_planner import (
 
 OPERATIONS = ("insert", "update", "delete")
 MAX_INSERT_ROWS = 100
+MAX_IMPORT_ROWS = 1000   # rows of an uploaded file recorded in one go (typed rows stay at MAX_INSERT_ROWS)
 PREVIEW_ROWS = 10
 DEFAULT_MAX_ROWS_CEILING = 10000
 
@@ -63,6 +65,9 @@ class ChangeRequest:
     conditions: tuple[tuple[str, str, Any], ...] = ()          # update / delete
     max_rows: int = 100                                        # the USER's limit, not the LLM's
     title: str = ""
+    # An update with ``rows`` (from an uploaded file): each row is the match column's value followed by the
+    # columns to set on the one row that holds that value.
+    match_column: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,11 +135,23 @@ class ChangeSqlBuilder:
     def _where(self, adapter, bind, conditions) -> str:
         if not conditions:
             return ""
-        parts = [adapter._condition_sql(
-            {"column": c, "operator": op,
-             **({} if v is None else {"value": list(v) if isinstance(v, tuple) else v})}, bind)
-            for c, op, v in conditions]
+        parts = [self._key_list(adapter, bind, c, v) if op == "in" and isinstance(v, (tuple, list)) and len(v) > 20
+                 else adapter._condition_sql(
+                     {"column": c, "operator": op,
+                      **({} if v is None else {"value": list(v) if isinstance(v, tuple) else v})}, bind)
+                 for c, op, v in conditions]
         return " WHERE " + " AND ".join(parts)
+
+    @staticmethod
+    def _key_list(adapter, bind, column: str, values) -> str:
+        """``column IN (...)`` for a long list of keys that our own code produced (the rows an entry made, or the
+        keys of an uploaded file). A model's conditions stay capped at 20 values by the planner; this path is
+        never reachable from model output. SQL Server takes up to 2,100 parameters, and the lists here stop at
+        MAX_IMPORT_ROWS."""
+        if len(values) > MAX_IMPORT_ROWS or any(isinstance(v, bool) or not isinstance(v, (int, float, str))
+                                                for v in values):
+            raise ChangeRefused("Too many keys, or keys of an unsupported kind.")
+        return f"{adapter._q(column)} IN ({', '.join(bind(v) for v in values)})"
 
     def select(self, table: str, columns: Sequence[str], conditions, *, limit: int,
                lock: str = "") -> tuple[str, list[Any]]:
@@ -180,6 +197,24 @@ class ChangeSqlBuilder:
 
 
 # ------------------------------------------------------------------------ planning
+_MISSING_COLUMN = (
+    re.compile(r"Field '([^']+)' doesn't have a default value"),            # MySQL 1364
+    re.compile(r"Column '([^']+)' cannot be null"),                         # MySQL 1048
+    re.compile(r"NOT NULL constraint failed: [\w$]+\.(\w+)"),               # SQLite
+    re.compile(r"Cannot insert the value NULL into column '([^']+)'"),      # SQL Server
+)
+
+
+def _missing_required_column(exc: BaseException) -> str | None:
+    """The column a database named when it refused an insert for lack of a value, else None."""
+    text = str(exc)
+    for pattern in _MISSING_COLUMN:
+        found = pattern.search(text)
+        if found:
+            return found.group(1)
+    return None
+
+
 def _plain(value: Any) -> Any:
     """JSON friendly: dates, decimals and bytes from a database row."""
     if isinstance(value, (datetime, date)):
@@ -189,6 +224,22 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "as_tuple"):  # Decimal
         return float(value)
     return value
+
+
+def _same(stored: Any, wanted: Any) -> bool:
+    """A value read back equals the one written, allowing for how databases hand values back (1 for True,
+    12.0 for 12, a date as text)."""
+    stored, wanted = _plain(stored), _plain(wanted)
+    if stored is None or wanted is None:
+        return stored is wanted
+    if isinstance(stored, bool) or isinstance(wanted, bool):
+        return bool(stored) == bool(wanted)
+    if isinstance(stored, (int, float)) and isinstance(wanted, (int, float)):
+        return math.isclose(float(stored), float(wanted), rel_tol=1e-9, abs_tol=1e-9)
+    if isinstance(stored, str) and isinstance(wanted, str):
+        a, b = stored.replace("T", " "), wanted.replace("T", " ")
+        return a == b or (len(b) == 10 and a[:10] == b)    # a date written as text may come back with a time
+    return stored == wanted
 
 
 class DataChangePlanner:
@@ -268,7 +319,38 @@ class DataChangePlanner:
             out.append((column, value))
         return tuple(out)
 
-    def validate(self, data: Mapping[str, Any], *, max_rows: int) -> ChangeRequest:
+    def validate_bulk_update(self, table_name: str, match_column: str, rows: Any, *, max_rows: int,
+                             title: str = "") -> ChangeRequest:
+        """Update many rows, each found by its own value of ``match_column`` and given its own new values (an
+        uploaded file). Built by our code, never by a model. A value left out is left as it is."""
+        table = self.tables.get(table_name) if isinstance(table_name, str) else None
+        if table is None:
+            raise PlanValidationError(f"Unknown table {table_name!r}; choose one of {sorted(self.tables)}.")
+        if "update" not in table.operations:
+            raise PlanValidationError(f"'update' is not allowed on {table_name!r}; allowed: {list(table.operations)}.")
+        if match_column not in table.entry.filterable_columns:
+            raise PlanValidationError(
+                f"Rows cannot be found by {match_column!r}; use one of {list(table.entry.filterable_columns)}.")
+        limit = min(MAX_IMPORT_ROWS, max_rows)
+        if not isinstance(rows, list) or not 1 <= len(rows) <= limit:
+            raise PlanValidationError(f"rows must be a list of 1 to {limit} objects (the row limit applies).")
+        out, seen = [], set()
+        for number, raw in enumerate(rows, start=1):
+            if not isinstance(raw, Mapping) or raw.get(match_column) is None:
+                raise PlanValidationError(f"Row {number} has no value in {match_column!r}.")
+            key = raw[match_column]
+            condition_scalar(table.entry.columns[match_column], match_column, key)
+            if key in seen:
+                raise PlanValidationError(f"The value {key!r} of {match_column!r} appears twice in the file.")
+            seen.add(key)
+            sets = {c: v for c, v in raw.items() if c != match_column}
+            if not sets or any(v is None for v in sets.values()):
+                raise PlanValidationError(f"Row {number} has nothing to change (empty values are left as they are).")
+            out.append(((match_column, key),) + self._values(table, sets, what="each row"))
+        return ChangeRequest("update", table_name, rows=tuple(out), max_rows=max_rows, match_column=match_column,
+                             title=title or f"update {table_name}")
+
+    def validate(self, data: Mapping[str, Any], *, max_rows: int, row_limit: int = MAX_INSERT_ROWS) -> ChangeRequest:
         operation, name = data.get("operation"), data.get("table")
         if operation not in OPERATIONS:
             raise PlanValidationError(f"operation must be one of {list(OPERATIONS)}.")
@@ -283,9 +365,9 @@ class DataChangePlanner:
         if operation == "insert":
             raw_rows = data.get("rows")
             if (not isinstance(raw_rows, list) or not raw_rows
-                    or len(raw_rows) > min(MAX_INSERT_ROWS, max_rows)):
+                    or len(raw_rows) > min(row_limit, max_rows)):
                 raise PlanValidationError(
-                    f"rows must be a list of 1 to {min(MAX_INSERT_ROWS, max_rows)} objects "
+                    f"rows must be a list of 1 to {min(row_limit, max_rows)} objects "
                     "(the user's row limit applies).")
             rows = tuple(self._values(table, r, what="each row") for r in raw_rows)
             if len({tuple(sorted(c for c, _ in row)) for row in rows}) != 1:
@@ -340,19 +422,48 @@ class DataChangeService:
     def summarize(self, request: ChangeRequest) -> dict[str, Any]:
         out: dict[str, Any] = {"operation": request.operation, "table": request.table,
                                "title": request.title, "max_rows": request.max_rows}
-        if request.operation == "insert":
+        if request.operation == "insert" or request.rows:
             out["rows"] = [dict(r) for r in request.rows]
+            if request.match_column:
+                out["match_column"] = request.match_column
         else:
             out["conditions"] = [{"column": c, "operator": op,
                                   "value": list(v) if isinstance(v, (tuple, list)) else v}
                                  for c, op, v in request.conditions]
-        if request.operation == "update":
+        if request.operation == "update" and not request.rows:
             out["set"] = dict(request.set_values)
         return out
 
     def confirm_phrase(self, request: ChangeRequest, expected_rows: int) -> str:
         verb = {"insert": "TAMBAH", "update": "UBAH", "delete": "HAPUS"}[request.operation]
         return f"{verb} {expected_rows} BARIS {request.table}"
+
+    @staticmethod
+    def _bulk_keys(request: ChangeRequest) -> tuple:
+        """The match values of an update that comes from a file, else ()."""
+        if request.operation != "update" or not request.rows:
+            return ()
+        return tuple(dict(row)[request.match_column] for row in request.rows)
+
+    @staticmethod
+    def _check_bulk_match(request: ChangeRequest, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Every value in the file must find exactly one row: none missing, none found twice."""
+        key = request.match_column
+        wanted = {dict(r)[key] for r in request.rows}
+        found: dict[Any, int] = {}
+        for row in rows:
+            found[row[key]] = found.get(row[key], 0) + 1
+        missing = [k for k in wanted if k not in found]
+        twice = [k for k, n in found.items() if n > 1]
+        if missing or twice:
+            parts = []
+            if missing:
+                parts.append(f"{len(missing)} of the {len(wanted)} values of {key} match no row "
+                             f"(first: {missing[0]!r})")
+            if twice:
+                parts.append(f"{len(twice)} values of {key} match more than one row (first: {twice[0]!r})")
+            raise ChangeRefused("; ".join(parts).capitalize() + ". Nothing would be changed. "
+                                "Rows can only be updated by a column whose values are unique.")
 
     # ------------------------------------------------------------------ preview
     def preview(self, request: ChangeRequest) -> ChangePreview:
@@ -363,7 +474,9 @@ class DataChangeService:
                                  "" if len(request.rows) <= PREVIEW_ROWS
                                  else f"showing the first {PREVIEW_ROWS} of {len(request.rows)} rows")
         columns = self._columns(request)
-        sql, params = self.builder.select(request.table, columns, request.conditions,
+        bulk = self._bulk_keys(request)
+        sql, params = self.builder.select(request.table, columns,
+                                          ((request.match_column, "in", bulk),) if bulk else request.conditions,
                                           limit=request.max_rows + 1)
         connection = self._connect()
         try:
@@ -382,6 +495,14 @@ class DataChangeService:
             raise ChangeRefused(
                 f"This would change more than {request.max_rows} rows, the limit you set. "
                 "Narrow the conditions or raise the limit.")
+        if bulk:
+            self._check_bulk_match(request, rows)
+            wanted = {dict(r)[request.match_column]: dict(r) for r in request.rows}
+            sample = rows[:PREVIEW_ROWS]
+            return ChangePreview(len(rows), tuple(sample),
+                                 tuple({**row, **wanted[row[request.match_column]]} for row in sample),
+                                 "" if len(rows) <= PREVIEW_ROWS
+                                 else f"showing the first {PREVIEW_ROWS} of {len(rows)} rows")
         if not rows:
             raise ChangeRefused("No rows match these conditions, so nothing would change.")
         sample = rows[:PREVIEW_ROWS]
@@ -406,10 +527,12 @@ class DataChangeService:
             cursor = connection.cursor()
             try:
                 before: list[dict[str, Any]] = []
+                bulk = self._bulk_keys(request)
                 if request.operation != "insert":
                     columns = self._columns(request)
                     sql, params = self.builder.select(
-                        request.table, columns, request.conditions,
+                        request.table, columns,
+                        ((request.match_column, "in", bulk),) if bulk else request.conditions,
                         limit=request.max_rows + 1, lock=self.lock_clause)
                     cursor.execute(sql, params)
                     before = self._rows(cursor, columns)
@@ -417,18 +540,24 @@ class DataChangeService:
                         raise ChangeRefused(
                             f"The data changed since the preview: {len(before)} rows match now, "
                             f"{expected_rows} were shown. Nothing was changed; plan it again.")
+                    if bulk:
+                        self._check_bulk_match(request, before)
                 if request.operation == "insert":
                     cols = sorted({c for row in request.rows for c, _ in row})
                     rows = [dict(row) for row in request.rows]
                     statements = (self.builder.insert_chunks(request.table, cols, rows)
                                   if self.builder.dialect == "top"
                                   else [self.builder.insert(request.table, cols, rows)])
+                elif bulk:
+                    statements = [self.builder.update(request.table, row[1:], ((request.match_column, "eq", row[0][1]),))
+                                  for row in request.rows]
                 elif request.operation == "update":
                     statements = [self.builder.update(request.table, request.set_values, request.conditions)]
                 else:
                     statements = [self.builder.delete(request.table, request.conditions)]
-                sql, params = statements[0]
-                record.update(sql=sql, params=[_plain(p) for p in params], statements=len(statements))
+                sql = statements[0][0]
+                record.update(sql=sql, params=[_plain(p) for _s, ps in statements for p in ps],
+                              statements=len(statements))
                 record["params_count"] = len(record["params"])
                 affected = 0
                 # For an insert into a table with a numeric key, remember which rows this change made, so that
@@ -437,6 +566,9 @@ class DataChangeService:
                 max_before = self._max_key(cursor, request.table, track_key) if track_key else _UNTRACKED
                 for sql, params in statements:
                     cursor.execute(sql, params)
+                    if bulk and cursor.rowcount != 1:   # each key names exactly one row, which is locked
+                        raise ChangeRefused(f"One update touched {cursor.rowcount} rows, not 1. "
+                                            "It was rolled back; nothing changed.")
                     affected += cursor.rowcount
                 if affected != expected_rows:
                     raise ChangeRefused(
@@ -456,6 +588,12 @@ class DataChangeService:
             if self._detail_mode() != "full":
                 record["params"] = []
             self._audit(record)
+            missing = _missing_required_column(exc)
+            if missing and request.operation == "insert":
+                raise ChangeRefused(
+                    f"Kolom {missing} wajib diisi di tabel {request.table}, tetapi belum ada nilainya. "
+                    "Tidak ada yang tersimpan. Isi kolom itu (di file, atau tulis nilainya di kolom teks, "
+                    f"misalnya \"{missing} diisi ...\"), lalu siapkan lagi.") from exc
             raise
         finally:
             try:
@@ -507,7 +645,7 @@ class DataChangeService:
         key = self.table(table).entry.key_column
         keys = [row["key"] for row in rows]
         wanted = {row["key"]: row["fp"] for row in rows}
-        if not key or not keys or len(keys) != len(set(keys)) or len(keys) > MAX_INSERT_ROWS:
+        if not key or not keys or len(keys) != len(set(keys)) or len(keys) > MAX_IMPORT_ROWS:
             raise ChangeRefused("This entry cannot be taken back.")
         columns = self._table_columns(table)
         conditions = ((key, "in", tuple(keys)),)
@@ -567,6 +705,8 @@ class DataChangeService:
 
         Returns ``{"method", "expected_rows", "observed_rows", "confirmed"}``.
         """
+        if self._bulk_keys(request):
+            return self._verify_bulk(request, expected_rows)
         set_columns = {c for c, _ in request.set_values}
         condition_columns = {c for c, _, _ in request.conditions}
         if request.operation == "insert" or (request.operation == "update" and set_columns & condition_columns):
@@ -594,6 +734,35 @@ class DataChangeService:
         wanted = 0 if request.operation == "delete" else expected_rows
         return {"method": "reread_after_commit", "expected_rows": wanted, "observed_rows": observed,
                 "confirmed": observed == wanted}
+
+    def _verify_bulk(self, request: ChangeRequest, expected_rows: int) -> dict[str, Any]:
+        """Read the rows again by their keys and compare every value that was meant to be written."""
+        columns = self._columns(request)
+        keys = self._bulk_keys(request)
+        sql, params = self.builder.select(request.table, columns, ((request.match_column, "in", keys),),
+                                          limit=len(keys) + 1)
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(sql, params)
+                rows = self._rows(cursor, columns)
+            finally:
+                cursor.close()
+        finally:
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
+        seen = {row[request.match_column]: row for row in rows}
+        good = 0
+        for pairs in request.rows:
+            wanted = dict(pairs)
+            row = seen.get(wanted[request.match_column])
+            if row is not None and all(_same(row.get(c), v) for c, v in wanted.items()):
+                good += 1
+        return {"method": "reread_after_commit", "expected_rows": expected_rows, "observed_rows": good,
+                "confirmed": good == expected_rows}
 
     def _detail_mode(self) -> str:
         mode = self._audit_detail() if callable(self._audit_detail) else self._audit_detail
@@ -624,6 +793,8 @@ class DataChangeService:
                                "max_rows": plan.get("max_rows")}
         if isinstance(plan.get("rows"), list):
             out["rows_count"] = len(plan["rows"])
+        if plan.get("match_column"):
+            out["match_column"] = plan["match_column"]
         if isinstance(plan.get("set"), Mapping):
             out["set_columns"] = sorted(plan["set"])
         if isinstance(plan.get("conditions"), list):
@@ -642,5 +813,5 @@ class DataChangeService:
 __all__ = [
     "ChangePlanResult", "ChangePreview", "ChangeRefused", "ChangeRequest", "ChangeResult",
     "ChangeSqlBuilder", "DataChangePlanner", "DataChangeService", "DEFAULT_MAX_ROWS_CEILING",
-    "MAX_INSERT_ROWS", "OPERATIONS", "WritableTable",
+    "MAX_IMPORT_ROWS", "MAX_INSERT_ROWS", "OPERATIONS", "WritableTable",
 ]

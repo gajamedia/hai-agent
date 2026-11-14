@@ -21,19 +21,23 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from agent.llm.fallback_provider import AllProvidersFailedError
 from agent.platform import (
     ApprovalRequired, ConfirmationMismatch, ExecutionFailed, PermissionDenied, PlanError, PlanUnsupported,
     PolicyViolation, StepUpRequired, TaskConflict, TaskExpired, TaskNotFound, TaskStatus, TooManyTasks,
 )
-from agent.workflow.data_change import ChangeRefused
+from agent.workflow.column_fill import apply_fill, propose_fill
+from agent.workflow.data_change import MAX_IMPORT_ROWS, ChangeRefused
+from agent.workflow.uploaded_table import MappingNeeded, UploadRefused, read_table, rows_for_table
 from api.data_change_settings import APPROVE, EXECUTE, PLAN, requires_approval, settings
 from api.database_runtime_registry import (
     DatabaseRuntimeRegistry, RegistryError, RegistryNotFound,
 )
 from api.features.database_changes import CHANGE_OPERATION, ConnectionChanged
 from api.platform_runtime import get_pipeline
+from api.routes.uploads import needs_mapping, parse_mapping, read_upload
 from api.security.authentication import AuthenticationError, get_attached_principal
 from api.security.authorization import AuthorizationDenied, AuthorizationPolicy
 
@@ -109,7 +113,7 @@ def _state(task) -> str:
 def _view(task, pipeline, *, with_phrase: bool, viewer: str | None = None) -> dict[str, Any]:
     plan = task.plan or {}
     out = {"plan_id": task.task_id, "database": plan.get("database"), "question": plan.get("question"),
-           "plan": plan.get("summary"),
+           "plan": plan.get("summary"), "column_order": plan.get("column_order") or [],
            "preview": {"before": plan.get("before", []), "after": plan.get("after", []),
                        "note": plan.get("note", "")},
            "expected_rows": plan.get("expected_rows"),
@@ -186,6 +190,91 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
     service.audit("planned", plan_id=task.task_id, actor=principal.actor_id,
                   plan=task.plan["summary"], expected_rows=task.plan["expected_rows"])
     return {"status": "planned", **_view(task, _pipeline(request), with_phrase=True)}
+
+
+@router.post("/file-plans", status_code=201)
+async def create_plan_from_file(request: Request, filename: str, table: str | None = None,
+                                database: str | None = None, match: str | None = None,
+                                mapping: str | None = None, max_rows: int = MAX_IMPORT_ROWS,
+                                question: str | None = None, header_row: int = 1):
+    """Update many rows from an uploaded file (CSV, TSV, TXT or .xlsx). Each row of the file names one existing row
+    by its value in the ``match`` column (the table's key unless you name another unique column) and gives the new
+    values for that row; an empty cell leaves that value as it is. Read by our own code, never by a model, and
+    shown as the same preview; the exact phrase, fresh login and, where the server requires it, a second person
+    still apply before anything changes. A value that matches no row, or more than one, refuses the whole file."""
+    principal = _principal(request, PLAN)
+    ceiling = settings()["max_rows_ceiling"]
+    if not 1 <= max_rows <= ceiling:
+        raise _err(422, "invalid_request", f"max_rows must be 1 to {ceiling}.")
+    data = await read_upload(request)
+    chosen = parse_mapping(mapping)
+    registry = _registry(request)
+    try:
+        name = registry.resolve_change_name(database)
+        service = registry.data_changes(name)
+    except RegistryNotFound as exc:
+        raise _err(404, "database_not_found", str(exc)) from exc
+    except RegistryError as exc:
+        raise _err(422, "changes_not_available", str(exc)) from exc
+    able = sorted(t for t, w in service.planner.tables.items() if "update" in w.operations)
+    if table is None and len(able) == 1:
+        table = able[0]
+    if table not in able:
+        raise _err(422, "table_required", "Choose the table to update: " + (", ".join(able) or "(none allows update)") + ".")
+    writable = service.table(table)
+    match = match or writable.entry.key_column
+    if not match or match not in writable.entry.filterable_columns:
+        raise _err(422, "invalid_match", "Rows are found by one of: " + ", ".join(writable.entry.filterable_columns) + ".")
+    usable = list(dict.fromkeys([match, *writable.writable_columns]))
+    try:
+        parsed = await run_in_threadpool(read_table, filename, data, header_row)
+        rows = await run_in_threadpool(rows_for_table, parsed, writable.entry.columns, usable, chosen)
+        if not any(match in row for row in rows):
+            raise UploadRefused(
+                f"Tidak ada kolom file yang cocok dengan {match}, kolom yang dipakai untuk menemukan baris yang diubah. "
+                f"Tambahkan kolom {match} di file, atau pilih kolom pencari lain yang ada di file.")
+    except MappingNeeded as exc:
+        return await needs_mapping(exc, parsed, service.planner.llm, writable.entry.columns, usable,
+                                   table=table, match=match)
+    except UploadRefused as exc:
+        return {"status": "refused", "reason": str(exc), "plan_id": None}
+    instruction = (question or "").strip()[:2000]
+    left_alone: list[str] = []
+    if instruction:
+        # The typed text says what to set on the columns the file does not carry. A model turns it into rules
+        # from column names only; our code applies them to every row of the file.
+        by_file = sorted({c for r in rows for c in r})
+        try:
+            rules, _extra = await run_in_threadpool(
+                propose_fill, service.planner.llm, instruction, writable.entry.columns,
+                list(writable.writable_columns), by_file, table, "update")
+            rows = await run_in_threadpool(apply_fill, rows, rules, writable.entry.columns)
+        except UploadRefused as exc:
+            return {"status": "refused", "reason": str(exc), "plan_id": None}
+        left_alone = [c for c in writable.writable_columns if c not in by_file and c not in rules]
+    rows = [{c: v for c, v in row.items() if v is not None or c == match} for row in rows]
+    pipeline = _pipeline(request)
+    try:
+        task = pipeline.submit(CHANGE_OPERATION, {
+            "question": f"[file] {parsed.filename}", "database": name, "max_rows": max_rows,
+            "file": {"name": parsed.filename, "sha256": parsed.sha256, "table": table, "match": match,
+                     "rows": rows}}, principal)
+    except PlanUnsupported as exc:
+        return {"status": "refused" if exc.details.get("kind") == "refused" else "unsupported",
+                "reason": exc.reason, "plan_id": None, "plan": exc.details.get("plan")}
+    except PermissionDenied as exc:
+        raise _err(403, "permission_denied", f"The principal lacks the {PLAN} permission.") from exc
+    except TooManyTasks as exc:
+        raise _err(429, "too_many_plans", str(exc)) from exc
+    except PlanError as exc:
+        logger.error("Data change from a file failed.", exc_info=exc)
+        raise _err(503, "data_change_failed", "The file could not be prepared right now.") from exc
+    service.audit("planned", plan_id=task.task_id, actor=principal.actor_id, plan=task.plan["summary"],
+                  expected_rows=task.plan["expected_rows"], file={"name": parsed.filename, "sha256": parsed.sha256})
+    view = _view(task, pipeline, with_phrase=True)
+    view["file"] = {"name": parsed.filename, "rows": len(rows), "sheet": parsed.sheet, "match": match,
+                    "columns": list(parsed.headers), "left_alone": left_alone}
+    return {"status": "planned", **view}
 
 
 @router.get("/plans/{plan_id}")

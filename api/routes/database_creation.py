@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Body, Request
+from starlette.concurrency import run_in_threadpool
 
 from agent.llm.fallback_provider import AllProvidersFailedError
 from agent.platform import (
@@ -22,9 +23,14 @@ from agent.platform import (
     TaskConflict, TaskExpired, TaskNotFound, TaskStatus, TooManyTasks,
 )
 from agent.workflow.database_creation import CreationRefused
+from agent.workflow.image_design import read_image
+from agent.workflow.database_creation import table_prefix
+from agent.workflow.file_context import describe_request, file_as_text
+from agent.workflow.uploaded_table import UploadRefused, design_from_table, normalize_name, read_table
 from api.database_runtime_registry import RegistryError, RegistryNotFound
-from api.features.database_creation import CREATE_OPERATION
+from api.features.database_creation import CREATE_OPERATION, design_to_json
 from api.platform_runtime import get_pipeline
+from api.routes.uploads import read_upload
 from api.routes.data_changes import (
     LLM_UNAVAILABLE, _err, _principal, _registry, _require_recent_login,
 )
@@ -112,6 +118,128 @@ def create_plan(request: Request, payload: dict[str, Any] = Body(...)):
         raise _err(503, "creation_failed", "A plan could not be produced right now.") from exc
     service.audit("planned", plan_id=task.task_id, actor=principal.actor_id, plan=task.plan["summary"])
     return {"status": "planned", **_view(task, pipeline)}
+
+
+@router.post("/file-plans", status_code=201)
+async def create_plan_from_file(request: Request, filename: str, database: str, table: str | None = None,
+                                profile: str | None = None, question: str | None = None,
+                                header_row: int = 1):
+    """Design a database from the columns of an uploaded file (CSV, TSV, TXT or .xlsx): one table whose columns
+    and their types come from the file. Same preview, fresh login and exact phrase as any creation; the file's
+    rows are not loaded here (record them afterwards from the Catat data page, once the table is approved)."""
+    principal = _principal(request, PERMISSION)
+    data = await read_upload(request)
+    registry = _registry(request)
+    try:
+        service = registry.database_creator(profile)
+    except RegistryNotFound as exc:
+        raise _err(404, "profile_not_found", str(exc)) from exc
+    except RegistryError as exc:
+        raise _err(422, "creation_not_available", str(exc)) from exc
+    try:
+        parsed = await run_in_threadpool(read_table, filename, data, header_row)
+    except UploadRefused as exc:
+        return {"status": "refused", "reason": str(exc), "plan_id": None}
+    stem = filename.rsplit(".", 1)[0]
+    table_name = (table or "").strip() or table_prefix() + normalize_name(stem)
+    instruction = (question or "").strip()[:2000]
+    sent_rows = None
+    if instruction:
+        # Here the file is part of the request: a model reads the typed text and the file (capped) together and
+        # designs the database from both. Nothing in a design file is business data; the design is still checked
+        # by our own validation and shown, with the exact statements, before anything is made.
+        rows_text, sent_rows = await run_in_threadpool(file_as_text, parsed)
+        payload = {"question": describe_request(
+                       instruction=instruction, table=parsed, database=database.strip(),
+                       table_name=(table or "").strip() or None, rows_text=rows_text, rows_sent=sent_rows),
+                   "profile": service.profile, "database": database.strip(),
+                   "table": (table or "").strip() or None}
+        columns = [(h, "", True) for h in parsed.headers]
+    else:
+        detected = design_from_table(parsed)
+        columns = [(n, t, True) for n, t in detected]
+        payload = {"question": f"[file] {parsed.filename}", "profile": service.profile,
+                   "file": {"name": parsed.filename, "sha256": parsed.sha256, "database": database.strip(),
+                            "table": table_name, "columns": columns}}
+    pipeline = get_pipeline(request.app)
+    try:
+        task = pipeline.submit(CREATE_OPERATION, payload, principal)
+    except PlanUnsupported as exc:
+        return {"status": "refused" if exc.details.get("kind") == "refused" else "unsupported",
+                "reason": exc.reason, "plan_id": None}
+    except PermissionDenied as exc:
+        raise _err(403, "permission_denied", f"The principal lacks the {PERMISSION} permission.") from exc
+    except TooManyTasks as exc:
+        raise _err(429, "too_many_plans", str(exc)) from exc
+    except PlanError as exc:
+        if isinstance(exc.__cause__, AllProvidersFailedError):
+            logger.warning("Database design from a file: no LLM provider answered: %s", exc.__cause__)
+            raise _err(503, "llm_unavailable", LLM_UNAVAILABLE) from exc
+        logger.error("Database design from a file failed.", exc_info=exc)
+        raise _err(503, "creation_failed", "A plan could not be produced right now.") from exc
+    service.audit("planned", plan_id=task.task_id, actor=principal.actor_id, plan=task.plan["summary"],
+                  file={"name": parsed.filename, "sha256": parsed.sha256})
+    view = _view(task, pipeline)
+    view["file"] = {"name": parsed.filename, "rows": len(parsed.rows), "sheet": parsed.sheet,
+                    "columns": [{"name": n, "type": t, "nullable": null} for n, t, null in columns],
+                    "sent_to_model_rows": sent_rows}
+    return {"status": "planned", **view}
+
+
+@router.post("/image-plans", status_code=201)
+async def create_plan_from_image(request: Request, filename: str, database: str | None = None,
+                                 table: str | None = None, profile: str | None = None,
+                                 question: str | None = None):
+    """Design a database from a picture of one (an ERD, a sketched table, a form).
+
+    The picture is sent to the model provider so it can be read: the page says so before it is sent. It is
+    never stored, and only its name and SHA-256 are kept in the history and audit. What the model reads becomes
+    an ordinary design, checked by our own validation and shown with the exact statements before anything is
+    made; relations between tables are kept as plain integer columns, not enforced."""
+    principal = _principal(request, PERMISSION)
+    data = await read_upload(request)
+    registry = _registry(request)
+    try:
+        service = registry.database_creator(profile)
+    except RegistryNotFound as exc:
+        raise _err(404, "profile_not_found", str(exc)) from exc
+    except RegistryError as exc:
+        raise _err(422, "creation_not_available", str(exc)) from exc
+    try:
+        image = read_image(filename, data)
+    except UploadRefused as exc:
+        return {"status": "refused", "reason": str(exc), "plan_id": None}
+    instruction = (question or "").strip()[:2000] or "Design the database shown in the attached image."
+    try:
+        read = await run_in_threadpool(service.designer.plan, instruction, [image.as_llm()])
+    except AllProvidersFailedError as exc:
+        logger.warning("Database design from an image: no LLM provider answered: %s", exc)
+        raise _err(503, "llm_unavailable", LLM_UNAVAILABLE) from exc
+    if read.design is None:
+        return {"status": "unsupported", "reason": read.reason or "The image could not be turned into a design.",
+                "plan_id": None}
+    payload = {"question": f"[image] {image.filename}", "profile": service.profile,
+               "design": design_to_json(read.design),
+               "image": {"name": image.filename, "sha256": image.sha256, "provider": read.provider},
+               "database": (database or "").strip() or None, "table": (table or "").strip() or None}
+    pipeline = get_pipeline(request.app)
+    try:
+        task = pipeline.submit(CREATE_OPERATION, payload, principal)
+    except PlanUnsupported as exc:
+        return {"status": "refused" if exc.details.get("kind") == "refused" else "unsupported",
+                "reason": exc.reason, "plan_id": None}
+    except PermissionDenied as exc:
+        raise _err(403, "permission_denied", f"The principal lacks the {PERMISSION} permission.") from exc
+    except TooManyTasks as exc:
+        raise _err(429, "too_many_plans", str(exc)) from exc
+    except PlanError as exc:
+        logger.error("Database design from an image failed.", exc_info=exc)
+        raise _err(503, "creation_failed", "A plan could not be produced right now.") from exc
+    service.audit("planned", plan_id=task.task_id, actor=principal.actor_id, plan=task.plan["summary"],
+                  file={"name": image.filename, "sha256": image.sha256, "kind": "image"})
+    view = _view(task, pipeline)
+    view["file"] = {"name": image.filename, "kind": "image", "sent_to_model": True}
+    return {"status": "planned", **view}
 
 
 @router.get("/plans/{plan_id}")
