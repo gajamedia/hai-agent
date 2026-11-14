@@ -4,6 +4,7 @@ import "./autonomous-testing.css";
 
 // One menu for everything that touches databases: connecting, creating databases, recording, changing and viewing data.
 export const DATABASE_AGENT_TABS = [
+  { to: "/database-agent/assistant", label: "Asisten" },
   { to: "/database-agent/create", label: "Buat database" },
   { to: "/database-agent/connections", label: "Koneksi" },
   { to: "/database-agent/entry", label: "Catat data" },

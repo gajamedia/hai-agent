@@ -7,6 +7,7 @@ import * as api from "../api/client";
 vi.mock("../api/client", () => ({
   cancelDataEntry: vi.fn(),
   createDataEntry: vi.fn(),
+  createDataEntryFromFile: vi.fn(),
   getDataEntryDatabases: vi.fn(),
   listRecentEntries: vi.fn(),
   runDataEntry: vi.fn(),
@@ -134,5 +135,92 @@ describe("DataEntry", () => {
     expect(await screen.findByText("dibatalkan")).toBeTruthy();
     expect(screen.getByText("batas waktu lewat")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Batalkan" })).toBeNull();
+  });
+
+  const FILE_ENTRY = { ...ENTRY, plan_id: "f1", expected_rows: 3,
+    file: { name: "jual.csv", rows: 3, sheet: null, columns: ["product", "amount"], already_recorded_at: null } };
+  const csv = () => new File(["product,amount\nkopi,25\n"], "jual.csv", { type: "text/csv" });
+
+  it("records a file: shows what it holds first, nothing is written until Simpan", async () => {
+    const user = userEvent.setup();
+    api.createDataEntryFromFile.mockResolvedValue(FILE_ENTRY);
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    expect(screen.getByLabelText(/Tambahan yang diketik/)).toBeTruthy(); // the typed box stays next to the file
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(api.createDataEntryFromFile).toHaveBeenCalledWith(expect.any(File), { database: "dbsales", table: "sales", question: "", headerRow: 1 });
+    expect(await screen.findByText(/File jual.csv: 3 baris, kolom product, amount/)).toBeTruthy();
+    expect(api.runDataEntry).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Simpan" }));
+    expect(api.runDataEntry).toHaveBeenCalledWith("f1", "f1");
+    expect(await screen.findByText(/Tersimpan/)).toBeTruthy();
+  });
+
+  it("makes the person choose the table when the database has several", async () => {
+    const user = userEvent.setup();
+    api.getDataEntryDatabases.mockResolvedValue({ databases: [{ name: "dbsales", tables: ["sales", "returns"] }] });
+    api.createDataEntryFromFile.mockResolvedValue(FILE_ENTRY);
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    expect(screen.getByRole("button", { name: "Siapkan" }).disabled).toBe(true);
+    await user.selectOptions(screen.getByLabelText("Tabel tujuan"), "returns");
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(api.createDataEntryFromFile).toHaveBeenCalledWith(expect.any(File), { database: "dbsales", table: "returns", question: "", headerRow: 1 });
+  });
+
+  it("says why a file was refused and shows no preview", async () => {
+    const user = userEvent.setup();
+    api.createDataEntryFromFile.mockResolvedValue({ status: "refused", reason: "Row 3, column amount: expected a number.", plan_id: null });
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(await screen.findByText(/Row 3, column amount/)).toBeTruthy();
+    expect(screen.queryByLabelText("Yang akan dicatat")).toBeNull();
+  });
+
+  it("asks for a second yes before recording a file that was already recorded", async () => {
+    const user = userEvent.setup();
+    api.createDataEntryFromFile.mockResolvedValue({ ...FILE_ENTRY, file: { ...FILE_ENTRY.file, already_recorded_at: 1760000000 } });
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(await screen.findByText(/File yang sama sudah pernah dicatat/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Simpan" }).disabled).toBe(true);
+    await user.click(screen.getByLabelText(/Saya tahu, catat lagi/));
+    await user.click(screen.getByRole("button", { name: "Simpan" }));
+    expect(api.runDataEntry).toHaveBeenCalledWith("f1", "f1", { confirmDuplicate: true });
+  });
+
+  const NEEDS = { status: "needs_mapping", plan_id: null, headers: ["Nama Barang", "Harga", "Catatan"],
+    columns: [{ name: "product", type: "text" }, { name: "amount", type: "number" }],
+    mapping: { "Nama Barang": "product", Harga: "amount", Catatan: null }, proposed_by_model: true, table: "sales" };
+
+  it("lets the person check the proposed column mapping before anything is prepared", async () => {
+    const user = userEvent.setup();
+    api.createDataEntryFromFile.mockResolvedValueOnce(NEEDS).mockResolvedValueOnce(FILE_ENTRY);
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(await screen.findByText(/nama kolom saja; isi file tidak dikirim ke AI/)).toBeTruthy();
+    expect(screen.getByLabelText("Kolom untuk Nama Barang").value).toBe("product");
+    expect(screen.getByLabelText("Kolom untuk Catatan").value).toBe("");           // left out unless chosen
+    expect(screen.queryByLabelText("Yang akan dicatat")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("Kolom untuk Harga"), "");      // the person corrects it
+    await user.click(screen.getByRole("button", { name: "Pakai pemetaan ini" }));
+    expect(api.createDataEntryFromFile).toHaveBeenLastCalledWith(expect.any(File), {
+      database: "dbsales", table: "sales", question: "", headerRow: 1, mapping: { "Nama Barang": "product", Harga: null, Catatan: null } });
+    expect(await screen.findByLabelText("Yang akan dicatat")).toBeTruthy();
+    expect(screen.queryByLabelText("Cocokkan kolom file")).toBeNull();
+  });
+
+  it("says so when no AI proposal exists and needs at least one column chosen", async () => {
+    const user = userEvent.setup();
+    api.createDataEntryFromFile.mockResolvedValue({ ...NEEDS, proposed_by_model: false,
+      mapping: { "Nama Barang": null, Harga: null, Catatan: null } });
+    render(<DataEntry />);
+    await user.upload(await screen.findByLabelText("File yang diunggah"), csv());
+    await user.click(screen.getByRole("button", { name: "Siapkan" }));
+    expect(await screen.findByText(/Pilih kolom tabel untuk tiap kolom file/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Pakai pemetaan ini" }).disabled).toBe(true);
   });
 });

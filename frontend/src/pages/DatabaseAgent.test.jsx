@@ -25,12 +25,12 @@ function renderAt(path) {
 }
 
 describe("Database Agent menu", () => {
-  it("offers the five tabs in working order: create, connect, record, change, view", () => {
+  it("offers the tabs in working order: assistant, create, connect, record, change, view", () => {
     renderAt("/database-agent/view");
     const nav = screen.getByRole("navigation", { name: "Database Agent" });
     expect(nav.querySelectorAll("a")).toHaveLength(DATABASE_AGENT_TABS.length);
     const labels = [...nav.querySelectorAll("a")].map((a) => a.textContent);
-    expect(labels).toEqual(["Buat database", "Koneksi", "Catat data", "Ubah data", "Lihat data"]);
+    expect(labels).toEqual(["Asisten", "Buat database", "Koneksi", "Catat data", "Ubah data", "Lihat data"]);
   });
 
   it("opens Lihat data by default", async () => {

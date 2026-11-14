@@ -305,7 +305,7 @@ function ApprovalForm({ connection, schema, busy, onApprove, preset = false }) {
   );
 }
 
-function ResultTable({ rows }) {
+export function ResultTable({ rows }) {
   if (!rows?.length) return null;
   const headers = Object.keys(rows[0]);
   return (

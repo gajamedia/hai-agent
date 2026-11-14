@@ -1,16 +1,20 @@
-import { useEffect, useState } from "react";
-import { AlertCircle, LoaderCircle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertCircle, FileUp, LoaderCircle } from "lucide-react";
+import HeaderRowField from "./HeaderRowField.jsx";
 import { Link, useNavigate } from "react-router-dom";
 import {
   cancelDatabasePlan,
   connectDatabase,
   createDatabasePlan,
+  createDatabasePlanFromFile,
+  createDatabasePlanFromImage,
   getDatabaseCreationConfig,
   getDatabasePlan,
   listDatabaseConnections,
   refreshDatabaseConnection,
   runDatabasePlan,
 } from "../api/client.js";
+import { isImageFile } from "../api/fileKinds.js";
 import { signInAgain } from "../auth/keycloak.js";
 import AddServerForm from "./AddServerForm.jsx";
 import "./autonomous-testing.css";
@@ -38,6 +42,11 @@ export default function DatabaseCreation() {
   const [result, setResult] = useState(null);
   const [notice, setNotice] = useState("");
   const [connected, setConnected] = useState(false);
+  const [file, setFile] = useState(null);
+  const [fileDatabase, setFileDatabase] = useState("");
+  const [fileTable, setFileTable] = useState("");
+  const [headerRow, setHeaderRow] = useState(1);
+  const fileInput = useRef(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -89,7 +98,13 @@ export default function DatabaseCreation() {
     event.preventDefault();
     return guarded(async () => {
       setResult(null); setPlan(null); setPhrase(""); setNotice(""); setConnected(false);
-      const body = await createDatabasePlan({ question, ...(profile ? { profile } : {}) });
+      const body = file && isImageFile(file)
+        ? await createDatabasePlanFromImage(file, { database: fileDatabase.trim(), table: fileTable.trim(), profile, question })
+        : file
+        ? await createDatabasePlanFromFile(file, {
+          database: fileDatabase.trim(), table: fileTable.trim(), profile, question, headerRow,
+        })
+        : await createDatabasePlan({ question, ...(profile ? { profile } : {}) });
       if (body.status === "planned") setPlan(body);
       else setMessage({ text: body.reason });
     });
@@ -128,6 +143,7 @@ export default function DatabaseCreation() {
         setResult(created);
         setPlan(null);
         setNotice("");
+        clearFile();
         await openInReports(created);
       } catch (error) {
         if (errorCode(error) !== "step_up_required") throw error;
@@ -148,6 +164,12 @@ export default function DatabaseCreation() {
       await connectDatabase({ name: result.database.slice(0, 32), profile: result.profile, database: result.database });
       setConnected(true);
     });
+
+  const clearFile = () => {
+    setFile(null);
+    setHeaderRow(1);
+    if (fileInput.current) fileInput.current.value = "";
+  };
 
   const phraseOk = plan && phrase.trim() === plan.confirm_phrase;
 
@@ -198,19 +220,68 @@ export default function DatabaseCreation() {
               </small>
             )}
             <label>
-              Perintah
+              {file ? "Tambahan yang diketik (boleh dikosongkan)" : "Perintah"}
               <textarea
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
                 rows={3}
-                required
-                placeholder="Contoh: buat database hai_toko dengan tabel bahan (nama, harga beli, tanggal masuk). Atau: tambah tabel pegawai di database hai_toko"
+                placeholder={file
+                  ? "Contoh: nama tabel tb_pegawai, tambah kolom status (teks), nip wajib diisi"
+                  : "Contoh: buat database hai_toko dengan tabel bahan (nama, harga beli, tanggal masuk). Atau: tambah tabel pegawai di database hai_toko"}
               />
+              {file && (
+                <small>
+                  Kalau Anda mengetik sesuatu di sini, isi file (maksimal 100 baris pertama) ikut dikirim ke model AI
+                  bersama teks ini, dan model merancang database dari keduanya. Kosongkan teks untuk merancang dari
+                  nama dan isi kolom file saja, tanpa model.
+                </small>
+              )}
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <FileUp size={16} aria-hidden="true" />
+              <span>{file ? "File contoh kolom" : "Atau rancang dari file (CSV, Excel .xlsx, atau gambar ERD .png/.jpg/.webp)"}</span>
+              <input ref={fileInput} type="file" accept=".csv,.tsv,.txt,.xlsx,.png,.jpg,.jpeg,.webp" aria-label="File untuk merancang tabel"
+                onChange={(e) => setFile(e.target.files?.[0] || null)} />
+            </label>
+            {file && isImageFile(file) && (
+              <>
+                <small role="note">
+                  <b>Gambar ini dikirim utuh ke model AI</b> agar bisa dibaca (nama tabel dan kolom diambil dari
+                  gambar). Jangan unggah gambar yang memuat data pribadi. Gambar tidak disimpan. Hubungan antar tabel
+                  menjadi kolom biasa (mis. id_pelanggan), belum dipaksa sebagai relasi. Hasil bacaan model bisa
+                  keliru: periksa rancangannya sebelum dijalankan.
+                </small>
+                <label>
+                  Nama database (boleh dikosongkan, model memilih)
+                  <input value={fileDatabase} onChange={(e) => setFileDatabase(e.target.value)} autoComplete="off" />
+                </label>
+                <div><button type="button" className="at-button at-button-secondary" onClick={clearFile}>Hapus file</button></div>
+              </>
+            )}
+            {file && !isImageFile(file) && (
+              <>
+                <small>
+                  Nama kolom diambil dari file, dan jenis tiap kolom (angka, tanggal, teks) dibaca dari isinya.
+                  Hanya rancangan tabel yang dibuat; baris datanya dicatat sesudahnya lewat menu Catat data.
+                </small>
+                <HeaderRowField value={headerRow} onChange={setHeaderRow} />
+                <label>
+                  Nama database
+                  <input value={fileDatabase} onChange={(e) => setFileDatabase(e.target.value)} autoComplete="off"
+                    placeholder={`${profiles.find((p) => p.name === profile)?.prefix || profiles[0].prefix}toko`} />
+                </label>
+                <label>
+                  Nama tabel (boleh dikosongkan, diambil dari nama file)
+                  <input value={fileTable} onChange={(e) => setFileTable(e.target.value)} autoComplete="off" />
+                </label>
+                <div><button type="button" className="at-button at-button-secondary" onClick={clearFile}>Hapus file</button></div>
+              </>
+            )}
             <small>
               Nama database harus diawali <b>{profiles.find((p) => p.name === profile)?.prefix || profiles[0].prefix}</b>.
             </small>
-            <button className="at-button at-button-primary" disabled={busy || !question.trim()}>
+            <button className="at-button at-button-primary"
+              disabled={busy || (file ? (!fileDatabase.trim() && !isImageFile(file)) : !question.trim())}>
               {busy ? <LoaderCircle size={14} className="spin" /> : null} Buat rencana
             </button>
           </form>
@@ -225,6 +296,10 @@ export default function DatabaseCreation() {
               <span>Menambah tabel ke database yang <b>sudah ada</b>: <b>{plan.plan.database}</b> (server {plan.profile}). Tabel dan data yang ada tidak disentuh.</span>
             ) : (
               <span>Database baru: <b>{plan.plan.database}</b> (server {plan.profile})</span>
+            )}
+            {plan.file?.sent_to_model && <small>Gambar {plan.file.name} dikirim ke model AI untuk dibaca.</small>}
+            {plan.file?.sent_to_model_rows != null && (
+              <small>Isi file ({plan.file.sent_to_model_rows} baris pertama) dikirim ke model AI untuk merancang ini.</small>
             )}
             {plan.plan.tables.length === 0 && <span>Tanpa tabel.</span>}
             {plan.plan.tables.map((t) => (

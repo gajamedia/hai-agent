@@ -13,6 +13,8 @@ vi.mock("../api/client", () => ({
   cancelDatabasePlan: vi.fn(),
   connectDatabase: vi.fn(),
   createDatabasePlan: vi.fn(),
+  createDatabasePlanFromFile: vi.fn(),
+  createDatabasePlanFromImage: vi.fn(),
   getDatabaseCreationConfig: vi.fn(),
   getDatabasePlan: vi.fn(),
   listDatabaseConnections: vi.fn(),
@@ -198,7 +200,7 @@ describe("DatabaseCreation", () => {
 
   it("runs only with the exact phrase, then connects the new database and opens its approval at once", async () => {
     const user = userEvent.setup();
-    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql", question: "", headerRow: 1 });
     renderPage();
     await planIt(user);
     const run = screen.getByRole("button", { name: "Jalankan" });
@@ -215,7 +217,7 @@ describe("DatabaseCreation", () => {
   it("reads the schema again, instead of connecting twice, when tables were added to a database that is already connected", async () => {
     const user = userEvent.setup();
     api.createDatabasePlan.mockResolvedValue({ ...PLAN, mode: "add_tables", confirm_phrase: "TAMBAH TABEL hai_toko" });
-    api.runDatabasePlan.mockResolvedValue({ status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_baru"], profile: "local_mysql" });
+    api.runDatabasePlan.mockResolvedValue({ status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_baru"], profile: "local_mysql", question: "", headerRow: 1 });
     api.listDatabaseConnections.mockResolvedValue({ connections: [{ name: "toko", file: "local_mysql/hai_toko", status: "active" }] });
     renderPage();
     await planIt(user);
@@ -229,7 +231,7 @@ describe("DatabaseCreation", () => {
 
   it("stays on the page with a clear message and a manual button when the automatic connection fails", async () => {
     const user = userEvent.setup();
-    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+    api.runDatabasePlan.mockResolvedValue({ status: "created", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql", question: "", headerRow: 1 });
     api.connectDatabase.mockRejectedValueOnce(Object.assign(new Error("403"), { status: 403,
       body: { detail: { message: "The principal lacks database:connection:manage." } } }));
     renderPage();
@@ -265,7 +267,7 @@ describe("DatabaseCreation", () => {
     api.createDatabasePlan.mockResolvedValue({
       ...PLAN, mode: "add_tables", confirm_phrase: "TAMBAH TABEL hai_toko" });
     api.runDatabasePlan.mockResolvedValue({
-      status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql" });
+      status: "created", mode: "add_tables", database: "hai_toko", tables: ["tb_bahan"], profile: "local_mysql", question: "", headerRow: 1 });
     renderPage();
     const card = (await planIt(user)).textContent;
     expect(card).toMatch(/Menambah tabel ke database yang sudah ada: hai_toko/);
@@ -305,5 +307,52 @@ describe("DatabaseCreation", () => {
     await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
     expect(await screen.findByText(/already exists/)).toBeTruthy();
     expect(screen.queryByLabelText("Rencana database")).toBeNull();
+  });
+
+  const sample = () => new File(["produk,qty\nkopi,3\n"], "jual.csv", { type: "text/csv" });
+
+  it("designs the table from an uploaded file: needs a database name, makes nothing before the phrase", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlanFromFile.mockResolvedValue({ ...PLAN, file: { name: "jual.csv", rows: 1, columns: [] } });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File untuk merancang tabel"), sample());
+    expect(screen.queryByLabelText(/Perintah/)).toBeNull();                       // the typed box gives way to the file
+    expect(screen.getByRole("button", { name: /Buat rencana/ }).disabled).toBe(true);   // no database name yet
+    await user.type(screen.getByLabelText("Nama database"), "hai_toko");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByLabelText("Rencana database")).toBeTruthy();
+    expect(api.createDatabasePlanFromFile).toHaveBeenCalledWith(
+      expect.any(File), { database: "hai_toko", table: "", profile: "local_mysql", question: "", headerRow: 1 });
+    expect(api.createDatabasePlan).not.toHaveBeenCalled();
+    expect(api.runDatabasePlan).not.toHaveBeenCalled();
+  });
+
+  it("shows why a file could not be used", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlanFromFile.mockResolvedValue({ status: "unsupported", reason: "Invalid column name '1abc'.", plan_id: null });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File untuk merancang tabel"), sample());
+    await user.type(screen.getByLabelText("Nama database"), "hai_toko");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText(/Invalid column name/)).toBeTruthy();
+    expect(screen.queryByLabelText("Rencana database")).toBeNull();
+  });
+
+  it("designs from an ERD picture without a database name, and says plainly that the picture goes to the AI", async () => {
+    const user = userEvent.setup();
+    api.createDatabasePlanFromImage.mockResolvedValue({ ...PLAN, file: { name: "erd.png", kind: "image", sent_to_model: true } });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File untuk merancang tabel"),
+      new File([new Uint8Array(8)], "erd.png", { type: "image/png" }));
+    expect(screen.getByRole("note").textContent).toMatch(/dikirim utuh ke model AI/);
+    const make = screen.getByRole("button", { name: /Buat rencana/ });
+    expect(make.disabled).toBe(false);                                            // the model may choose the name
+    await user.click(make);
+    expect(await screen.findByLabelText("Rencana database")).toBeTruthy();
+    expect(screen.getByText(/Gambar erd.png dikirim ke model AI/)).toBeTruthy();
+    expect(api.createDatabasePlanFromImage).toHaveBeenCalledWith(
+      expect.any(File), { database: "", table: "", profile: "local_mysql", question: "" });
+    expect(api.createDatabasePlanFromFile).not.toHaveBeenCalled();
+    expect(api.runDatabasePlan).not.toHaveBeenCalled();
   });
 });

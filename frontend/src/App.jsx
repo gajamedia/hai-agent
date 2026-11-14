@@ -3,6 +3,7 @@ import Dashboard from "./pages/Dashboard.jsx";
 import AutonomousTesting from "./pages/AutonomousTesting.jsx";
 import DataChanges from "./pages/DataChanges.jsx";
 import DataEntry from "./pages/DataEntry.jsx";
+import Assistant from "./pages/Assistant.jsx";
 import DatabaseCreation from "./pages/DatabaseCreation.jsx";
 import DataReports from "./pages/DataReports.jsx";
 import DatabaseAgent from "./pages/DatabaseAgent.jsx";
@@ -61,6 +62,7 @@ function AuthenticatedApplication() {
           <Route path="entry" element={<DataEntry />} />
           <Route path="changes" element={<DataChanges />} />
           <Route path="create" element={<DatabaseCreation />} />
+          <Route path="assistant" element={<Assistant />} />
         </Route>
         {/* Old addresses keep working (bookmarks). */}
         <Route path="/data-reports" element={<Navigate to="/database-agent/view" replace />} />

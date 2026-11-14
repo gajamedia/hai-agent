@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
-import { AlertCircle, CheckCircle2, LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertCircle, CheckCircle2, FileUp, LoaderCircle } from "lucide-react";
 import {
-  cancelDataEntry, createDataEntry, getDataEntryDatabases, listRecentEntries, runDataEntry, undoDataEntry,
+  cancelDataEntry, createDataEntry, createDataEntryFromFile, getDataEntryDatabases, listRecentEntries, runDataEntry,
+  undoDataEntry,
 } from "../api/client.js";
+import FileMapping from "./FileMapping.jsx";
+import HeaderRowField from "./HeaderRowField.jsx";
 import "./autonomous-testing.css";
 
 const errorText = (error) => error?.body?.detail?.message || error?.message || "Terjadi kesalahan.";
 
-function RowsTable({ rows }) {
+function RowsTable({ rows, order = [] }) {
   if (!rows?.length) return null;
-  const headers = Object.keys(rows[0]);
+  const all = Object.keys(rows[0]);
+  // Same column order as the destination table; anything not in that list follows.
+  const headers = [...order.filter((h) => all.includes(h)), ...all.filter((h) => !order.includes(h))];
   return (
     <div style={{ overflowX: "auto" }}>
       <table aria-label="Baris yang akan dicatat" style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
@@ -94,6 +99,12 @@ export default function DataEntry() {
   const [undoMinutes, setUndoMinutes] = useState(null);
   const [confirming, setConfirming] = useState(null);
   const [notice, setNotice] = useState("");
+  const [file, setFile] = useState(null);
+  const [table, setTable] = useState("");
+  const [again, setAgain] = useState(false);
+  const [headerRow, setHeaderRow] = useState(1);
+  const [mapState, setMapState] = useState(null);
+  const fileInput = useRef(null);
 
   const loadRecent = useCallback(async () => {
     try {
@@ -135,25 +146,48 @@ export default function DataEntry() {
     }
   };
 
-  const prepare = (event) => {
-    event.preventDefault();
+  const chosen = databases?.find((d) => d.name === database);
+  const tables = chosen?.tables || [];
+  const tableName = tables.length === 1 ? tables[0] : table;
+
+  const prepare = (event, mapping) => {
+    event?.preventDefault();
     return guarded(async () => {
       setResult(null);
       setEntry(null);
-      const body = await createDataEntry({ question, ...(database ? { database } : {}) });
-      if (body.status === "planned") setEntry(body);
-      else setMessage({ text: body.reason });
+      setAgain(false);
+      if (!mapping) setMapState(null);
+      const body = file
+        ? await createDataEntryFromFile(file, { database, table: tableName, question, headerRow, ...(mapping ? { mapping } : {}) })
+        : await createDataEntry({ question, ...(database ? { database } : {}) });
+      if (body.status === "planned") { setEntry(body); setMapState(null); }
+      else if (body.status === "needs_mapping") { setMapState(body); }
+      else { setMapState(null); setMessage({ text: body.reason }); }
     });
+  };
+
+  const pickFile = (event) => {
+    setFile(event.target.files?.[0] || null);
+    setTable("");
+    setMapState(null);
+  };
+  const clearFile = () => {
+    setFile(null);
+    setMapState(null);
+    if (fileInput.current) fileInput.current.value = "";
   };
 
   // The plan id is the idempotency key: pressing Simpan twice (or a retry after a lost answer) records once.
   const save = () =>
     guarded(async () => {
-      const body = await runDataEntry(entry.plan_id, entry.plan_id);
+      const body = entry.file?.already_recorded_at
+        ? await runDataEntry(entry.plan_id, entry.plan_id, { confirmDuplicate: true })
+        : await runDataEntry(entry.plan_id, entry.plan_id);
       setResult(body);
       setNotice("");
       setEntry(null);
       setQuestion("");
+      clearFile();
       await loadRecent();
     });
 
@@ -184,7 +218,7 @@ export default function DataEntry() {
       </header>
 
       {message && (
-        <div className="at-warning" role="alert">
+        <div className="at-warning" role="alert" ref={(el) => el?.scrollIntoView?.({ block: "nearest" })}>
           <AlertCircle size={16} /><div>{message.text}</div>
         </div>
       )}
@@ -209,32 +243,81 @@ export default function DataEntry() {
               </fieldset>
             )}
             <label>
-              Yang dicatat
+              {file ? "Tambahan yang diketik (boleh dikosongkan)" : "Yang dicatat"}
               <textarea
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
-                placeholder="Contoh: catat penjualan 10 pcs kopi 25 ribu dan 5 pcs teh 15 ribu"
+                placeholder={file
+                  ? "Contoh: isi kolom jabatan dengan Staff, departemen acak dari HR, IT, Finance, gaji acak 4 sampai 9 juta"
+                  : "Contoh: catat penjualan 10 pcs kopi 25 ribu dan 5 pcs teh 15 ribu"}
                 rows={3}
-                required
               />
             </label>
-            <button className="at-button at-button-primary" disabled={busy || !question.trim() || (databases?.length > 1 && !database)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <FileUp size={16} aria-hidden="true" />
+                <span>{file ? "File yang dicatat" : "Atau unggah file (CSV atau Excel .xlsx)"}</span>
+                <input ref={fileInput} type="file" accept=".csv,.tsv,.txt,.xlsx" onChange={pickFile}
+                  aria-label="File yang diunggah" />
+              </label>
+              {file && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 13 }}>
+                  <HeaderRowField value={headerRow} onChange={setHeaderRow} />
+                  <button type="button" className="at-button at-button-secondary" onClick={clearFile}>Hapus file</button>
+                </div>
+              )}
+              {file && tables.length > 1 && (
+                <label>
+                  Tabel tujuan
+                  <select value={table} onChange={(e) => setTable(e.target.value)}>
+                    <option value="">Pilih tabel</option>
+                    {tables.map((t) => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </label>
+              )}
+            </div>
+            <button className="at-button at-button-primary"
+              disabled={busy || (file ? (tables.length > 1 && !table) : !question.trim()) || (databases?.length > 1 && !database)}>
               {busy && !entry ? <LoaderCircle size={14} className="spin" /> : null} Siapkan
             </button>
           </form>
         )}
       </section>
 
+      {mapState && (
+        <FileMapping key={mapState.headers.join("|")} state={mapState} busy={busy}
+          onApply={(mapping) => prepare(null, mapping)} onCancel={() => setMapState(null)} />
+      )}
+
       {entry && (
         <section className="at-panel" aria-label="Yang akan dicatat">
           <h2>Periksa dulu. Belum ada yang tersimpan.</h2>
           <div className="at-config-summary">
             <span>Ke tabel <b>{entry.plan.table}</b> pada database <b>{entry.database}</b>: <b>{entry.expected_rows}</b> baris</span>
+            {entry.file && (
+              <small>File {entry.file.name}{entry.file.sheet ? ` (lembar ${entry.file.sheet})` : ""}: {entry.file.rows} baris, kolom {entry.file.columns.join(", ")}.</small>
+            )}
+            {entry.file?.left_empty?.length > 0 && (
+              <small>Dibiarkan kosong (tidak ada aturan isian, atau data pribadi): {entry.file.left_empty.join(", ")}.</small>
+            )}
             {entry.preview?.note && <small>{entry.preview.note}</small>}
-            <RowsTable rows={entry.preview?.after} />
+            <RowsTable rows={entry.preview?.after} order={entry.column_order} />
           </div>
+          {entry.file?.already_recorded_at && (
+            <div className="at-warning" role="alert">
+              <AlertCircle size={16} />
+              <div>
+                File yang sama sudah pernah dicatat pada {formatTime(entry.file.already_recorded_at)}.
+                <label style={{ display: "block", marginTop: 6 }}>
+                  <input type="checkbox" checked={again} onChange={(e) => setAgain(e.target.checked)} />
+                  {" "}Saya tahu, catat lagi
+                </label>
+              </div>
+            </div>
+          )}
           <div className="at-form-row">
-            <button type="button" className="at-button at-button-primary" disabled={busy} onClick={save}>
+            <button type="button" className="at-button at-button-primary"
+              disabled={busy || (entry.file?.already_recorded_at && !again)} onClick={save}>
               Simpan
             </button>
             <button type="button" className="at-button at-button-secondary" disabled={busy} onClick={cancel}>

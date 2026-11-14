@@ -9,6 +9,7 @@ import * as keycloak from "../auth/keycloak";
 vi.mock("../api/client", () => ({
   cancelDataChangePlan: vi.fn(),
   createDataChangePlan: vi.fn(),
+  createDataChangePlanFromFile: vi.fn(),
   decideDataChange: vi.fn(),
   getDataChangeConfig: vi.fn(),
   getDataChangePlan: vi.fn(),
@@ -197,5 +198,108 @@ describe("DataChanges", () => {
     renderPage();
     await screen.findByLabelText(/Perintah/);
     expect(screen.queryByLabelText("Menunggu persetujuan")).toBeNull();
+  });
+
+  const FILE_PLAN = {
+    ...PLAN, plan_id: "f1", confirm_phrase: "UBAH 2 BARIS tb_bahan",
+    plan: { operation: "update", table: "tb_bahan", max_rows: 10, match_column: "id",
+      rows: [{ id: 1, harga_beli: 5000 }, { id: 2, harga_beli: 6000 }] },
+    file: { name: "ubah.csv", rows: 2, match: "id", columns: ["id", "harga_beli"] },
+  };
+  const csv = () => new File(["id,harga_beli\n1,5000\n2,6000\n"], "ubah.csv", { type: "text/csv" });
+
+  it("updates many rows from a file: the same preview and the same exact phrase as any change", async () => {
+    const user = userEvent.setup();
+    api.createDataChangePlanFromFile.mockResolvedValue(FILE_PLAN);
+    api.runDataChangePlan.mockResolvedValue({
+      status: "committed", rows_affected: 2, operation: "update", table: "tb_bahan", replayed: false });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    expect(screen.queryByLabelText(/Perintah/)).toBeNull();                       // the typed box gives way to the file
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(api.createDataChangePlanFromFile).toHaveBeenCalledWith(
+      expect.any(File), { database: "dbsales", table: "tb_bahan", match: "", maxRows: 100, question: "", headerRow: 1 });
+    const card = (await screen.findByLabelText("Rencana perubahan")).textContent;
+    expect(card).toMatch(/lewat kolom id/);
+    expect(card).toMatch(/2 baris di file/);
+    expect(api.runDataChangePlan).not.toHaveBeenCalled();
+    const run = screen.getByRole("button", { name: "Jalankan" });
+    expect(run.disabled).toBe(true);
+    await user.type(screen.getByLabelText("Frasa konfirmasi"), "UBAH 2 BARIS tb_bahan");
+    await user.click(run);
+    expect(api.runDataChangePlan).toHaveBeenCalledWith("f1", "UBAH 2 BARIS tb_bahan", "f1");
+  });
+
+  it("sends the column that finds the rows when the person names one", async () => {
+    const user = userEvent.setup();
+    api.createDataChangePlanFromFile.mockResolvedValue(FILE_PLAN);
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    await user.type(screen.getByLabelText(/Kolom pencari baris/), "kode");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(api.createDataChangePlanFromFile).toHaveBeenCalledWith(
+      expect.any(File), { database: "dbsales", table: "tb_bahan", match: "kode", maxRows: 100, question: "", headerRow: 1 });
+  });
+
+  it("offers the columns that may find rows as a list when the server names them", async () => {
+    const user = userEvent.setup();
+    api.listDatabaseConnections.mockResolvedValue({
+      connections: [{ name: "dbsales", status: "active", tables: ["tb_bahan"], writable_tables: ["tb_bahan"],
+        match_columns: { tb_bahan: ["id", "kode"] } }],
+    });
+    api.createDataChangePlanFromFile.mockResolvedValue(FILE_PLAN);
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    const list = screen.getByLabelText(/Kolom pencari baris/);
+    expect(list.tagName).toBe("SELECT");
+    expect([...list.options].map((o) => o.value)).toEqual(["", "id", "kode"]);
+    await user.selectOptions(list, "kode");
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(api.createDataChangePlanFromFile).toHaveBeenCalledWith(
+      expect.any(File), { database: "dbsales", table: "tb_bahan", match: "kode", maxRows: 100, question: "", headerRow: 1 });
+  });
+
+  it("shows why a file was refused and no plan", async () => {
+    const user = userEvent.setup();
+    api.createDataChangePlanFromFile.mockResolvedValue({
+      status: "refused", reason: "1 of the 2 values of id match no row (first: 9999).", plan_id: null });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText(/match no row/)).toBeTruthy();
+    expect(screen.queryByLabelText("Rencana perubahan")).toBeNull();
+  });
+
+  it("lets the person match the file's columns when the names differ, and says which column finds the rows", async () => {
+    const user = userEvent.setup();
+    api.createDataChangePlanFromFile
+      .mockResolvedValueOnce({ status: "needs_mapping", plan_id: null, headers: ["Kode", "Harga"], match: "id", table: "tb_bahan",
+        columns: [{ name: "id", type: "integer" }, { name: "harga_beli", type: "number" }],
+        mapping: { Kode: "id", Harga: null }, proposed_by_model: true })
+      .mockResolvedValueOnce(FILE_PLAN);
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText(/Kolom pencari baris: id/)).toBeTruthy();
+    await user.selectOptions(screen.getByLabelText("Kolom untuk Harga"), "harga_beli");
+    await user.click(screen.getByRole("button", { name: "Pakai pemetaan ini" }));
+    expect(api.createDataChangePlanFromFile).toHaveBeenLastCalledWith(expect.any(File), {
+      database: "dbsales", table: "tb_bahan", match: "", maxRows: 100, question: "", headerRow: 1, mapping: { Kode: "id", Harga: "harga_beli" } });
+    expect(await screen.findByLabelText("Rencana perubahan")).toBeTruthy();
+  });
+
+  it("does not let the mapping be applied until some file column goes into the column that finds the rows", async () => {
+    const user = userEvent.setup();
+    api.createDataChangePlanFromFile.mockResolvedValueOnce({
+      status: "needs_mapping", plan_id: null, headers: ["nama lengkap", "ktp"], match: "nip", table: "tb_bahan",
+      columns: [{ name: "nip", type: "string" }, { name: "nama_lengkap", type: "string" }],
+      mapping: { "nama lengkap": "nama_lengkap", ktp: null }, proposed_by_model: false });
+    renderPage();
+    await user.upload(await screen.findByLabelText("File perubahan"), csv());
+    await user.click(screen.getByRole("button", { name: /Buat rencana/ }));
+    expect(await screen.findByText(/Belum ada kolom file yang dipilih untuk/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Pakai pemetaan ini" }).disabled).toBe(true);
+    await user.selectOptions(screen.getByLabelText("Kolom untuk ktp"), "nip");
+    expect(screen.getByRole("button", { name: "Pakai pemetaan ini" }).disabled).toBe(false);
   });
 });

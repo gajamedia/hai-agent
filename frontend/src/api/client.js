@@ -337,13 +337,60 @@ export async function createDataEntry(payload, signal) {
   return jsonPost(`${API_V1}/data-entries/plans`, payload, signal);
 }
 
-export async function runDataEntry(planId, idempotencyKey, signal) {
+export async function runDataEntry(planId, idempotencyKey, options = {}, signal) {
   return jsonPost(
     `${API_V1}/data-entries/plans/${encodeURIComponent(planId)}/run`,
     {},
     signal,
-    idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+    {
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      // Recording a file that was already recorded needs this explicit second yes.
+      ...(options.confirmDuplicate ? { "X-Confirm-Duplicate": "yes" } : {}),
+    },
   );
+}
+
+// A file goes up as the raw request body (no multipart): the name and the target travel in the query.
+export async function uploadFile(path, file, query = {}, signal) {
+  const params = new URLSearchParams({ filename: file.name });
+  Object.entries(query).forEach(([key, value]) => { if (value) params.set(key, value); });
+  return request(`${path}?${params}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file,
+    signal,
+  });
+}
+
+export async function createDatabasePlanFromFile(file, { database, table, profile, question, headerRow } = {}, signal) {
+  return uploadFile(`${API_V1}/database-creation/file-plans`, file, {
+    database, table, profile, question: question?.trim() ? question.trim() : undefined,
+    header_row: headerRow > 1 ? headerRow : undefined,
+  }, signal);
+}
+
+// A picture of a database design (an ERD): it is sent to the model provider so it can be read; never stored.
+export async function createDatabasePlanFromImage(file, { database, table, profile, question } = {}, signal) {
+  return uploadFile(`${API_V1}/database-creation/image-plans`, file, {
+    database, table, profile, question: question?.trim() ? question.trim() : undefined,
+  }, signal);
+}
+
+// Update many rows from a file: each row of the file names an existing row (by `match`, the table key by default).
+export async function createDataChangePlanFromFile(file, { database, table, match, mapping, maxRows, question, headerRow } = {}, signal) {
+  return uploadFile(`${API_V1}/data-changes/file-plans`, file, {
+    database, table, match, max_rows: maxRows ? String(maxRows) : undefined,
+    question: question?.trim() ? question.trim() : undefined,
+    header_row: headerRow > 1 ? headerRow : undefined,
+    mapping: mapping ? JSON.stringify(mapping) : undefined,
+  }, signal);
+}
+
+export async function createDataEntryFromFile(file, { database, table, mapping, question, headerRow } = {}, signal) {
+  return uploadFile(`${API_V1}/data-entries/file-plans`, file,
+    { database, table, mapping: mapping ? JSON.stringify(mapping) : undefined,
+      question: question?.trim() ? question.trim() : undefined,
+      header_row: headerRow > 1 ? headerRow : undefined }, signal);
 }
 
 export async function listRecentEntries(signal) {
@@ -429,6 +476,18 @@ export async function cancelDatabasePlan(planId, signal) {
     method: "DELETE",
     signal,
   });
+}
+
+// The one-page assistant: only decides which pipeline a message (and file) belongs to; nothing is planned here.
+export async function routeAssistantMessage(message, signal) {
+  return jsonPost(`${API_V1}/assistant/route`, { message }, signal);
+}
+
+export async function routeAssistantFile(file, { message, headerRow } = {}, signal) {
+  return uploadFile(`${API_V1}/assistant/route-file`, file, {
+    message: message?.trim() ? message.trim() : undefined,
+    header_row: headerRow > 1 ? headerRow : undefined,
+  }, signal);
 }
 
 // Task history: your own tasks on the shared pipeline (reports, data changes, ...), newest first.
